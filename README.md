@@ -20,11 +20,18 @@ worth building.
 ```
 kafka-protocol          generated from Kafka's JSON schemas — the wire codec, not ours
       ↓
-kestrel-core            sans-io: framing, correlation, filtering. No sockets, no clock, no Send.
-      ↓
-kestrel-glommio         sockets and timers. !Send handle, one connection per broker.
-kestrel-tokio           (P3)
+kestrel-core            sans-io: framing, correlation, filtering, sequencing. No sockets,
+      ↓                 no clock, no Send.
+kestrel-client          the client: pooling, leader routing, metadata, fetch and transaction
+      ↓                 flows. Generic over a four-function `Transport`. Still no Send.
+kestrel-glommio (64)    connect, read, write, sleep.
+kestrel-tokio   (67)    connect, read, write, sleep.
 ```
+
+Those line counts are the load-bearing part. A binding supplies four functions and a handful of
+type aliases; **all protocol code is shared**, so the two runtimes cannot drift and a fix cannot
+land in one and not the other. The same broker suite — 6 consumer tests, 8 producer tests — runs
+against both.
 
 The core names no runtime, so there is nothing to abstract over and no `Send` bound forced by a
 lowest-common-denominator trait. The *binding* decides `Send`-ness, which is how one state machine
@@ -42,14 +49,16 @@ behave. Every `kestrel-core` test does that, with no broker and no executor.
 | **Consumer, assign-only** | works — `ApiVersions`, `Metadata`, `ListOffsets`, `Fetch`, seek, READ_COMMITTED filtering |
 | **Producer** | idempotent and transactional — sequencing, coordinator routing, zombie fencing, keyed partitioning |
 | **Leader routing, metadata cache** | works — fetches go to the leader from the cluster map, `NOT_LEADER_OR_FOLLOWER` invalidates that partition and retries |
-| **TLS, SASL** | not started (P3). The `futures-io` seam means `futures-rustls` drops in |
+| **Runtimes** | glommio and tokio, from one client. Adding a third is a `Transport` impl |
+| **TLS, SASL** | not started. `Transport::Stream` is where TLS goes — `futures-rustls` for glommio, `tokio-rustls` for tokio |
 | **Consumer groups** | **out of scope** — callers assign partitions themselves |
 
 ## Tests
 
 ```sh
-cargo test                                        # 63 unit tests, no broker, no runtime
+cargo test                                        # 65 unit tests, no broker, no runtime
 cargo test -p kestrel-glommio -- --ignored --test-threads=1   # needs a broker
+cargo test -p kestrel-tokio   -- --ignored --test-threads=1   # the same suite, other runtime
 ```
 
 The broker tests need a single-node Kafka; the invocation is at the top of

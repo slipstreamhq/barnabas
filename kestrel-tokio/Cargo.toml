@@ -1,5 +1,5 @@
 [package]
-name = "kestrel-glommio"
+name = "kestrel-tokio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,8 +8,9 @@ publish.workspace = true
 [dependencies]
 kestrel-core   = { path = "../kestrel-core" }
 kestrel-client = { path = "../kestrel-client" }
+tokio          = { version = "1", features = ["net", "io-util", "time", "rt"] }
+
+[dev-dependencies]
 kafka-protocol = { workspace = true }
 bytes          = { workspace = true }
-thiserror      = { workspace = true }
-futures-lite   = "2"
-glommio        = { git = "https://github.com/dahankzter/glommio", rev = "2acb59d1" }
+tokio          = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -5,12 +5,13 @@
 //! fetch" into "send it to node 3, and if node 3 says it is no longer the
 //! leader, find out who is and try again".
 //!
-//! # Per core, and not shared
+//! # Locality is the binding's choice
 //!
-//! Connections are `glommio::net::TcpStream`s, so a `Cluster` belongs to the
-//! core that built it and is `!Send`. That is why the map is a plain
-//! `HashMap` behind `&mut self` with no locking anywhere: there is no other
-//! thread to contend with, which is the whole reason to be per-core.
+//! The connection map is a plain `HashMap` behind `&mut self`, with no locking
+//! anywhere. Under a per-core binding that is simply correct — the sockets
+//! belong to the core that opened them and there is no other thread to contend
+//! with. Under a work-stealing binding the handle is what carries the
+//! synchronisation, not this map.
 //!
 //! One consequence is worth stating, because it is the interesting cost of the
 //! design: **each core keeps its own connections**, so a node with C cores and
@@ -21,8 +22,6 @@
 
 use std::collections::HashMap;
 
-use futures_lite::{AsyncReadExt, AsyncWriteExt};
-use glommio::net::TcpStream;
 use kafka_protocol::messages::{
     metadata_request::MetadataRequestTopic, ApiKey, ApiVersionsRequest, ApiVersionsResponse,
     MetadataRequest, MetadataResponse, TopicName,
@@ -30,19 +29,19 @@ use kafka_protocol::messages::{
 use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
 use kestrel_core::{BrokerAddr, Connection, Metadata};
 
-use crate::{check, Error, Result};
+use crate::{check, Error, Result, Transport};
 
 /// One broker connection.
-pub(crate) struct Broker {
-    stream: TcpStream,
+pub(crate) struct Broker<T: Transport> {
+    stream: T::Stream,
     conn: Connection,
 }
 
-impl Broker {
+impl<T: Transport> Broker<T> {
     pub(crate) async fn connect(addr: &str, client_id: &str) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await.map_err(|e| Error::Connect {
+        let stream = T::connect(addr).await.map_err(|source| Error::Connect {
             addr: addr.to_owned(),
-            source: std::io::Error::other(e.to_string()),
+            source,
         })?;
         let mut me = Self {
             stream,
@@ -77,15 +76,14 @@ impl Broker {
         Resp: Decodable,
     {
         let wire = self.conn.request(api_key, version, req)?;
-        self.stream.write_all(&wire).await?;
-        self.stream.flush().await?;
+        T::write_all(&mut self.stream, &wire).await?;
 
         loop {
             if let Some(resp) = self.conn.next_response()? {
                 return Ok(Connection::decode(&resp)?);
             }
             let mut buf = [0u8; 16 * 1024];
-            let n = self.stream.read(&mut buf).await?;
+            let n = T::read(&mut self.stream, &mut buf).await?;
             if n == 0 {
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -98,7 +96,7 @@ impl Broker {
 }
 
 /// Connections plus the cluster map.
-pub struct Cluster {
+pub struct Cluster<T: Transport> {
     client_id: String,
     bootstrap: Vec<String>,
     /// Whether a metadata request may create the topic.
@@ -111,11 +109,11 @@ pub struct Cluster {
     /// Keyed by `host:port` rather than node id: a broker that restarts with a
     /// new id at the same address should reuse the socket, and a bootstrap
     /// address has no node id until the first `Metadata` reply.
-    conns: HashMap<String, Broker>,
+    conns: HashMap<String, Broker<T>>,
     metadata: Metadata,
 }
 
-impl Cluster {
+impl<T: Transport> Cluster<T> {
     /// Connect to the first reachable bootstrap address and load metadata.
     ///
     /// # Errors
@@ -150,14 +148,14 @@ impl Cluster {
     ///
     /// Used for requests that any broker can serve — `Metadata` above all,
     /// which is what makes bootstrapping work at all.
-    pub(crate) async fn any_broker(&mut self) -> Result<&mut Broker> {
+    pub(crate) async fn any_broker(&mut self) -> Result<&mut Broker<T>> {
         if let Some(addr) = self.conns.keys().next().cloned() {
             return Ok(self.conns.get_mut(&addr).expect("just found"));
         }
 
         let mut last_err = None;
         for addr in self.bootstrap.clone() {
-            match Broker::connect(&addr, &self.client_id).await {
+            match Broker::<T>::connect(&addr, &self.client_id).await {
                 Ok(broker) => {
                     self.conns.insert(addr.clone(), broker);
                     return Ok(self.conns.get_mut(&addr).expect("just inserted"));
@@ -169,9 +167,9 @@ impl Cluster {
     }
 
     /// Connect to `addr` if not already connected, and return it.
-    pub(crate) async fn broker_at(&mut self, addr: &str) -> Result<&mut Broker> {
+    pub(crate) async fn broker_at(&mut self, addr: &str) -> Result<&mut Broker<T>> {
         if !self.conns.contains_key(addr) {
-            let broker = Broker::connect(addr, &self.client_id).await?;
+            let broker = Broker::<T>::connect(addr, &self.client_id).await?;
             self.conns.insert(addr.to_owned(), broker);
         }
         Ok(self.conns.get_mut(addr).expect("just inserted"))

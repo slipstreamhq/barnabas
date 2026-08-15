@@ -15,7 +15,7 @@ use kestrel_core::consumer::{self, AbortedTransaction, Fetched};
 use kestrel_core::{Disposition, ErrorCode, IsolationLevel};
 
 use crate::cluster::Cluster;
-use crate::{check, Error, Result};
+use crate::{check, Error, Result, Transport};
 
 /// Timestamps `ListOffsets` understands.
 pub const EARLIEST: i64 = -2;
@@ -32,8 +32,8 @@ const MAX_LEADER_RETRIES: usize = 5;
 /// Assignment is the caller's: no group protocol, no rebalance, no offset
 /// commit. Where the position lives is also the caller's problem, which is what
 /// makes this usable from a system that checkpoints offsets itself.
-pub struct Consumer {
-    cluster: Cluster,
+pub struct Consumer<T: Transport> {
+    cluster: Cluster<T>,
     topic: String,
     partition: i32,
     next_offset: i64,
@@ -42,7 +42,7 @@ pub struct Consumer {
     max_bytes: i32,
 }
 
-impl Consumer {
+impl<T: Transport> Consumer<T> {
     /// Connect and position on `topic`/`partition` at `offset`.
     ///
     /// `offset` may be [`EARLIEST`], [`LATEST`], or an absolute offset;
@@ -255,9 +255,9 @@ impl Consumer {
     ///
     /// `extract` pulls `(error_code, value)` for the partition out of whatever
     /// response shape the API uses — the one part that differs between them.
-    fn with_leader<Resp, T, F>(&mut self, op: &'static str, extract: F) -> LeaderCall<'_, Resp, T, F>
+    fn with_leader<Resp, V, F>(&mut self, op: &'static str, extract: F) -> LeaderCall<'_, T, Resp, V, F>
     where
-        F: Fn(Resp, i32) -> Option<(i16, T)>,
+        F: Fn(Resp, i32) -> Option<(i16, V)>,
     {
         LeaderCall {
             consumer: self,
@@ -274,24 +274,24 @@ impl Consumer {
 /// A struct rather than a closure taking `&mut Consumer`: the closure would
 /// borrow the consumer mutably and return a future that outlives the borrow,
 /// which is a lifetime fight with nothing at the end of it.
-pub struct LeaderCall<'a, Resp, T, F> {
-    consumer: &'a mut Consumer,
+pub struct LeaderCall<'a, T: Transport, Resp, V, F> {
+    consumer: &'a mut Consumer<T>,
     op: &'static str,
     extract: F,
-    _resp: std::marker::PhantomData<(Resp, T)>,
+    _resp: std::marker::PhantomData<(Resp, V)>,
 }
 
-impl<Resp, T, F> LeaderCall<'_, Resp, T, F>
+impl<T: Transport, Resp, V, F> LeaderCall<'_, T, Resp, V, F>
 where
     Resp: kafka_protocol::protocol::Decodable,
-    F: Fn(Resp, i32) -> Option<(i16, T)>,
+    F: Fn(Resp, i32) -> Option<(i16, V)>,
 {
     async fn call<Req: kafka_protocol::protocol::Encodable>(
         self,
         api_key: ApiKey,
         version: i16,
         req: &Req,
-    ) -> Result<T> {
+    ) -> Result<V> {
         let Self {
             consumer,
             op,

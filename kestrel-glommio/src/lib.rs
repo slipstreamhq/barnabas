@@ -1,86 +1,64 @@
-//! The glommio binding: sockets and timers for [`kestrel_core`].
+//! The glommio binding: four functions.
 //!
-//! Everything that touches a file descriptor lives here. The protocol logic —
-//! framing, correlation, READ_COMMITTED filtering, the cluster map — is in the
-//! core and is shared with every other binding, so a bug in it cannot be
-//! arm-specific.
+//! Everything else — connection pooling, leader routing, metadata refresh, the
+//! consumer's filtering, the producer's transaction flow — is
+//! [`kestrel_client`], written once and shared with the tokio binding. This
+//! file is the whole difference between the two runtimes.
 //!
-//! # `!Send` on purpose
+//! # `!Send`, and why nothing above had to know
 //!
-//! A [`Consumer`] holds `glommio::net::TcpStream`s, which belong to the core
-//! that opened them, so the handle is `!Send` and must not be moved between
-//! executors. That is the point rather than a limitation: the core is neither
-//! `Send` nor `!Send`, so a work-stealing binding can make the opposite choice
-//! without either of them compromising.
-//!
-//! # Scope
-//!
-//! Assign-only consumer and a transactional producer, both with leader routing
-//! and a metadata cache. No consumer groups, and there will not be any: callers
-//! assign partitions themselves.
+//! `glommio::net::TcpStream` belongs to the core that opened it, so everything
+//! built on this transport is `!Send` and must stay on its executor. That is a
+//! property of *this* binding, not of the client: `kestrel-client` places no
+//! `Send` bound anywhere, so the tokio binding is free to be `Send` from the
+//! same code. An abstraction that required `Send` would have forbidden this
+//! side outright.
 
-pub mod cluster;
-pub mod consumer;
-pub mod producer;
+use std::io;
+use std::time::Duration;
 
-pub use cluster::Cluster;
-pub use consumer::{Consumer, EARLIEST, LATEST};
-pub use producer::{Producer, ProducerRecord};
-pub use kestrel_core::IsolationLevel;
+use futures_lite::{AsyncReadExt as _, AsyncWriteExt as _};
+use glommio::net::TcpStream;
 
-use kestrel_core::{Disposition, ErrorCode};
+pub use kestrel_client::{Error, ProducerRecord, Result, EARLIEST, LATEST};
+pub use kestrel_core::{Disposition, ErrorCode, IsolationLevel, Partitioner};
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("core: {0}")]
-    Core(#[from] kestrel_core::Error),
+/// The runtime selector. Never instantiated — it exists to name a choice.
+#[derive(Debug, Clone, Copy)]
+pub struct Glommio;
 
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+impl kestrel_client::Transport for Glommio {
+    type Stream = TcpStream;
 
-    #[error("connect {addr}: {source}")]
-    Connect {
-        addr: String,
-        #[source]
-        source: std::io::Error,
-    },
-
-    /// A broker error code, with what the client should do about it. Carrying
-    /// the [`Disposition`] means a caller can react without re-deriving the
-    /// taxonomy — and cannot accidentally retry something fatal.
-    #[error("{op} failed with error code {code} ({disposition:?})")]
-    Broker {
-        op: &'static str,
-        code: i16,
-        disposition: Disposition,
-    },
-
-    /// The partition has no leader even after a metadata refresh — what a
-    /// partition mid-election looks like. Separate from [`Self::Broker`] so a
-    /// caller can back off and retry rather than treat it as fatal.
-    #[error("{topic}-{partition} has no leader")]
-    NoLeader { topic: String, partition: i32 },
-
-    /// A misuse of the producer, caught by the state machine rather than by a
-    /// broker — producing outside a transaction, to an unenrolled partition, or
-    /// after being fenced.
-    #[error("producer: {0}")]
-    Producer(#[from] kestrel_core::producer::ProducerError),
-
-    #[error("the broker's response contained no {0}")]
-    Missing(&'static str),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
-pub(crate) fn check(op: &'static str, code: i16) -> Result<()> {
-    let code = ErrorCode(code);
-    if code.is_ok() {
-        return Ok(());
+    async fn connect(addr: &str) -> io::Result<Self::Stream> {
+        // glommio's error type is its own; the seam speaks `io::Error`, which
+        // every runtime can produce.
+        TcpStream::connect(addr)
+            .await
+            .map_err(|e| io::Error::other(e.to_string()))
     }
-    Err(Error::Broker {
-        op,
-        code: code.0,
-        disposition: code.disposition(),
-    })
+
+    async fn read(stream: &mut Self::Stream, buf: &mut [u8]) -> io::Result<usize> {
+        stream.read(buf).await
+    }
+
+    async fn write_all(stream: &mut Self::Stream, buf: &[u8]) -> io::Result<()> {
+        stream.write_all(buf).await?;
+        // Kafka framing is length-prefixed, so a half-written request is a
+        // protocol error rather than a slow one.
+        stream.flush().await
+    }
+
+    async fn sleep(dur: Duration) {
+        glommio::timer::sleep(dur).await;
+    }
 }
+
+/// A cluster handle on this core.
+pub type Cluster = kestrel_client::Cluster<Glommio>;
+
+/// An assign-only consumer on this core.
+pub type Consumer = kestrel_client::Consumer<Glommio>;
+
+/// An idempotent, optionally transactional producer on this core.
+pub type Producer = kestrel_client::Producer<Glommio>;

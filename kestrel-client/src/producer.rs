@@ -34,7 +34,7 @@ use kestrel_core::producer::{ProducerIdentity, ProducerState, SequenceRange};
 use kestrel_core::{Disposition, ErrorCode, Partitioner};
 
 use crate::cluster::Cluster;
-use crate::{Error, Result};
+use crate::{Error, Result, Transport};
 
 /// Attempts for a request whose disposition says "retry" or "re-discover".
 ///
@@ -66,8 +66,8 @@ impl ProducerRecord {
 }
 
 /// An idempotent, optionally transactional producer for one core.
-pub struct Producer {
-    cluster: Cluster,
+pub struct Producer<T: Transport> {
+    cluster: Cluster<T>,
     state: ProducerState,
     transactional_id: Option<String>,
     /// The coordinator's address, once discovered. Cleared on
@@ -82,7 +82,7 @@ pub struct Producer {
     round_robin: u32,
 }
 
-impl Producer {
+impl<T: Transport> Producer<T> {
     /// A transactional producer under `transactional_id`.
     ///
     /// `InitProducerId` fences any previous producer using the same id, which
@@ -216,7 +216,7 @@ impl Producer {
     }
 
     async fn backoff(_attempt: usize) {
-        glommio::timer::sleep(RETRY_BACKOFF).await;
+        T::sleep(RETRY_BACKOFF).await;
     }
 
     /// Send a coordinator request, honouring the disposition of whatever comes

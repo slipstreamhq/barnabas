@@ -1,5 +1,5 @@
 [package]
-name = "kestrel-glommio"
+name = "kestrel-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,9 +7,6 @@ publish.workspace = true
 
 [dependencies]
 kestrel-core   = { path = "../kestrel-core" }
-kestrel-client = { path = "../kestrel-client" }
 kafka-protocol = { workspace = true }
 bytes          = { workspace = true }
 thiserror      = { workspace = true }
-futures-lite   = "2"
-glommio        = { git = "https://github.com/dahankzter/glommio", rev = "2acb59d1" }
