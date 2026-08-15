@@ -40,7 +40,7 @@ behave. Every `kestrel-core` test does that, with no broker and no executor.
 | | |
 |---|---|
 | **Consumer, assign-only** | works — `ApiVersions`, `Metadata`, `ListOffsets`, `Fetch`, seek, READ_COMMITTED filtering |
-| **Producer** | not started (P2) |
+| **Producer** | idempotent and transactional — sequencing, coordinator routing, zombie fencing. **Partitioning is the caller's**: `send(topic, partition, ..)` takes an explicit partition, there is no default partitioner yet |
 | **Leader routing, metadata cache** | works — fetches go to the leader from the cluster map, `NOT_LEADER_OR_FOLLOWER` invalidates that partition and retries |
 | **TLS, SASL** | not started (P3). The `futures-io` seam means `futures-rustls` drops in |
 | **Consumer groups** | **out of scope** — callers assign partitions themselves |
@@ -48,7 +48,7 @@ behave. Every `kestrel-core` test does that, with no broker and no executor.
 ## Tests
 
 ```sh
-cargo test                                        # 36 unit tests, no broker, no runtime
+cargo test                                        # 52 unit tests, no broker, no runtime
 cargo test -p kestrel-glommio -- --ignored --test-threads=1   # needs a broker
 ```
 

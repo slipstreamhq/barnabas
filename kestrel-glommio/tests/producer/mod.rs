@@ -1,9 +1,17 @@
 //! A minimal producer, for putting data in front of the consumer under test.
 //!
-//! **Test scaffolding, not library code.** `kestrel` has no producer until P2;
-//! this drives `kafka-protocol` directly, panics on everything, and implements
-//! only what these tests need. Its one non-obvious behaviour is documented
-//! where it lives: transaction sequence numbers continue across transactions.
+//! **Test scaffolding, not library code.** It drives `kafka-protocol` directly,
+//! panics on everything, and implements only what the tests need. `kestrel`'s
+//! own producer is deliberately not used here: a test whose fixture is the code
+//! under test cannot fail honestly.
+//!
+//! Its one non-obvious behaviour is the one P0 found: transaction sequence
+//! numbers continue across transactions.
+
+// The producer tests use only `create_topic`; the rest is what the consumer
+// tests need. Shared rather than split so there is one scaffolding producer to
+// keep correct.
+#![allow(dead_code)]
 
 use bytes::{Bytes, BytesMut};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};

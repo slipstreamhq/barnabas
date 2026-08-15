@@ -15,15 +15,17 @@
 //!
 //! # Scope
 //!
-//! Assign-only consumer, with leader routing and a metadata cache. No producer
-//! — that is P2, and a sketch of one here would make the shape harder to
-//! change rather than easier.
+//! Assign-only consumer and a transactional producer, both with leader routing
+//! and a metadata cache. No consumer groups, and there will not be any: callers
+//! assign partitions themselves.
 
 pub mod cluster;
 pub mod consumer;
+pub mod producer;
 
 pub use cluster::Cluster;
 pub use consumer::{Consumer, EARLIEST, LATEST};
+pub use producer::{Producer, ProducerRecord};
 pub use kestrel_core::IsolationLevel;
 
 use kestrel_core::{Disposition, ErrorCode};
@@ -58,6 +60,12 @@ pub enum Error {
     /// caller can back off and retry rather than treat it as fatal.
     #[error("{topic}-{partition} has no leader")]
     NoLeader { topic: String, partition: i32 },
+
+    /// A misuse of the producer, caught by the state machine rather than by a
+    /// broker — producing outside a transaction, to an unenrolled partition, or
+    /// after being fenced.
+    #[error("producer: {0}")]
+    Producer(#[from] kestrel_core::producer::ProducerError),
 
     #[error("the broker's response contained no {0}")]
     Missing(&'static str),
