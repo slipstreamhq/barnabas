@@ -54,8 +54,12 @@ fn records(values: &[&str]) -> Vec<ProducerRecord> {
 /// Topic creation still uses the test scaffolding — `kestrel` has no admin
 /// client, and it does not need one.
 async fn make_topic(topic: &str) {
+    make_topic_with_partitions(topic, 1).await;
+}
+
+async fn make_topic_with_partitions(topic: &str, partitions: i32) {
     let mut admin = TestProducer::connect(BROKER, topic).await;
-    admin.create_topic().await;
+    admin.create_topic_with_partitions(partitions).await;
 }
 
 async fn read_all(topic: &str, want: usize, isolation: IsolationLevel) -> Vec<String> {
@@ -287,6 +291,95 @@ fn a_new_producer_fences_the_old_one() {
 
         let seen = read_all(&topic, 1, IsolationLevel::ReadCommitted).await;
         assert!(seen.is_empty(), "the zombie's records landed: {seen:?}");
+    });
+}
+
+/// **Keyed placement, end to end.** `send_keyed` hashes the key, picks the
+/// partition, and routes the batch to *that partition's leader* — the same two
+/// steps librdkafka and the Java client take. This checks the record really
+/// arrives on the partition the partitioner named, by reading that partition
+/// alone.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn keyed_records_land_on_the_partition_their_key_names() {
+    run(|| async {
+        let topic = unique("keyed");
+        make_topic_with_partitions(&topic, 4).await;
+
+        let mut producer = Producer::idempotent(&bootstrap(), "kestrel-test")
+            .await
+            .expect("producer");
+
+        // Where each key should go, according to the partitioner alone.
+        let keys = ["alpha", "beta", "gamma", "delta", "epsilon"];
+        let mut expected = Vec::new();
+        for key in keys {
+            let partition = producer
+                .partition_for(&topic, Some(key.as_bytes()))
+                .await
+                .expect("partition_for");
+            expected.push((key, partition));
+        }
+
+        let written = producer
+            .send_keyed(
+                &topic,
+                &keys
+                    .iter()
+                    .map(|k| {
+                        ProducerRecord::new(
+                            Some(Bytes::from((*k).to_owned())),
+                            Some(Bytes::from(format!("v-{k}"))),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .expect("send_keyed");
+        assert!(!written.is_empty(), "nothing was written");
+
+        // Read each partition on its own and check the keys that arrived are
+        // exactly the ones the partitioner assigned to it.
+        for partition in 0..4 {
+            let want: Vec<&str> = expected
+                .iter()
+                .filter(|(_, p)| *p == partition)
+                .map(|(k, _)| *k)
+                .collect();
+
+            let mut consumer = Consumer::assign(
+                &bootstrap(),
+                "kestrel-producer-test",
+                &topic,
+                partition,
+                EARLIEST,
+                IsolationLevel::ReadCommitted,
+            )
+            .await
+            .expect("assign");
+            consumer.set_max_wait(Duration::from_millis(200));
+
+            let mut got = Vec::new();
+            for _ in 0..10 {
+                for record in consumer.fetch().await.expect("fetch") {
+                    got.push(
+                        record
+                            .key
+                            .as_ref()
+                            .map(|k| String::from_utf8_lossy(k).into_owned())
+                            .unwrap_or_default(),
+                    );
+                }
+                if got.len() >= want.len() {
+                    break;
+                }
+            }
+            assert_eq!(
+                got, want,
+                "partition {partition} held the wrong keys; the record did not \
+                 reach the leader its key names"
+            );
+        }
     });
 }
 

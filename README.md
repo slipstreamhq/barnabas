@@ -40,7 +40,7 @@ behave. Every `kestrel-core` test does that, with no broker and no executor.
 | | |
 |---|---|
 | **Consumer, assign-only** | works — `ApiVersions`, `Metadata`, `ListOffsets`, `Fetch`, seek, READ_COMMITTED filtering |
-| **Producer** | idempotent and transactional — sequencing, coordinator routing, zombie fencing. **Partitioning is the caller's**: `send(topic, partition, ..)` takes an explicit partition, there is no default partitioner yet |
+| **Producer** | idempotent and transactional — sequencing, coordinator routing, zombie fencing, keyed partitioning |
 | **Leader routing, metadata cache** | works — fetches go to the leader from the cluster map, `NOT_LEADER_OR_FOLLOWER` invalidates that partition and retries |
 | **TLS, SASL** | not started (P3). The `futures-io` seam means `futures-rustls` drops in |
 | **Consumer groups** | **out of scope** — callers assign partitions themselves |
@@ -48,7 +48,7 @@ behave. Every `kestrel-core` test does that, with no broker and no executor.
 ## Tests
 
 ```sh
-cargo test                                        # 52 unit tests, no broker, no runtime
+cargo test                                        # 63 unit tests, no broker, no runtime
 cargo test -p kestrel-glommio -- --ignored --test-threads=1   # needs a broker
 ```
 
@@ -75,6 +75,13 @@ they do:
   the original base offset echoed back, nothing written, transaction committed empty.
 - **Invalidate per partition, not wholesale.** One moved partition does not make the rest of the
   map wrong, and throwing it all away turns a single failover into a reconnect storm.
+- **There is no single "Kafka default" partitioner.** librdkafka hashes keys with CRC-32; the Java
+  client uses murmur2. Same key, same topic, different partition, no error. `kestrel` implements
+  both and defaults to CRC-32, so a program migrating off `rdkafka` keeps its placement — checked
+  against `rdkafka` itself, key for key, while it is still around to be the oracle.
+- **Metadata requests ask for topic auto-creation**, as librdkafka and Java do, and
+  `UNKNOWN_TOPIC_OR_PARTITION` refreshes rather than failing: a topic being created reports it for
+  a moment.
 - **Error codes are states, not failures.** A cold cluster answers 15, then 14, then 16 — the last
   *after* a successful `FindCoordinator`. `CONCURRENT_TRANSACTIONS` (51) appears whenever a
   transaction starts right after one ends. See `ErrorCode::disposition`.

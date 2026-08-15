@@ -31,7 +31,7 @@ use kafka_protocol::records::{
     Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
 };
 use kestrel_core::producer::{ProducerIdentity, ProducerState, SequenceRange};
-use kestrel_core::{Disposition, ErrorCode};
+use kestrel_core::{Disposition, ErrorCode, Partitioner};
 
 use crate::cluster::Cluster;
 use crate::{Error, Result};
@@ -76,6 +76,10 @@ pub struct Producer {
     acks: i16,
     timeout_ms: i32,
     compression: Compression,
+    partitioner: Partitioner,
+    /// Round-robin counter for null-keyed records. See
+    /// [`kestrel_core::partitioner`].
+    round_robin: u32,
 }
 
 impl Producer {
@@ -99,6 +103,8 @@ impl Producer {
             acks: -1,
             timeout_ms: 30_000,
             compression: Compression::None,
+            partitioner: Partitioner::default(),
+            round_robin: 0,
         };
         me.init_producer_id().await?;
         Ok(me)
@@ -117,9 +123,20 @@ impl Producer {
             acks: -1,
             timeout_ms: 30_000,
             compression: Compression::None,
+            partitioner: Partitioner::default(),
+            round_robin: 0,
         };
         me.init_producer_id().await?;
         Ok(me)
+    }
+
+    /// Choose which hash decides a keyed record's partition.
+    ///
+    /// Defaults to [`Partitioner::Crc32`], which is librdkafka's — so a program
+    /// migrating off `rdkafka` keeps its key placement. The Java client's
+    /// murmur2 is the other option, and the two disagree for most keys.
+    pub fn set_partitioner(&mut self, partitioner: Partitioner) {
+        self.partitioner = partitioner;
     }
 
     /// Compress batches with `compression`. Applies to whole batches, which is
@@ -424,7 +441,17 @@ impl Producer {
         let batch = self.encode_batch(records, range)?;
 
         for attempt in 0..MAX_RETRIES {
-            let addr = self.cluster.leader_addr(topic, partition).await?;
+            // A topic that is still being auto-created has no leader yet, which
+            // is a wait rather than a failure — the same reason error 3
+            // refreshes instead of failing.
+            let addr = match self.cluster.leader_addr(topic, partition).await {
+                Ok(addr) => addr,
+                Err(Error::NoLeader { .. }) if attempt + 1 < MAX_RETRIES => {
+                    Self::backoff(attempt).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let req = self.produce_request(topic, partition, batch.clone());
 
             let resp: ProduceResponse = self
@@ -478,6 +505,80 @@ impl Producer {
             code: ErrorCode::NOT_LEADER_OR_FOLLOWER.0,
             disposition: Disposition::RefreshMetadata,
         })
+    }
+
+    /// Produce records to whichever partitions their keys hash to.
+    ///
+    /// The counterpart to [`Self::send`], for callers that want Kafka's usual
+    /// key-based placement rather than choosing partitions themselves. Records
+    /// are grouped by partition and sent as one batch each, which is what makes
+    /// this cheaper than a send per record.
+    ///
+    /// Returns the base offset per partition written.
+    ///
+    /// # Errors
+    /// As [`Self::send`], plus failure to learn the topic's partition count.
+    pub async fn send_keyed(
+        &mut self,
+        topic: &str,
+        records: &[ProducerRecord],
+    ) -> Result<Vec<(i32, i64)>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The partition count decides where every key lands, so a topic that is
+        // still materialising must be waited for rather than partitioned
+        // against a count of zero.
+        let mut count = 0;
+        for attempt in 0..MAX_RETRIES {
+            match self.cluster.partition_count(topic).await {
+                Ok(n) => {
+                    count = n;
+                    break;
+                }
+                Err(Error::NoLeader { .. }) if attempt + 1 < MAX_RETRIES => {
+                    Self::backoff(attempt).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if count == 0 {
+            return Err(Error::NoLeader {
+                topic: topic.to_owned(),
+                partition: -1,
+            });
+        }
+
+        let mut by_partition: std::collections::BTreeMap<i32, Vec<ProducerRecord>> =
+            std::collections::BTreeMap::new();
+        for record in records {
+            let partition = self.partitioner.partition_for(
+                record.key.as_deref(),
+                count,
+                &mut self.round_robin,
+            );
+            by_partition.entry(partition).or_default().push(record.clone());
+        }
+
+        let mut offsets = Vec::with_capacity(by_partition.len());
+        for (partition, batch) in by_partition {
+            let base = self.send(topic, partition, &batch).await?;
+            offsets.push((partition, base));
+        }
+        Ok(offsets)
+    }
+
+    /// Which partition a key would go to, without sending anything.
+    ///
+    /// Exposed for the parity test that checks this places keys exactly where
+    /// `rdkafka` does — see `slipstream-kafka`'s partitioner parity test.
+    ///
+    /// # Errors
+    /// If the topic's partition count cannot be learned.
+    pub async fn partition_for(&mut self, topic: &str, key: Option<&[u8]>) -> Result<i32> {
+        let count = self.cluster.partition_count(topic).await?;
+        let mut scratch = self.round_robin;
+        Ok(self.partitioner.partition_for(key, count, &mut scratch))
     }
 
     fn encode_batch(&self, records: &[ProducerRecord], range: SequenceRange) -> Result<Bytes> {

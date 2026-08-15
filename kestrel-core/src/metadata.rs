@@ -110,6 +110,23 @@ impl Metadata {
         self.leaders.remove(&(topic.to_owned(), partition));
     }
 
+    /// How many partitions the client knows this topic has.
+    ///
+    /// Counted from known leaders, so it is only as complete as the last
+    /// refresh — which is why [`Self::update`] skipping errored partitions
+    /// matters here: a partition mid-election would otherwise shrink the count
+    /// and silently move every key.
+    #[must_use]
+    pub fn partition_count(&self, topic: &str) -> i32 {
+        i32::try_from(
+            self.leaders
+                .keys()
+                .filter(|(name, _)| name == topic)
+                .count(),
+        )
+        .unwrap_or(i32::MAX)
+    }
+
     /// Every broker the client has heard of, for connection cleanup.
     pub fn brokers(&self) -> impl Iterator<Item = &BrokerAddr> {
         self.brokers.values()
@@ -248,6 +265,23 @@ mod tests {
         ));
         assert!(md.leader_for("t", 0).is_none());
         assert_eq!(md.broker(7).unwrap().addr(), "kafka-7:9092");
+    }
+
+    /// The partition count follows what the last refresh knew.
+    #[test]
+    fn the_partition_count_follows_metadata() {
+        let mut md = Metadata::new();
+        assert_eq!(md.partition_count("t"), 0);
+        md.update(&response(
+            vec![broker(1, "kafka-1", 9092)],
+            vec![topic(
+                "t",
+                0,
+                vec![partition(0, 1, 0), partition(1, 1, 0), partition(2, 1, 0)],
+            )],
+        ));
+        assert_eq!(md.partition_count("t"), 3);
+        assert_eq!(md.partition_count("other"), 0);
     }
 
     /// **Invalidation is per partition.** One moved partition must not throw

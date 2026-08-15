@@ -27,17 +27,21 @@
 //! - [`conn`] — request/response correlation over a single broker connection.
 //! - [`consumer`] — assign-only fetch positions and READ_COMMITTED filtering.
 //! - [`metadata`] — the cluster map, and knowing when it is stale.
+//! - [`partitioner`] — which partition a keyed record lands on, and why the
+//!   answer differs between Kafka clients.
 //! - [`producer`] — idempotent sequencing and the transaction state machine.
 
 pub mod conn;
 pub mod consumer;
 pub mod frame;
 pub mod metadata;
+pub mod partitioner;
 pub mod producer;
 
 pub use conn::{Connection, PendingResponse};
 pub use consumer::{FetchPosition, IsolationLevel};
 pub use metadata::{BrokerAddr, Metadata};
+pub use partitioner::Partitioner;
 pub use producer::{ProducerIdentity, ProducerState, SequenceRange, TxnState};
 
 /// Everything that can go wrong in the core.
@@ -102,6 +106,10 @@ pub enum Disposition {
 impl ErrorCode {
     pub const NONE: Self = Self(0);
     pub const OFFSET_OUT_OF_RANGE: Self = Self(1);
+    /// The topic or partition is not (yet) known to this broker. Transient
+    /// while a topic is being auto-created, and part of Kafka's
+    /// invalid-metadata family — so it refreshes rather than failing.
+    pub const UNKNOWN_TOPIC_OR_PARTITION: Self = Self(3);
     pub const LEADER_NOT_AVAILABLE: Self = Self(5);
     pub const NOT_LEADER_OR_FOLLOWER: Self = Self(6);
     pub const REQUEST_TIMED_OUT: Self = Self(7);
@@ -132,9 +140,9 @@ impl ErrorCode {
     pub fn disposition(self) -> Disposition {
         match self {
             Self::NONE => Disposition::Ok,
-            Self::LEADER_NOT_AVAILABLE | Self::NOT_LEADER_OR_FOLLOWER => {
-                Disposition::RefreshMetadata
-            }
+            Self::LEADER_NOT_AVAILABLE
+            | Self::NOT_LEADER_OR_FOLLOWER
+            | Self::UNKNOWN_TOPIC_OR_PARTITION => Disposition::RefreshMetadata,
             Self::COORDINATOR_LOAD_IN_PROGRESS | Self::COORDINATOR_NOT_AVAILABLE => {
                 Disposition::Retry
             }
@@ -199,6 +207,17 @@ mod tests {
     fn not_leader_refreshes_metadata() {
         assert_eq!(
             ErrorCode::NOT_LEADER_OR_FOLLOWER.disposition(),
+            Disposition::RefreshMetadata
+        );
+    }
+
+    /// A topic being auto-created answers 3 for a moment. Treating it as fatal
+    /// makes the first write to a new topic fail, which is what happened when
+    /// the sink moved onto this client.
+    #[test]
+    fn an_unknown_topic_refreshes_metadata() {
+        assert_eq!(
+            ErrorCode::UNKNOWN_TOPIC_OR_PARTITION.disposition(),
             Disposition::RefreshMetadata
         );
     }

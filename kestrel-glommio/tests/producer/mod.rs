@@ -89,9 +89,13 @@ impl TestProducer {
     /// retry; the tests wait explicitly so a failure here is never mistaken for
     /// a consumer bug.
     pub async fn create_topic(&mut self) {
+        self.create_topic_with_partitions(1).await;
+    }
+
+    pub async fn create_topic_with_partitions(&mut self, partitions: i32) {
         let mut topic = CreatableTopic::default();
         topic.name = TopicName(StrBytes::from_string(self.topic.clone()));
-        topic.num_partitions = 1;
+        topic.num_partitions = partitions;
         topic.replication_factor = 1;
 
         let mut req = CreateTopicsRequest::default();

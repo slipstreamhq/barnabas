@@ -101,6 +101,13 @@ impl Broker {
 pub struct Cluster {
     client_id: String,
     bootstrap: Vec<String>,
+    /// Whether a metadata request may create the topic.
+    ///
+    /// **True by default, which is what librdkafka and the Java client do.** A
+    /// producer's first write to a new topic otherwise fails with error 3
+    /// rather than creating it — and a caller that expected the usual
+    /// behaviour has no way to tell that from a genuinely missing topic.
+    allow_auto_topic_creation: bool,
     /// Keyed by `host:port` rather than node id: a broker that restarts with a
     /// new id at the same address should reuse the socket, and a bootstrap
     /// address has no node id until the first `Metadata` reply.
@@ -119,11 +126,17 @@ impl Cluster {
             bootstrap: bootstrap.to_vec(),
             conns: HashMap::new(),
             metadata: Metadata::new(),
+            allow_auto_topic_creation: true,
         };
         // Touch one bootstrap address so a bad configuration fails here rather
         // than at the first fetch.
         me.any_broker().await?;
         Ok(me)
+    }
+
+    /// Whether metadata requests may create missing topics. See the field.
+    pub fn set_allow_auto_topic_creation(&mut self, allow: bool) {
+        self.allow_auto_topic_creation = allow;
     }
 
     /// The cluster map, for callers that want to inspect leadership.
@@ -173,10 +186,17 @@ impl Cluster {
         req_topic.name = Some(TopicName(StrBytes::from_string(topic.to_owned())));
         let mut req = MetadataRequest::default();
         req.topics = Some(vec![req_topic]);
+        req.allow_auto_topic_creation = self.allow_auto_topic_creation;
 
         let resp: MetadataResponse = self.any_broker().await?.call(ApiKey::Metadata, 12, &req).await?;
         for t in &resp.topics {
-            check("Metadata", t.error_code)?;
+            let code = kestrel_core::ErrorCode(t.error_code);
+            // An invalid-metadata code is "not yet", not "no": a topic being
+            // auto-created reports 3 until it exists. The response is still
+            // merged — its brokers are real — and the caller retries.
+            if !code.is_ok() && code.disposition() != kestrel_core::Disposition::RefreshMetadata {
+                check("Metadata", t.error_code)?;
+            }
         }
         self.metadata.update(&resp);
         Ok(())
@@ -201,6 +221,25 @@ impl Cluster {
                 topic: topic.to_owned(),
                 partition,
             })
+    }
+
+    /// How many partitions `topic` has, refreshing metadata if the client has
+    /// not seen it yet.
+    ///
+    /// # Errors
+    /// If metadata cannot be refreshed, or the topic has no partitions after it.
+    pub async fn partition_count(&mut self, topic: &str) -> Result<i32> {
+        if self.metadata.partition_count(topic) == 0 {
+            self.refresh_metadata(topic).await?;
+        }
+        let count = self.metadata.partition_count(topic);
+        if count == 0 {
+            return Err(Error::NoLeader {
+                topic: topic.to_owned(),
+                partition: -1,
+            });
+        }
+        Ok(count)
     }
 
     /// Forget one partition's leader after the broker said it is not the
