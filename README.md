@@ -41,14 +41,14 @@ behave. Every `kestrel-core` test does that, with no broker and no executor.
 |---|---|
 | **Consumer, assign-only** | works — `ApiVersions`, `Metadata`, `ListOffsets`, `Fetch`, seek, READ_COMMITTED filtering |
 | **Producer** | not started (P2) |
-| **Leader routing, metadata cache** | not started — one connection, one broker |
+| **Leader routing, metadata cache** | works — fetches go to the leader from the cluster map, `NOT_LEADER_OR_FOLLOWER` invalidates that partition and retries |
 | **TLS, SASL** | not started (P3). The `futures-io` seam means `futures-rustls` drops in |
 | **Consumer groups** | **out of scope** — callers assign partitions themselves |
 
 ## Tests
 
 ```sh
-cargo test                                        # 29 unit tests, no broker, no runtime
+cargo test                                        # 36 unit tests, no broker, no runtime
 cargo test -p kestrel-glommio -- --ignored --test-threads=1   # needs a broker
 ```
 
@@ -73,6 +73,8 @@ they do:
   stalls forever while looking perfectly healthy.
 - **Sequence numbers continue across transactions.** Restarting them makes the broker dedupe: `Ok`,
   the original base offset echoed back, nothing written, transaction committed empty.
+- **Invalidate per partition, not wholesale.** One moved partition does not make the rest of the
+  map wrong, and throwing it all away turns a single failover into a reconnect storm.
 - **Error codes are states, not failures.** A cold cluster answers 15, then 14, then 16 — the last
   *after* a successful `FindCoordinator`. `CONCURRENT_TRANSACTIONS` (51) appears whenever a
   transaction starts right after one ends. See `ErrorCode::disposition`.

@@ -26,13 +26,16 @@
 //!   are handled.
 //! - [`conn`] — request/response correlation over a single broker connection.
 //! - [`consumer`] — assign-only fetch positions and READ_COMMITTED filtering.
+//! - [`metadata`] — the cluster map, and knowing when it is stale.
 
 pub mod conn;
 pub mod consumer;
 pub mod frame;
+pub mod metadata;
 
 pub use conn::{Connection, PendingResponse};
 pub use consumer::{FetchPosition, IsolationLevel};
+pub use metadata::{BrokerAddr, Metadata};
 
 /// Everything that can go wrong in the core.
 ///

@@ -37,6 +37,10 @@ use kestrel_glommio::{Consumer, EARLIEST};
 
 use producer::TestProducer;
 
+fn bootstrap() -> Vec<String> {
+    vec!["127.0.0.1:9092".to_owned()]
+}
+
 const BROKER: &str = "127.0.0.1:9092";
 
 /// A topic per test, so tests neither see each other's records nor depend on
@@ -66,7 +70,7 @@ fn plain_records_round_trip() {
         prod.produce_plain(3).await;
 
         let mut consumer = Consumer::assign(
-            BROKER,
+            &bootstrap(),
             "kestrel-test",
             &topic,
             0,
@@ -102,7 +106,7 @@ fn an_aborted_transaction_is_invisible() {
         prod.end(false).await;
 
         let mut consumer = Consumer::assign(
-            BROKER,
+            &bootstrap(),
             "kestrel-test",
             &topic,
             0,
@@ -151,7 +155,7 @@ fn a_commit_after_an_abort_survives() {
         prod.end(true).await;
 
         let mut consumer = Consumer::assign(
-            BROKER,
+            &bootstrap(),
             "kestrel-test",
             &topic,
             0,
@@ -185,7 +189,7 @@ fn read_uncommitted_sees_aborted_records() {
         prod.end(false).await;
 
         let mut consumer = Consumer::assign(
-            BROKER,
+            &bootstrap(),
             "kestrel-test",
             &topic,
             0,
@@ -212,7 +216,7 @@ fn seek_positions_the_next_fetch() {
         prod.produce_plain(5).await;
 
         let mut consumer = Consumer::assign(
-            BROKER,
+            &bootstrap(),
             "kestrel-test",
             &topic,
             0,
@@ -229,6 +233,48 @@ fn seek_positions_the_next_fetch() {
             .map(|r| String::from_utf8_lossy(r.value.as_ref().unwrap()).into_owned())
             .collect();
         assert_eq!(values, vec!["v3", "v4"]);
+    });
+}
+
+/// Fetches go to the **leader**, which is discovered from metadata rather than
+/// assumed to be the bootstrap broker.
+///
+/// A single-node cluster cannot prove routing chose the right broker — there is
+/// only one — but it does prove the path is taken: the consumer resolves a
+/// leader address from metadata, connects to it, and fetches over that
+/// connection. On this cluster the leader advertises `localhost:9092` while the
+/// bootstrap address is `127.0.0.1:9092`, so the two are distinct strings and a
+/// consumer that skipped routing would hold one connection instead of two.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn fetches_are_routed_to_the_partition_leader() {
+    run(|| async {
+        let topic = unique_topic("routing");
+        let mut prod = TestProducer::connect(BROKER, &topic).await;
+        prod.create_topic().await;
+        prod.produce_plain(1).await;
+
+        let mut consumer = Consumer::assign(
+            &bootstrap(),
+            "kestrel-test",
+            &topic,
+            0,
+            EARLIEST,
+            IsolationLevel::ReadCommitted,
+        )
+        .await
+        .expect("assign");
+
+        let leader = consumer
+            .metadata_leader(&topic, 0)
+            .expect("a leader in the cluster map");
+        assert!(
+            leader.ends_with(":9092"),
+            "leader address came from metadata: {leader}"
+        );
+
+        let records = fetch_until(&mut consumer, 1).await;
+        assert_eq!(records.len(), 1);
     });
 }
 
