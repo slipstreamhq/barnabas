@@ -39,8 +39,18 @@ serves both a per-core handle and a work-stealing one.
 
 The second reason for sans-io is testing, and for a Kafka client it is the bigger one: exactly-once
 bugs are silent — a wrong retry duplicates records while every status code stays green — so they
-have to be caught by driving the state machine adversarially rather than by watching a broker
-behave. Every `kestrel-core` test does that, with no broker and no executor.
+have to be caught by driving the client adversarially rather than by watching a broker behave.
+
+`kestrel-client/tests/adversarial.rs` does exactly that. The `Transport` seam takes a **simulated
+broker** that speaks the real wire protocol and lies on cue: a leader that moves mid-produce, a
+coordinator that migrates, a fenced epoch, an out-of-sequence error. No runtime, no sockets, and
+`sleep` returns immediately, so a test that forces forty retries runs in microseconds and
+reproduces exactly. The assertions are on what the broker **accepted** — a duplicate returns `Ok`
+just like a success does.
+
+Both properties were mutation-proved: resetting sequences per transaction fails
+`sequences_continue_across_transactions`, and classifying `NOT_COORDINATOR` as a plain retry fails
+`a_moved_coordinator_is_rediscovered`.
 
 ## Status
 
@@ -56,7 +66,7 @@ behave. Every `kestrel-core` test does that, with no broker and no executor.
 ## Tests
 
 ```sh
-cargo test                                        # 65 unit tests, no broker, no runtime
+cargo test                                        # 74 tests, no broker, no runtime
 cargo test -p kestrel-glommio -- --ignored --test-threads=1   # needs a broker
 cargo test -p kestrel-tokio   -- --ignored --test-threads=1   # the same suite, other runtime
 ```

@@ -468,6 +468,7 @@ name = "kestrel-client"
 version = "0.0.1"
 dependencies = [
  "bytes",
+ "futures-lite",
  "kafka-protocol",
  "kestrel-core",
  "thiserror",
