@@ -44,10 +44,17 @@ use crate::{check, Error, Result, Transport};
 /// deliberately generous: this is a liveness backstop, not a latency budget.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Largest single read. Bounds the per-connection buffer while still being big
+/// enough that a multi-megabyte fetch response arrives in a few reads.
+const MAX_READ: usize = 1024 * 1024;
+
 /// One broker connection.
 pub(crate) struct Broker<T: Transport> {
     stream: T::Stream,
     conn: Connection,
+    /// Reused across reads, sized to the frame being read rather than to a
+    /// fixed chunk. See [`Self::recv`].
+    read_buf: Vec<u8>,
     /// What this broker said it speaks, per API key: `(min, max)`.
     ///
     /// **The point of the `ApiVersions` handshake, which this client used to
@@ -77,6 +84,7 @@ impl<T: Transport> Broker<T> {
         let mut me = Self {
             stream,
             conn: Connection::new(StrBytes::from_string(client_id.to_owned())),
+            read_buf: Vec::new(),
             versions: BTreeMap::new(),
         };
 
@@ -234,20 +242,38 @@ impl<T: Transport> Broker<T> {
     }
 
     /// Read the answer to the **oldest** outstanding request.
+    ///
+    /// **The read is sized to the frame, not to a fixed chunk.** This used to
+    /// read into a 16 KiB stack buffer, which for a 10 MiB fetch response meant
+    /// more than six hundred reads and six hundred copies into the decoder's
+    /// buffer. Produce responses are a few hundred bytes and never noticed;
+    /// fetch responses are megabytes, which is why the cost showed up on the
+    /// consume side of the benchmark and nowhere else.
+    ///
+    /// The length prefix says how much is coming, so after the first small read
+    /// the rest arrives in a handful of large ones.
     pub(crate) async fn recv<Resp: Decodable>(&mut self) -> Result<Resp> {
         loop {
             if let Some(resp) = self.conn.next_response()? {
                 return Ok(Connection::decode(&resp)?);
             }
-            let mut buf = [0u8; 16 * 1024];
-            let n = T::read(&mut self.stream, &mut buf).await?;
+
+            // Capped so a large `fetch.max.bytes` cannot turn into one
+            // enormous buffer, and floored so the prefix read is not a
+            // four-byte syscall.
+            let want = self.conn.needed().clamp(16 * 1024, MAX_READ);
+            if self.read_buf.len() < want {
+                self.read_buf.resize(want, 0);
+            }
+
+            let n = T::read(&mut self.stream, &mut self.read_buf[..want]).await?;
             if n == 0 {
                 return Err(Error::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "broker closed the connection",
                 )));
             }
-            self.conn.push_bytes(&buf[..n]);
+            self.conn.push_bytes(&self.read_buf[..n]);
         }
     }
 

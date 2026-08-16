@@ -118,6 +118,13 @@ impl Connection {
         self.decoder.push(bytes);
     }
 
+    /// How many more bytes the next response needs. See
+    /// [`FrameDecoder::needed`](crate::frame::FrameDecoder::needed).
+    #[must_use]
+    pub fn needed(&self) -> usize {
+        self.decoder.needed()
+    }
+
     /// Take the next complete response, matched to its request.
     ///
     /// # Errors

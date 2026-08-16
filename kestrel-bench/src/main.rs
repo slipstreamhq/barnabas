@@ -217,6 +217,7 @@ fn kestrel_consume(topic: &str, expect: usize) -> Duration {
 
             let start = Instant::now();
             let mut seen = 0;
+            let mut polls = 0u64;
             while seen < expect {
                 let groups = consumer.fetch().await.expect("fetch");
                 let got: usize = groups.iter().map(|g| g.records.len()).sum();
@@ -224,8 +225,15 @@ fn kestrel_consume(topic: &str, expect: usize) -> Duration {
                     break;
                 }
                 seen += got;
+                polls += 1;
             }
             assert_eq!(seen, expect, "kestrel consumed {seen} of {expect}");
+            if std::env::var("KESTREL_DEBUG").is_ok() {
+                eprintln!(
+                    "  kestrel: {polls} polls, {:.0} records/poll",
+                    seen as f64 / polls as f64
+                );
+            }
             start.elapsed()
         })
 }
@@ -868,6 +876,48 @@ fn rdkafka_produce_many_clients(topic: &str, clients: usize, cell: &Cell) -> Dur
     start.elapsed()
 }
 
+/// The same consume loop on **tokio**, to separate the runtime from the code.
+///
+/// If this matches the glommio number, the gap to rskafka is in what this
+/// client does per record, not in which executor it does it on.
+fn kestrel_consume_tokio(topic: &str, expect: usize) -> Duration {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    runtime.block_on(async {
+        let mut consumer = kestrel_tokio::Consumer::new(
+            kestrel_tokio::Tokio,
+            &brokers(),
+            "bench",
+            kestrel_core::IsolationLevel::ReadCommitted,
+        )
+        .await
+        .expect("consumer");
+        for partition in 0..PARTITIONS {
+            consumer
+                .add(topic, partition, kestrel_tokio::EARLIEST)
+                .await
+                .expect("assign");
+        }
+        consumer.set_max_wait(Duration::from_millis(100));
+
+        let start = Instant::now();
+        let mut seen = 0;
+        while seen < expect {
+            let groups = consumer.fetch().await.expect("fetch");
+            let got: usize = groups.iter().map(|g| g.records.len()).sum();
+            if got == 0 {
+                break;
+            }
+            seen += got;
+        }
+        assert_eq!(seen, expect, "kestrel/tokio consumed {seen} of {expect}");
+        start.elapsed()
+    })
+}
+
 // ── rskafka ──────────────────────────────────────────────────────────────────
 //
 // The other pure-Rust client, and the closest peer to this one: async, no C
@@ -961,9 +1011,11 @@ fn rskafka_consume(topic: &str, expect: usize) -> Duration {
         let start = Instant::now();
         let mut offsets = vec![0i64; partitions.len()];
         let mut seen = 0;
+        let mut polls = 0u64;
         while seen < expect {
             let mut got = 0;
             for (i, partition) in partitions.iter().enumerate() {
+                polls += 1;
                 let (records, _high) = partition
                     .fetch_records(offsets[i], 1..10_485_760, 100)
                     .await
@@ -979,6 +1031,12 @@ fn rskafka_consume(topic: &str, expect: usize) -> Duration {
             seen += got;
         }
         assert_eq!(seen, expect, "rskafka consumed {seen} of {expect}");
+        if std::env::var("KESTREL_DEBUG").is_ok() {
+            eprintln!(
+                "  rskafka: {polls} fetches, {:.0} records/fetch",
+                seen as f64 / polls as f64
+            );
+        }
         start.elapsed()
     })
 }
@@ -1101,6 +1159,12 @@ fn main() {
         create_topic(&rd_topic);
         rdkafka_produce(&rd_topic, &cell);
         let rdkafka_rate = cell.rate(rdkafka_consume(&rd_topic, cell.records));
+
+        let tk_topic = topic("tc");
+        create_topic(&tk_topic);
+        kestrel_produce(&tk_topic, &cell);
+        let tokio_rate = cell.rate(kestrel_consume_tokio(&tk_topic, cell.records));
+        println!("      (kestrel on tokio: {tokio_rate:.0} rec/s)");
 
         let rs_topic = topic("sc");
         create_topic(&rs_topic);

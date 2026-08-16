@@ -45,6 +45,26 @@ impl FrameDecoder {
         self.buf.len()
     }
 
+    /// How many more bytes are needed before [`Self::next_frame`] can return.
+    ///
+    /// **This is what lets a reader size its read to the frame.** A caller that
+    /// reads into a small fixed buffer issues one syscall per chunk — for a
+    /// 10 MiB fetch response and a 16 KiB buffer, more than six hundred of them
+    /// — and copies every byte twice. Knowing the length prefix turns that into
+    /// a handful of large reads.
+    ///
+    /// Returns 4 while the prefix itself is incomplete, since that is what must
+    /// be read before anything else can be known.
+    #[must_use]
+    pub fn needed(&self) -> usize {
+        if self.buf.len() < 4 {
+            return 4 - self.buf.len();
+        }
+        let len = i32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]);
+        let len = usize::try_from(len).unwrap_or(0).min(self.max_frame);
+        (4 + len).saturating_sub(self.buf.len())
+    }
+
     /// Take the next complete frame, if one has arrived.
     ///
     /// The length prefix is consumed and not returned: every caller wants the

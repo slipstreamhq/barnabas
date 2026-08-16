@@ -135,6 +135,29 @@ pub fn filter(
     let mut aborted_producers: HashSet<i64> = HashSet::new();
 
     let read_committed = isolation == IsolationLevel::ReadCommitted;
+
+    // **The common case is that nothing is dropped**, and moving a million
+    // records into a second `Vec` to discover that is most of the cost of
+    // consuming. A scan that touches only three fields per record decides it
+    // without moving anything, and hands the input straight back.
+    //
+    // The conditions are exactly the four rules below, negated: no aborted
+    // ranges to track, nothing above the LSO to withhold, no control records to
+    // strip, and nothing below `fetch_offset` to skip.
+    if aborted.is_empty()
+        && !records.iter().any(|r| {
+            r.control
+                || r.offset < fetch_offset
+                || (read_committed && r.offset >= last_stable_offset)
+        })
+    {
+        let next_offset = records.last().map_or(fetch_offset, |r| r.offset + 1);
+        return Fetched {
+            records,
+            next_offset,
+        };
+    }
+
     let mut kept = Vec::with_capacity(records.len());
     let mut next_offset = fetch_offset;
 

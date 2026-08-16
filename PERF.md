@@ -242,7 +242,7 @@ the closest thing to this client, and therefore the most informative comparison 
 | batch 100, 128 B | 1 094 000 – 1 170 000 | 2 435 | see below — not a real comparison |
 | batch 1 000, 128 B | 3 972 000 – 4 569 000 | 1 176 000 – 3 139 000 | kestrel, 1.3× – 3.9× |
 | batch 1 000, 1 KiB | 1 685 000 – 1 954 000 | 1 292 000 – 1 364 000 | kestrel, 1.2× – 1.5× |
-| consume, 128 B | 2 950 000 – 3 007 000 | **4 334 000 – 4 387 000** | **rskafka, by ~45%** |
+| consume, 128 B | 3 232 000 – 3 259 000 | **4 327 000 – 5 130 000** | **rskafka, by ~35–55%** |
 
 **We are not fastest on every dimension.** rskafka beats us at small batches and, more importantly,
 **beats us on consume by about 45%**. The ~20× consume advantage over librdkafka elsewhere in this
@@ -260,6 +260,37 @@ explain them away:
 It also binds a client to **one partition**, so eight partitions are eight clients and eight
 connections, and a write spanning them is eight requests. Ours is one request per *broker*. That is
 the trade this client was designed around, and at batch 1 000 it shows.
+
+### Chasing the consume gap: four hypotheses, two dead
+
+Measured rather than argued, and two of the obvious answers are wrong.
+
+**Instrumented first.** Per 1 M records: this client does **6 polls at 167 000 records each**;
+rskafka does **16 fetches at 62 500 each**. We make *fewer* sequential round trips and still lose, so
+the gap is per-byte CPU, not I/O shape. That killed two hypotheses before either was coded.
+
+| hypothesis | result |
+|---|---|
+| Reads were 16 KiB chunks into a stack buffer, copying every byte twice — 600+ syscalls for a 10 MiB response | **No effect.** Reads are now sized from the length prefix, which is correct and cheaper in syscalls, but it moved no number. |
+| Fewer, larger fetches would win | **Disproven by measurement** — we already make fewer. |
+| `filter` moved every record into a second `Vec` even when nothing was dropped | **5–8%.** A scan touching three fields per record decides whether anything needs removing, and hands the input back untouched when it does not. Kept. |
+| glommio is the problem | **Eliminated.** The same consumer on tokio: 3 268 000 and 3 274 000 rec/s, against glommio's 3 232 000 – 3 259 000. Identical. The gap is in what this client does per record, not where it runs. |
+
+**Still open, with evidence but untested:**
+
+- **Atomic refcount traffic on `Bytes`.** A profile puts `bytes::shared_clone`, `shared_drop` and
+  `bytes_mut::shared_v_clone` at ~7.4% combined. Every record's key and value is a `Bytes` slice into
+  the fetch buffer, so a million records is two million refcount increments and as many decrements —
+  on a thread-per-core executor where nothing else touches those counts. **rskafka copies into
+  `Vec<u8>` instead**, and for 128-byte values a memcpy may well beat two atomic read-modify-writes.
+  The "zero-copy" claim in this file may be costing more than it saves at small record sizes.
+- **The record struct is fat.** `kafka_protocol::records::Record` carries producer id, epoch,
+  sequence, timestamp type, control and transactional flags and an `IndexMap` of headers — roughly
+  160 bytes — where rskafka's carries key, value, headers and timestamp. Materialising a million of
+  those costs regardless of what is in them.
+
+Both point the same way: the decode path materialises too much per record. Testing them means a
+leaner record representation, which is a larger change than anything above and is not attempted here.
 
 ### The batch-100 figure is not a comparison
 
@@ -368,9 +399,8 @@ than defended.
   causing.
 - **Whether 25–29 M records/s is our ceiling or the cluster's** is unknown; the other clients are far
   enough below it that only our own number is in question.
-- **Why rskafka consumes ~45% faster than we do** is not understood, and it is the most useful open
-  question in this file. Our READ_COMMITTED filtering is extra work it does not do, but that is an
-  explanation to test rather than a conclusion.
+- **Why rskafka still consumes faster** — narrowed to the per-record decode path, with two named
+  suspects and two hypotheses eliminated. See the rskafka section.
 - **rskafka has no many-core row.** Its per-partition client shape makes the comparison less direct,
   and it has not been run.
 - **lz4's slowness** is unexplained.
