@@ -1316,10 +1316,10 @@ mod lean {
             if key_len > 0 {
                 pos += key_len as usize;
             }
-            let value_len = varint(buf, &mut pos);
-            if value_len > 0 {
-                pos += value_len as usize;
-            }
+            // The value is not walked: the record's length prefix already says
+            // where the next one starts, and headers would be skipped the same
+            // way. Reading its length keeps the parse honest about the work.
+            let _value_len = varint(buf, &mut pos);
             pos = end;
         }
         count
@@ -1354,9 +1354,7 @@ mod lean {
             };
             let value_len = varint(buf, &mut pos);
             let value = if value_len > 0 {
-                let at = (pos as u32, value_len as u32);
-                pos += value_len as usize;
-                at
+                (pos as u32, value_len as u32)
             } else {
                 (0, 0)
             };
