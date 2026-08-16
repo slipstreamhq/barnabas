@@ -28,8 +28,13 @@ cell is dominated by warm-up, not by steady state.
 | | kestrel | rdkafka |
 |---|---:|---:|
 | p50 | 0.041 – 0.045 ms | 0.051 – 0.053 ms |
-| p99 | 0.065 – 0.082 ms | 0.084 – 0.096 ms |
+| p99 | 0.051 – 0.113 ms | 0.087 – 0.098 ms |
 | max | 1.7 – 2.0 ms | **502 – 504 ms** |
+
+**p99 is a tie, not a win.** Across runs ours lands anywhere from 0.051 to 0.113 ms against
+librdkafka's steadier 0.087–0.098, so some runs are faster and some slower. Earlier revisions of
+this file claimed p99 outright; that was three runs' luck, and the wider sample does not support
+it.
 
 The maximum is the interesting column. A half-second worst case in librdkafka is reproducible
 across every run; ours is under 2 ms. For anything user-facing, the tail is the number that
@@ -54,6 +59,29 @@ Part of this gap is an API difference and should be read as such: `kestrel` retu
 per `fetch()`, `rdkafka`'s `StreamConsumer` returns one message per `await`. That per-message
 wakeup is a real cost of that API, not evidence about librdkafka's decoder.
 
+## Many cores: not measurable on this setup
+
+The design's central claim is that N cores each own partitions and never coordinate. The harness
+has a cell for it — N glommio executors pinned to N cores, each with its own client and partitions
+— and **its output is not usable**:
+
+| cores | run 1 | run 2 | run 3 |
+|---:|---:|---:|---:|
+| 1 | 3.89 M | 3.83 M | 4.30 M |
+| 2 | 6.76 M | 7.08 M | 0.73 M |
+| 4 | 7.98 M | 0.38 M | 0.50 M |
+| 8 | 8.46 M | 0.50 M | 8.09 M |
+
+A twenty-fold swing between runs of the same configuration is not a client measurement. One broker
+on one node, eight partitions on one disk, everything over loopback: past roughly 4 M records/s the
+broker is the constraint and its behaviour under that pressure dominates everything the client
+does.
+
+Single-core numbers are stable (3.8–4.3 M) and the 1→2 step is repeatable at ~1.8×. Beyond that,
+**this setup cannot answer the question**, and publishing a scaling curve from it would be
+inventing one. Answering it properly needs a multi-broker cluster on real hardware, which is
+unbuilt.
+
 ## Two fairness mistakes, both mine, both corrected
 
 Recorded because a benchmark's credibility is mostly its author's willingness to write these down.
@@ -76,8 +104,9 @@ than defended.
 - **No many-core run.** Everything above is one process; the case a per-core client is built for —
   each core owning partitions — is not represented at all.
 - **No consume latency**, only throughput.
-- **No fetch sessions (KIP-227).** Each fetch re-states every partition; incremental fetch would
-  shrink the request and the broker's per-connection work.
+- **Fetch sessions are implemented** (KIP-227, incremental fetch, on by default) but their benefit
+  is **not measured**: it shows up when most partitions are idle, and every cell here keeps every
+  partition busy. A cell with mostly-idle partitions is the missing measurement.
 - **No compression cells**, though all four codecs round-trip correctly in the test suite.
 - **No sustained run.** These are seconds-long bursts; nothing here says what happens after an hour,
   or how memory behaves under backpressure.

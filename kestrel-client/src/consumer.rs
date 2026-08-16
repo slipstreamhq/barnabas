@@ -38,6 +38,42 @@ pub const LATEST: i64 = -1;
 /// How many times a request is retried when the broker says leadership moved.
 const MAX_LEADER_RETRIES: usize = 5;
 
+/// The broker forgot our fetch session, or our epoch is stale. Both mean
+/// "start again with a full fetch" rather than "fail".
+const FETCH_SESSION_ID_NOT_FOUND: i16 = 70;
+const INVALID_FETCH_SESSION_EPOCH: i16 = 71;
+
+/// Per-broker fetch session state (KIP-227).
+///
+/// **An incremental fetch names only what changed.** A full fetch restates
+/// every partition's offset on every poll, which for a core owning many
+/// partitions is most of the request — and the broker rebuilds its view each
+/// time. With a session, the broker remembers the partition set and the client
+/// sends only the partitions whose position moved.
+///
+/// Idle partitions are the case this exists for: a consumer holding thirty-two
+/// partitions where two are busy sends two partitions per fetch instead of
+/// thirty-two.
+#[derive(Debug, Default, Clone)]
+struct Session {
+    /// 0 until the broker assigns one.
+    id: i32,
+    /// 0 opens a full fetch; each subsequent request increments.
+    epoch: i32,
+    /// What the broker believes our offsets are, so a request can send the
+    /// difference.
+    known: BTreeMap<(String, i32), i64>,
+}
+
+impl Session {
+    /// Forget everything and ask for a full fetch next time.
+    fn reset(&mut self) {
+        self.id = 0;
+        self.epoch = 0;
+        self.known.clear();
+    }
+}
+
 /// What one partition yielded.
 #[derive(Debug)]
 pub struct FetchedRecords {
@@ -58,6 +94,11 @@ pub struct Consumer<T: Transport> {
     isolation: IsolationLevel,
     max_wait: Duration,
     max_bytes: i32,
+    /// One session per broker address.
+    sessions: BTreeMap<String, Session>,
+    /// Whether to use incremental fetch at all. On by default; a caller with a
+    /// broker that mishandles sessions can turn it off without changing code.
+    incremental: bool,
 }
 
 impl<T: Transport> Consumer<T> {
@@ -77,6 +118,8 @@ impl<T: Transport> Consumer<T> {
             isolation,
             max_wait: Duration::from_millis(500),
             max_bytes: 10 * 1024 * 1024,
+            sessions: BTreeMap::new(),
+            incremental: true,
         })
     }
 
@@ -118,12 +161,23 @@ impl<T: Transport> Consumer<T> {
             self.positions
                 .insert((topic.to_owned(), partition), resolved);
         }
+        // A new assignment changes the set the broker remembers.
+        for session in self.sessions.values_mut() {
+            session.reset();
+        }
         Ok(())
     }
 
     /// Stop fetching a partition.
+    ///
+    /// Resets the fetch sessions: the broker's remembered partition set no
+    /// longer matches ours, and correcting it with `forgotten_topics_data` is
+    /// more machinery than a fresh full fetch costs.
     pub fn remove(&mut self, topic: &str, partition: i32) {
         self.positions.remove(&(topic.to_owned(), partition));
+        for session in self.sessions.values_mut() {
+            session.reset();
+        }
     }
 
     /// Every partition this consumer holds.
@@ -174,6 +228,18 @@ impl<T: Transport> Consumer<T> {
         );
         let key = self.positions.keys().next().expect("checked length").clone();
         self.positions.insert(key, offset);
+    }
+
+    /// Use incremental fetch sessions (KIP-227). On by default.
+    ///
+    /// Turning this off makes every fetch restate every partition, which is
+    /// what the client did before sessions existed — useful if a broker or
+    /// proxy mishandles them.
+    pub fn set_incremental_fetch(&mut self, incremental: bool) {
+        self.incremental = incremental;
+        if !incremental {
+            self.sessions.clear();
+        }
     }
 
     /// How long a fetch waits for data before returning empty.
@@ -281,10 +347,36 @@ impl<T: Transport> Consumer<T> {
             let mut needs_refresh: Vec<(String, i32)> = Vec::new();
 
             for (addr, partitions) in by_broker {
-                let req = self.fetch_request(&partitions);
+                let req = self.fetch_request(&addr, &partitions);
                 let resp: FetchResponse =
                     self.cluster.call_at(&addr, ApiKey::Fetch, 12, &req).await?;
+
+                // A session the broker has forgotten is not a failure: drop it
+                // and the next fetch is a full one.
+                if matches!(
+                    resp.error_code,
+                    FETCH_SESSION_ID_NOT_FOUND | INVALID_FETCH_SESSION_EPOCH
+                ) {
+                    self.sessions.entry(addr.clone()).or_default().reset();
+                    continue;
+                }
                 check("Fetch", resp.error_code)?;
+
+                if self.incremental {
+                    let session = self.sessions.entry(addr.clone()).or_default();
+                    session.id = resp.session_id;
+                    // The epoch advances only on a response the broker
+                    // accepted; incrementing optimistically would desynchronise
+                    // it from the broker's view.
+                    session.epoch = session.epoch.wrapping_add(1).max(1);
+                    for (topic, partition) in &partitions {
+                        if let Some(offset) = self.positions.get(&(topic.clone(), *partition)) {
+                            session
+                                .known
+                                .insert((topic.clone(), *partition), *offset);
+                        }
+                    }
+                }
 
                 for topic_response in &resp.responses {
                     let topic = topic_response.topic.0.to_string();
@@ -364,11 +456,28 @@ impl<T: Transport> Consumer<T> {
         unreachable!("the loop returns on its last attempt")
     }
 
-    /// One `Fetch` naming every partition this broker leads, grouped by topic
-    /// as the protocol requires.
-    fn fetch_request(&self, partitions: &[(String, i32)]) -> FetchRequest {
+    /// One `Fetch` for this broker.
+    ///
+    /// With a session open, only the partitions whose position moved since the
+    /// last accepted response are named — the broker remembers the rest. That
+    /// is the whole of KIP-227's benefit: a poll over thirty-two partitions
+    /// where two are busy sends two.
+    fn fetch_request(&self, addr: &str, partitions: &[(String, i32)]) -> FetchRequest {
+        let session = self.sessions.get(addr);
+        let incremental = self.incremental && session.is_some_and(|s| s.id != 0);
+
         let mut by_topic: BTreeMap<&str, Vec<i32>> = BTreeMap::new();
         for (topic, partition) in partitions {
+            if incremental {
+                let known = session
+                    .and_then(|s| s.known.get(&(topic.clone(), *partition)))
+                    .copied();
+                let current = self.positions.get(&(topic.clone(), *partition)).copied();
+                if known == current {
+                    // The broker already knows where we are on this partition.
+                    continue;
+                }
+            }
             by_topic.entry(topic.as_str()).or_default().push(*partition);
         }
 
@@ -404,6 +513,13 @@ impl<T: Transport> Consumer<T> {
         req.max_bytes = self.max_bytes;
         req.isolation_level = self.isolation.as_i8();
         req.topics = topics;
+        if self.incremental {
+            req.session_id = session.map_or(0, |s| s.id);
+            req.session_epoch = session.map_or(0, |s| s.epoch);
+        } else {
+            // -1 is FINAL_EPOCH: "no session, do not make one".
+            req.session_epoch = -1;
+        }
         req
     }
 }

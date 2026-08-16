@@ -306,6 +306,62 @@ fn rdkafka_consume(topic: &str, expect: usize) -> Duration {
     })
 }
 
+/// **The case per-core is built for**: N cores, each owning a slice of the
+/// partitions, each with its own executor, sockets and client.
+///
+/// Nothing is shared between them — no locks, no work stealing, no cross-core
+/// wakeups — which is the claim the whole design rests on and which every
+/// number above this point failed to exercise.
+fn kestrel_produce_many_cores(topic: &str, cores: usize, cell: &Cell) -> Duration {
+    let per_core = cell.records / cores;
+    let partitions_per_core = (PARTITIONS as usize).div_ceil(cores);
+
+    let start = Instant::now();
+    let handles: Vec<_> = (0..cores)
+        .map(|core| {
+            let topic = topic.to_owned();
+            let batch_size = cell.batch;
+            let value_bytes = cell.value_bytes;
+            std::thread::spawn(move || {
+                glommio::LocalExecutorBuilder::new(glommio::Placement::Fixed(core))
+                    .make()
+                    .expect("executor")
+                    .run(async move {
+                        let mut producer = kestrel_glommio::Producer::idempotent(
+                            kestrel_glommio::Glommio,
+                            &[broker()],
+                            "bench",
+                        )
+                        .await
+                        .expect("producer");
+
+                        let value = payload(value_bytes);
+                        let batch: Vec<ProducerRecord> = (0..batch_size)
+                            .map(|i| {
+                                ProducerRecord::new(
+                                    Some(Bytes::from(format!("k{core}-{i}"))),
+                                    Some(value.clone()),
+                                )
+                            })
+                            .collect();
+
+                        // Each core writes to its own partitions, so nothing
+                        // contends — on the client or on the broker's log.
+                        let first = (core * partitions_per_core) as i32;
+                        let partition = first.min(PARTITIONS - 1);
+                        for _ in 0..(per_core / batch_size) {
+                            producer.send(&topic, partition, &batch).await.expect("send");
+                        }
+                    });
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("core finished");
+    }
+    start.elapsed()
+}
+
 fn main() {
     println!("{PARTITIONS} partitions, acks=all, idempotent, one local broker\n");
 
@@ -355,6 +411,25 @@ fn main() {
             "{label:<8} {:>18.3} ms {:>12.3} ms{marker}",
             k.as_secs_f64() * 1e3,
             r.as_secs_f64() * 1e3
+        );
+    }
+
+    // ── many cores, the shape the design exists for ─────────────────────────
+    println!("\nproduce, N cores (glommio)          rec/s      per core   scaling");
+    let cell = Cell { batch: 1_000, value_bytes: 128, records: 400_000 };
+    let mut single_core = 0.0;
+    for cores in [1usize, 2, 4, 8] {
+        let topic = topic("mc");
+        create_topic(&topic);
+        let rate = cell.rate(kestrel_produce_many_cores(&topic, cores, &cell));
+        if cores == 1 {
+            single_core = rate;
+        }
+        println!(
+            "{cores:>2} cores                     {:>12.0}  {:>12.0}   {:>6.2}x",
+            rate,
+            rate / cores as f64,
+            rate / single_core
         );
     }
 
