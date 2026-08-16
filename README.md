@@ -57,7 +57,8 @@ Both properties were mutation-proved: resetting sequences per transaction fails
 | | |
 |---|---|
 | **Consumer, assign-only** | works — `ApiVersions`, `Metadata`, `ListOffsets`, `Fetch`, seek, READ_COMMITTED filtering |
-| **Producer** | idempotent and transactional — sequencing, coordinator routing, zombie fencing, keyed partitioning |
+| **Producer** | idempotent and transactional — sequencing, coordinator routing, zombie fencing, keyed partitioning. **One `Produce` per broker**, not per partition; enrollment likewise |
+| **Compression** | gzip, snappy, lz4, zstd — round-tripped against a real broker, both directions |
 | **Leader routing, metadata cache** | works — fetches go to the leader from the cluster map, `NOT_LEADER_OR_FOLLOWER` invalidates that partition and retries |
 | **Runtimes** | glommio and tokio, from one client. Adding a third is a `Transport` impl |
 | **Connection recovery** | a closed connection is evicted and redialled once; a request that outlives its deadline drops its connection, because the late response would desynchronise the stream |
@@ -68,7 +69,7 @@ Both properties were mutation-proved: resetting sequences per transaction fails
 ## Tests
 
 ```sh
-cargo test                                        # 86 tests, no broker, no runtime
+cargo test                                        # 89 tests, no broker, no runtime
 cargo test -p kestrel-glommio -- --ignored --test-threads=1   # needs a broker
 cargo test -p kestrel-tokio   -- --ignored --test-threads=1   # the same suite, other runtime
 ```

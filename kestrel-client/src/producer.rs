@@ -16,6 +16,7 @@
 //! Produce itself goes to the partition leader, like every other partition
 //! request.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -356,12 +357,21 @@ impl<T: Transport> Producer<T> {
         Ok(())
     }
 
-    /// Enroll a partition in the open transaction, if it is not already.
+    /// Enroll partitions in the open transaction, in **one** request.
     ///
-    /// The coordinator must know a partition is in the transaction *before*
+    /// The coordinator must know a partition is in the transaction before
     /// records are produced to it, or it cannot fence that partition at commit.
-    async fn enroll(&mut self, topic: &str, partition: i32) -> Result<()> {
-        if !self.state.needs_enrollment(topic, partition) {
+    /// `AddPartitionsToTxn` takes a list, so enrolling eight partitions is one
+    /// round trip rather than eight — which matters because this happens once
+    /// per transaction, and a transaction can be as short as a checkpoint
+    /// interval.
+    async fn enroll_all(&mut self, topic: &str, partitions: &[i32]) -> Result<()> {
+        let needed: Vec<i32> = partitions
+            .iter()
+            .copied()
+            .filter(|p| self.state.needs_enrollment(topic, *p))
+            .collect();
+        if needed.is_empty() {
             return Ok(());
         }
         let identity = self.state.identity().ok_or(Error::Missing("producer id"))?;
@@ -372,7 +382,7 @@ impl<T: Transport> Producer<T> {
 
         let mut req_topic = AddPartitionsToTxnTopic::default();
         req_topic.name = TopicName(StrBytes::from_string(topic.to_owned()));
-        req_topic.partitions = vec![partition];
+        req_topic.partitions.clone_from(&needed);
 
         let mut req = AddPartitionsToTxnRequest::default();
         req.v3_and_below_transactional_id = TransactionalId(StrBytes::from_string(txn_id));
@@ -400,7 +410,9 @@ impl<T: Transport> Producer<T> {
             )
             .await?;
 
-        self.state.on_enrolled(topic, partition);
+        for partition in needed {
+            self.state.on_enrolled(topic, partition);
+        }
         Ok(())
     }
 
@@ -408,9 +420,6 @@ impl<T: Transport> Producer<T> {
 
     /// Produce `records` to one partition, returning the base offset the broker
     /// assigned.
-    ///
-    /// Enrolls the partition first when transactional. Sequence numbers come
-    /// from [`kestrel_core::producer`] and are **not** the caller's to choose.
     ///
     /// # Errors
     /// If the producer is fenced, no transaction is open when one is required,
@@ -424,80 +433,140 @@ impl<T: Transport> Producer<T> {
         if records.is_empty() {
             return Ok(-1);
         }
-        self.enroll(topic, partition).await?;
+        self.enroll_all(topic, &[partition]).await?;
+        let batch = self.encode_for(topic, partition, records)?;
+        let written = self.dispatch(topic, vec![(partition, batch)]).await?;
+        Ok(written.first().map_or(-1, |(_, offset)| *offset))
+    }
 
+    /// Allocate this batch's sequence numbers and encode it **once**.
+    ///
+    /// Encoding once is what makes a retry a retry: the bytes re-sent carry the
+    /// same sequence numbers, so a broker that already persisted the first
+    /// attempt deduplicates instead of writing twice.
+    fn encode_for(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        records: &[ProducerRecord],
+    ) -> Result<Bytes> {
         let count = i32::try_from(records.len()).map_err(|_| Error::Missing("batch size"))?;
         let range = self
             .state
             .allocate(topic, partition, count)
             .map_err(Error::Producer)?;
+        self.encode_batch(records, range)
+    }
 
-        // The same encoded batch is re-sent on every retry, sequence numbers
-        // included. That is what makes a retry idempotent rather than a second
-        // write.
-        let batch = self.encode_batch(records, range)?;
+    /// Send pre-encoded batches, **one request per broker rather than one per
+    /// partition**.
+    ///
+    /// This is the difference between eight round trips and one when a producer
+    /// writes to eight partitions, and it is the reason a per-core client can
+    /// afford to own many partitions: everything a core holds on a given broker
+    /// travels together.
+    ///
+    /// Retries are per partition. A partition whose leader moved is re-sent —
+    /// with its original bytes, so its sequence numbers are unchanged — while
+    /// the partitions that succeeded are not touched.
+    async fn dispatch(
+        &mut self,
+        topic: &str,
+        batches: Vec<(i32, Bytes)>,
+    ) -> Result<Vec<(i32, i64)>> {
+        let mut pending: BTreeMap<i32, Bytes> = batches.into_iter().collect();
+        let mut written: Vec<(i32, i64)> = Vec::with_capacity(pending.len());
 
         for attempt in 0..MAX_RETRIES {
-            // A topic that is still being auto-created has no leader yet, which
-            // is a wait rather than a failure — the same reason error 3
-            // refreshes instead of failing.
-            let addr = match self.cluster.leader_addr(topic, partition).await {
-                Ok(addr) => addr,
-                Err(Error::NoLeader { .. }) if attempt + 1 < MAX_RETRIES => {
-                    Self::backoff(attempt).await;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            let req = self.produce_request(topic, partition, batch.clone());
-
-            let resp: ProduceResponse =
-                self.cluster.call_at(&addr, ApiKey::Produce, 9, &req).await?;
-
-            let Some(part) = resp
-                .responses
-                .iter()
-                .flat_map(|t| t.partition_responses.iter())
-                .find(|p| p.index == partition)
-            else {
-                return Err(Error::Missing("partition"));
-            };
-
-            let code = ErrorCode(part.error_code);
-            if code.is_ok() {
-                return Ok(part.base_offset);
+            if pending.is_empty() {
+                break;
             }
-            match code.disposition() {
-                Disposition::RefreshMetadata => {
-                    self.cluster.invalidate(topic, partition);
-                    self.cluster.refresh_metadata(topic).await?;
-                    Self::backoff(attempt).await;
+
+            // Group this round's partitions by the broker that leads them.
+            let mut by_broker: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+            let mut unroutable = Vec::new();
+            for partition in pending.keys().copied() {
+                match self.cluster.leader_addr(topic, partition).await {
+                    Ok(addr) => by_broker.entry(addr).or_default().push(partition),
+                    // A topic still being created has no leader yet; that is a
+                    // wait, not a failure.
+                    Err(Error::NoLeader { .. }) => unroutable.push(partition),
+                    Err(e) => return Err(e),
                 }
-                Disposition::Retry => Self::backoff(attempt).await,
-                Disposition::Fatal => {
-                    // A sequence or fencing error means this producer's stream
-                    // is already wrong. Refusing further writes is the point.
-                    self.state.fence();
-                    return Err(Error::Broker {
-                        op: "Produce",
-                        code: code.0,
-                        disposition: Disposition::Fatal,
+            }
+            if !unroutable.is_empty() && by_broker.is_empty() {
+                if attempt + 1 == MAX_RETRIES {
+                    return Err(Error::NoLeader {
+                        topic: topic.to_owned(),
+                        partition: unroutable[0],
                     });
                 }
-                Disposition::FindCoordinator | Disposition::Ok => {
-                    return Err(Error::Broker {
-                        op: "Produce",
-                        code: code.0,
-                        disposition: code.disposition(),
-                    })
+                Self::backoff(attempt).await;
+                continue;
+            }
+
+            let mut retry_after_refresh = Vec::new();
+            for (addr, partitions) in by_broker {
+                let req = self.produce_request(topic, &partitions, &pending);
+                let resp: ProduceResponse =
+                    self.cluster.call_at(&addr, ApiKey::Produce, 9, &req).await?;
+
+                for part in resp
+                    .responses
+                    .iter()
+                    .flat_map(|t| t.partition_responses.iter())
+                {
+                    let code = ErrorCode(part.error_code);
+                    if code.is_ok() {
+                        pending.remove(&part.index);
+                        written.push((part.index, part.base_offset));
+                        continue;
+                    }
+                    match code.disposition() {
+                        Disposition::RefreshMetadata => {
+                            self.cluster.invalidate(topic, part.index);
+                            retry_after_refresh.push(part.index);
+                        }
+                        Disposition::Retry => {}
+                        Disposition::Fatal => {
+                            // A sequence or fencing error means this producer's
+                            // stream is already wrong. Refusing further writes
+                            // is the point.
+                            self.state.fence();
+                            return Err(Error::Broker {
+                                op: "Produce",
+                                code: code.0,
+                                disposition: Disposition::Fatal,
+                            });
+                        }
+                        Disposition::FindCoordinator | Disposition::Ok => {
+                            return Err(Error::Broker {
+                                op: "Produce",
+                                code: code.0,
+                                disposition: code.disposition(),
+                            })
+                        }
+                    }
                 }
             }
+
+            if !pending.is_empty() {
+                if !retry_after_refresh.is_empty() {
+                    self.cluster.refresh_metadata(topic).await?;
+                }
+                Self::backoff(attempt).await;
+            }
         }
-        Err(Error::Broker {
-            op: "Produce",
-            code: ErrorCode::NOT_LEADER_OR_FOLLOWER.0,
-            disposition: Disposition::RefreshMetadata,
-        })
+
+        if !pending.is_empty() {
+            return Err(Error::Broker {
+                op: "Produce",
+                code: ErrorCode::NOT_LEADER_OR_FOLLOWER.0,
+                disposition: Disposition::RefreshMetadata,
+            });
+        }
+        written.sort_unstable();
+        Ok(written)
     }
 
     /// Produce records to whichever partitions their keys hash to.
@@ -542,12 +611,8 @@ impl<T: Transport> Producer<T> {
             });
         }
 
-        let mut by_partition: std::collections::BTreeMap<i32, Vec<ProducerRecord>> =
-            std::collections::BTreeMap::new();
+        let mut by_partition: BTreeMap<i32, Vec<ProducerRecord>> = BTreeMap::new();
         for record in records {
-            // `None` means the topic reported no partitions, which the loop
-            // above already waited out — so reaching here is a cluster that
-            // says a topic exists and has nowhere to put records.
             let partition = self
                 .partitioner
                 .partition_for(record.key.as_deref(), count, &mut self.round_robin)
@@ -558,12 +623,14 @@ impl<T: Transport> Producer<T> {
             by_partition.entry(partition).or_default().push(record.clone());
         }
 
-        let mut offsets = Vec::with_capacity(by_partition.len());
-        for (partition, batch) in by_partition {
-            let base = self.send(topic, partition, &batch).await?;
-            offsets.push((partition, base));
+        let partitions: Vec<i32> = by_partition.keys().copied().collect();
+        self.enroll_all(topic, &partitions).await?;
+
+        let mut batches = Vec::with_capacity(by_partition.len());
+        for (partition, records) in by_partition {
+            batches.push((partition, self.encode_for(topic, partition, &records)?));
         }
-        Ok(offsets)
+        self.dispatch(topic, batches).await
     }
 
     /// Which partition a key would go to, without sending anything.
@@ -630,14 +697,27 @@ impl<T: Transport> Producer<T> {
         Ok(buf.freeze())
     }
 
-    fn produce_request(&self, topic: &str, partition: i32, batch: Bytes) -> ProduceRequest {
-        let mut partition_data = PartitionProduceData::default();
-        partition_data.index = partition;
-        partition_data.records = Some(batch);
+    /// One request carrying every partition this broker leads.
+    fn produce_request(
+        &self,
+        topic: &str,
+        partitions: &[i32],
+        batches: &BTreeMap<i32, Bytes>,
+    ) -> ProduceRequest {
+        let partition_data: Vec<PartitionProduceData> = partitions
+            .iter()
+            .filter_map(|partition| {
+                let batch = batches.get(partition)?;
+                let mut data = PartitionProduceData::default();
+                data.index = *partition;
+                data.records = Some(batch.clone());
+                Some(data)
+            })
+            .collect();
 
         let mut topic_data = TopicProduceData::default();
         topic_data.name = TopicName(StrBytes::from_string(topic.to_owned()));
-        topic_data.partition_data = vec![partition_data];
+        topic_data.partition_data = partition_data;
 
         let mut req = ProduceRequest::default();
         req.acks = self.acks;

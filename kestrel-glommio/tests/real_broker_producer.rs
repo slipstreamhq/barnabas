@@ -385,6 +385,47 @@ fn keyed_records_land_on_the_partition_their_key_names() {
     });
 }
 
+/// **Compression, both directions.** The producer compresses whole batches and
+/// the consumer must decompress them — a codec that encodes but does not decode
+/// looks fine on the wire and returns nothing to the caller.
+///
+/// All four of Kafka's codecs, because they are independent implementations and
+/// a client that quietly supports three of them is a client that fails on
+/// somebody's cluster.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn every_compression_codec_round_trips() {
+    use kestrel_glommio::CompressionCodec;
+
+    run(|| async {
+        for codec in [
+            CompressionCodec::None,
+            CompressionCodec::Gzip,
+            CompressionCodec::Snappy,
+            CompressionCodec::Lz4,
+            CompressionCodec::Zstd,
+        ] {
+            let topic = unique("compress");
+            make_topic(&topic).await;
+
+            let mut producer = Producer::idempotent(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test")
+                .await
+                .expect("producer");
+            producer.set_compression(codec);
+            producer
+                .send(&topic, 0, &records(&["a", "b", "c"]))
+                .await
+                .unwrap_or_else(|e| panic!("send with {codec:?}: {e}"));
+
+            assert_eq!(
+                read_all(&topic, 3, IsolationLevel::ReadCommitted).await,
+                vec!["a", "b", "c"],
+                "{codec:?} did not round trip"
+            );
+        }
+    });
+}
+
 /// Producing outside a transaction is caught by the state machine, before any
 /// request is sent.
 #[test]

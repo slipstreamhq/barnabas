@@ -54,6 +54,12 @@ pub struct Journal {
     /// produce. A duplicate would appear here twice; a lost retry would be
     /// missing.
     pub produced: Vec<(i32, i32, usize)>,
+    /// How many partitions each `Produce` request carried. One entry per
+    /// request, so `[4]` is one batched request and `[1,1,1,1]` is four
+    /// unbatched ones — the difference this client's throughput rests on.
+    pub produce_widths: Vec<usize>,
+    /// How many partitions each `AddPartitionsToTxn` enrolled.
+    pub enroll_widths: Vec<usize>,
 }
 
 impl Journal {
@@ -252,6 +258,15 @@ fn handle(world: &mut World, wire: &[u8]) -> Answer {
             r
         }),
         ApiKey::AddPartitionsToTxn => {
+            let enrolled = AddPartitionsToTxnRequest::decode(&mut buf.clone(), version)
+                .map(|r| {
+                    r.v3_and_below_topics
+                        .iter()
+                        .map(|t| t.partitions.len())
+                        .sum::<usize>()
+                })
+                .unwrap_or(0);
+            world.journal.enroll_widths.push(enrolled);
             let mut partition =
                 add_partitions_to_txn_response::AddPartitionsToTxnPartitionResult::default();
             partition.partition_index = 0;
@@ -302,14 +317,21 @@ fn metadata_response(req: &MetadataRequest, fault: Option<i16>) -> MetadataRespo
         .and_then(|t| t.name.clone())
         .unwrap_or(TopicName(StrBytes::from_static_str("t")));
 
-    let mut partition = metadata_response::MetadataResponsePartition::default();
-    partition.partition_index = 0;
-    partition.leader_id = BrokerId(1);
+    // Four partitions, all led by the one simulated broker: enough for keys to
+    // spread, so a test can tell one batched request from four unbatched ones.
+    let partitions = (0..4)
+        .map(|index| {
+            let mut partition = metadata_response::MetadataResponsePartition::default();
+            partition.partition_index = index;
+            partition.leader_id = BrokerId(1);
+            partition
+        })
+        .collect();
 
     let mut topic = metadata_response::MetadataResponseTopic::default();
     topic.name = Some(name);
     topic.error_code = fault.unwrap_or(0);
-    topic.partitions = vec![partition];
+    topic.partitions = partitions;
 
     let mut r = MetadataResponse::default();
     r.brokers = vec![broker];
@@ -325,33 +347,46 @@ fn produce_response(
     fault: Option<i16>,
 ) -> ProduceResponse {
     let code = fault.unwrap_or(0);
-    let mut partition_response = produce_response::PartitionProduceResponse::default();
-    partition_response.index = 0;
-    partition_response.error_code = code;
 
-    if code == 0 {
-        for topic in &req.topic_data {
-            for partition in &topic.partition_data {
-                let Some(records) = partition.records.clone() else {
-                    continue;
-                };
-                let mut bytes = records;
-                let set = kafka_protocol::records::RecordBatchDecoder::decode(&mut bytes)
-                    .expect("decode produced batch");
-                let base_sequence = set.records.first().map_or(-1, |r| r.sequence);
-                world
-                    .journal
-                    .produced
-                    .push((partition.index, base_sequence, set.records.len()));
-                partition_response.base_offset = world.next_offset;
-                world.next_offset += set.records.len() as i64;
+    world.journal.produce_widths.push(
+        req.topic_data
+            .iter()
+            .map(|t| t.partition_data.len())
+            .sum::<usize>(),
+    );
+
+    // **One response entry per partition in the request.** A broker answers
+    // every partition it was asked about, and a client that batches depends on
+    // that to know which ones landed.
+    let mut partition_responses = Vec::new();
+    for topic in &req.topic_data {
+        for partition in &topic.partition_data {
+            let mut response = produce_response::PartitionProduceResponse::default();
+            response.index = partition.index;
+            response.error_code = code;
+
+            if code == 0 {
+                if let Some(records) = partition.records.clone() {
+                    let mut bytes = records;
+                    let set = kafka_protocol::records::RecordBatchDecoder::decode(&mut bytes)
+                        .expect("decode produced batch");
+                    let base_sequence = set.records.first().map_or(-1, |r| r.sequence);
+                    world.journal.produced.push((
+                        partition.index,
+                        base_sequence,
+                        set.records.len(),
+                    ));
+                    response.base_offset = world.next_offset;
+                    world.next_offset += set.records.len() as i64;
+                }
             }
+            partition_responses.push(response);
         }
     }
 
     let mut topic_response = produce_response::TopicProduceResponse::default();
     topic_response.name = TopicName(StrBytes::from_static_str("t"));
-    topic_response.partition_responses = vec![partition_response];
+    topic_response.partition_responses = partition_responses;
 
     let mut r = ProduceResponse::default();
     r.responses = vec![topic_response];

@@ -23,6 +23,7 @@ use glommio::net::TcpStream;
 #[cfg(feature = "tls")]
 pub mod tls;
 
+pub use kestrel_client::producer::CompressionCodec;
 pub use kestrel_client::{Error, ProducerRecord, Result, EARLIEST, LATEST};
 pub use kestrel_core::{Disposition, ErrorCode, IsolationLevel, Partitioner};
 

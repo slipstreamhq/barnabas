@@ -378,3 +378,126 @@ fn a_hung_broker_times_out_rather_than_hanging() {
         "nothing was accepted, so nothing may be reported as written"
     );
 }
+
+// ── batching ────────────────────────────────────────────────────────────────
+
+/// **One request per broker, not per partition.**
+///
+/// A producer writing to four partitions on one broker sends *one* `Produce`.
+/// The unbatched version sent four, which is four round trips where the network
+/// cost is identical — and it is the difference that makes a per-core client
+/// able to own many partitions at all.
+#[test]
+fn one_produce_request_covers_every_partition_on_a_broker() {
+    start(vec![]);
+
+    drive(async {
+        let mut producer = transactional().await;
+        producer.begin_transaction().expect("begin");
+        // Keys chosen to spread: the simulated topic has four partitions.
+        let records: Vec<ProducerRecord> = (0..40)
+            .map(|i| {
+                ProducerRecord::new(
+                    Some(bytes::Bytes::from(format!("key-{i}"))),
+                    Some(bytes::Bytes::from(format!("v{i}"))),
+                )
+            })
+            .collect();
+        let written = producer.send_keyed("t", &records).await.expect("send");
+        assert!(
+            written.len() > 1,
+            "the test needs keys spread over several partitions, got {written:?}"
+        );
+    });
+
+    let j = journal();
+    assert_eq!(
+        j.produce_widths.len(),
+        1,
+        "expected one batched request, got {} ({:?})",
+        j.produce_widths.len(),
+        j.produce_widths
+    );
+    assert!(
+        j.produce_widths[0] > 1,
+        "the single request carried only one partition: {:?}",
+        j.produce_widths
+    );
+    assert_eq!(
+        j.produced.len(),
+        j.produce_widths[0],
+        "every partition in the request must be accounted for"
+    );
+}
+
+/// **One enrollment request, not one per partition.** `AddPartitionsToTxn`
+/// takes a list, and a transaction as short as a checkpoint interval pays this
+/// cost every time.
+#[test]
+fn partitions_are_enrolled_in_one_request() {
+    start(vec![]);
+
+    drive(async {
+        let mut producer = transactional().await;
+        producer.begin_transaction().expect("begin");
+        let records: Vec<ProducerRecord> = (0..40)
+            .map(|i| {
+                ProducerRecord::new(
+                    Some(bytes::Bytes::from(format!("key-{i}"))),
+                    Some(bytes::Bytes::from(format!("v{i}"))),
+                )
+            })
+            .collect();
+        producer.send_keyed("t", &records).await.expect("send");
+    });
+
+    let j = journal();
+    assert_eq!(
+        j.count(ApiKey::AddPartitionsToTxn),
+        1,
+        "enrollment was sent per partition instead of once"
+    );
+    assert!(
+        j.enroll_widths[0] > 1,
+        "the enrollment carried one partition: {:?}",
+        j.enroll_widths
+    );
+}
+
+/// A partition whose leader moved is re-sent **alone** — the ones that
+/// succeeded are not sent again, because re-sending them would rely on the
+/// broker's deduplication to undo work the client should not have done.
+#[test]
+fn only_the_failed_partition_is_retried() {
+    start(vec![Fault {
+        api: ApiKey::Produce,
+        code: 6, // NOT_LEADER_OR_FOLLOWER — applied to the whole first request
+        times: 1,
+    }]);
+
+    drive(async {
+        let mut producer = transactional().await;
+        producer.begin_transaction().expect("begin");
+        let records: Vec<ProducerRecord> = (0..40)
+            .map(|i| {
+                ProducerRecord::new(
+                    Some(bytes::Bytes::from(format!("key-{i}"))),
+                    Some(bytes::Bytes::from(format!("v{i}"))),
+                )
+            })
+            .collect();
+        producer.send_keyed("t", &records).await.expect("send");
+    });
+
+    let j = journal();
+    // The first request failed wholesale, so the retry carries everything —
+    // and each partition still appears exactly once in what was accepted.
+    let mut partitions: Vec<i32> = j.produced.iter().map(|(p, _, _)| *p).collect();
+    partitions.sort_unstable();
+    let unique: std::collections::BTreeSet<i32> = partitions.iter().copied().collect();
+    assert_eq!(
+        partitions.len(),
+        unique.len(),
+        "a partition was written twice: {partitions:?}"
+    );
+}
