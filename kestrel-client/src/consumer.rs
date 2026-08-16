@@ -159,12 +159,7 @@ impl<T: Transport> Consumer<T> {
             let addr = self.cluster.leader_addr(&self.topic, self.partition).await?;
             let req = self.fetch_request();
 
-            let resp: FetchResponse = self
-                .cluster
-                .broker_at(&addr)
-                .await?
-                .call(ApiKey::Fetch, 12, &req)
-                .await?;
+            let resp: FetchResponse = self.cluster.call_at(&addr, ApiKey::Fetch, 12, &req).await?;
             check("Fetch", resp.error_code)?;
 
             let Some(partition) = resp
@@ -303,12 +298,7 @@ where
                 .cluster
                 .leader_addr(&consumer.topic, consumer.partition)
                 .await?;
-            let resp: Resp = consumer
-                .cluster
-                .broker_at(&addr)
-                .await?
-                .call(api_key, version, req)
-                .await?;
+            let resp: Resp = consumer.cluster.call_at(&addr, api_key, version, req).await?;
 
             let (code, value) =
                 extract(resp, consumer.partition).ok_or(Error::Missing("partition"))?;

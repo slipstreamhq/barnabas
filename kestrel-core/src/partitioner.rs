@@ -42,21 +42,26 @@ impl Partitioner {
     /// `next` is the round-robin counter used for null keys; it is advanced
     /// only when it is used.
     ///
-    /// # Panics
-    /// If `partition_count` is not positive — a topic with no partitions is a
-    /// caller error, not a runtime condition to paper over.
+    /// Returns `None` when `partition_count` is not positive. **A library must
+    /// not panic on a number that came off the network**: a topic mid-creation
+    /// reports zero partitions, and taking down the caller's process for it is
+    /// not a reasonable answer to a transient cluster state.
     #[must_use]
-    pub fn partition_for(self, key: Option<&[u8]>, partition_count: i32, next: &mut u32) -> i32 {
-        assert!(
-            partition_count > 0,
-            "partition_count must be positive, got {partition_count}"
-        );
-        let count = u32::try_from(partition_count).expect("checked positive");
+    pub fn partition_for(
+        self,
+        key: Option<&[u8]>,
+        partition_count: i32,
+        next: &mut u32,
+    ) -> Option<i32> {
+        if partition_count <= 0 {
+            return None;
+        }
+        let count = u32::try_from(partition_count).ok()?;
 
         let Some(key) = key else {
             let chosen = *next % count;
             *next = next.wrapping_add(1);
-            return i32::try_from(chosen).expect("modulo a positive i32");
+            return i32::try_from(chosen).ok();
         };
 
         let slot = match self {
@@ -68,10 +73,10 @@ impl Partitioner {
             // value — `abs(i32::MIN)` would overflow.
             Self::Murmur2 => {
                 let h = murmur2(key) & 0x7fff_ffff;
-                u32::try_from(h).expect("masked positive") % count
+                u32::try_from(h).ok()? % count
             }
         };
-        i32::try_from(slot).expect("modulo a positive i32")
+        i32::try_from(slot).ok()
     }
 }
 
@@ -196,6 +201,7 @@ mod tests {
         for p in [Partitioner::Crc32, Partitioner::Murmur2] {
             let mut counter = 0;
             let first = p.partition_for(Some(b"user-42"), 12, &mut counter);
+            assert!(first.is_some());
             for _ in 0..10 {
                 assert_eq!(p.partition_for(Some(b"user-42"), 12, &mut counter), first);
             }
@@ -210,7 +216,9 @@ mod tests {
             let mut seen = std::collections::HashSet::new();
             for i in 0..2000 {
                 let key = format!("key-{i}");
-                let part = p.partition_for(Some(key.as_bytes()), 8, &mut counter);
+                let part = p
+                    .partition_for(Some(key.as_bytes()), 8, &mut counter)
+                    .expect("a positive partition count");
                 assert!((0..8).contains(&part), "{p:?} produced partition {part}");
                 seen.insert(part);
             }
@@ -240,7 +248,11 @@ mod tests {
     fn null_keys_are_spread() {
         let mut counter = 0;
         let picks: Vec<i32> = (0..6)
-            .map(|_| Partitioner::Crc32.partition_for(None, 3, &mut counter))
+            .map(|_| {
+                Partitioner::Crc32
+                    .partition_for(None, 3, &mut counter)
+                    .expect("a positive partition count")
+            })
             .collect();
         assert_eq!(picks, vec![0, 1, 2, 0, 1, 2]);
     }
@@ -257,10 +269,13 @@ mod tests {
         assert_eq!(counter, 1);
     }
 
+    /// A topic mid-creation reports zero partitions. That is a transient
+    /// cluster state, so it is `None` rather than a panic in the caller's
+    /// process.
     #[test]
-    #[should_panic(expected = "partition_count must be positive")]
-    fn a_topic_with_no_partitions_is_a_caller_error() {
+    fn a_topic_with_no_partitions_yields_no_partition() {
         let mut counter = 0;
-        let _ = Partitioner::Crc32.partition_for(Some(b"k"), 0, &mut counter);
+        assert_eq!(Partitioner::Crc32.partition_for(Some(b"k"), 0, &mut counter), None);
+        assert_eq!(Partitioner::Crc32.partition_for(None, -1, &mut counter), None);
     }
 }

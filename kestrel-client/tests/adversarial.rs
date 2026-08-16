@@ -276,3 +276,105 @@ fn a_partition_is_enrolled_once_per_transaction() {
     assert_eq!(j.count(ApiKey::AddPartitionsToTxn), 1);
     assert_eq!(j.count(ApiKey::Produce), 3);
 }
+
+// ── connections that die ─────────────────────────────────────────────────────
+
+/// **A broker restart must not be permanent.**
+///
+/// Pooled connections are closed all the time — rolling upgrades, idle reapers,
+/// network blips — and the client only finds out when it writes. Without a
+/// reconnect the dead socket stays in the pool and *every* later request fails,
+/// which is a client that dies the first time its cluster is maintained. No
+/// broker-backed test can see this, because nothing there kills a connection on
+/// cue.
+#[test]
+fn a_closed_connection_is_reconnected() {
+    sim::start_with(
+        Vec::new(),
+        vec![sim::Close {
+            api: ApiKey::Produce,
+            times: 1,
+        }],
+        Vec::new(),
+    );
+
+    drive(async {
+        let mut producer = transactional().await;
+        producer.begin_transaction().expect("begin");
+        producer
+            .send("t", 0, &records(2))
+            .await
+            .expect("a closed connection must be reconnected, not fatal");
+    });
+
+    let j = journal();
+    assert_eq!(
+        j.produced,
+        vec![(0, 0, 2)],
+        "the reconnect wrote twice, or lost the batch"
+    );
+    assert_eq!(j.count(ApiKey::Produce), 2, "expected exactly one reconnect");
+}
+
+/// The retry after a reconnect carries the same sequence numbers, so a broker
+/// that had *already* persisted the first attempt deduplicates it rather than
+/// writing it twice. Losing that is how a connection blip becomes a duplicate.
+#[test]
+fn a_reconnect_does_not_renumber() {
+    sim::start_with(
+        Vec::new(),
+        vec![sim::Close {
+            api: ApiKey::Produce,
+            times: 1,
+        }],
+        Vec::new(),
+    );
+
+    drive(async {
+        let mut producer = transactional().await;
+        producer.begin_transaction().expect("begin");
+        producer.send("t", 0, &records(3)).await.expect("first");
+        producer.send("t", 0, &records(2)).await.expect("second");
+    });
+
+    assert_eq!(
+        journal().produced,
+        vec![(0, 0, 3), (0, 3, 2)],
+        "sequences restarted across a reconnect"
+    );
+}
+
+/// **A broker that never answers must not hang the caller.**
+///
+/// The socket stays open, so nothing but a deadline ends this. The connection
+/// is dropped with the request: the response may still arrive, and reading it
+/// as the answer to the *next* request would desynchronise the stream.
+#[test]
+fn a_hung_broker_times_out_rather_than_hanging() {
+    sim::start_with(
+        Vec::new(),
+        Vec::new(),
+        vec![sim::Hang {
+            api: ApiKey::Produce,
+            times: 1,
+        }],
+    );
+
+    drive(async {
+        let mut producer = transactional().await;
+        producer.begin_transaction().expect("begin");
+        let err = producer
+            .send("t", 0, &records(1))
+            .await
+            .expect_err("a hung broker must time out");
+        assert!(
+            matches!(err, kestrel_client::Error::Timeout { .. }),
+            "expected a timeout, got: {err}"
+        );
+    });
+
+    assert!(
+        journal().produced.is_empty(),
+        "nothing was accepted, so nothing may be reported as written"
+    );
+}

@@ -62,9 +62,27 @@ impl Journal {
     }
 }
 
+/// A connection the broker closes rather than answers — a rolling upgrade, an
+/// idle reaper, a network blip. The client only discovers it on the next write.
+#[derive(Debug, Clone, Copy)]
+pub struct Close {
+    pub api: ApiKey,
+    pub times: usize,
+}
+
+/// A broker that accepts the request and never answers. Distinct from a close:
+/// the socket stays open, so only a deadline gets the caller out.
+#[derive(Debug, Clone, Copy)]
+pub struct Hang {
+    pub api: ApiKey,
+    pub times: usize,
+}
+
 #[derive(Default)]
 struct World {
     faults: Vec<Fault>,
+    closes: Vec<Close>,
+    hangs: Vec<Hang>,
     journal: Journal,
     /// Offsets handed out per partition, so base offsets advance like a log.
     next_offset: i64,
@@ -78,9 +96,16 @@ thread_local! {
 
 /// Reset the world and install `faults`.
 pub fn start(faults: Vec<Fault>) {
+    start_with(faults, Vec::new(), Vec::new());
+}
+
+/// Reset the world with faults, connection closes and hangs.
+pub fn start_with(faults: Vec<Fault>, closes: Vec<Close>, hangs: Vec<Hang>) {
     WORLD.with(|w| {
         *w.borrow_mut() = World {
             faults,
+            closes,
+            hangs,
             ..World::default()
         };
     });
@@ -101,6 +126,13 @@ fn take_fault(world: &mut World, api: ApiKey) -> Option<i16> {
 /// An in-memory socket: what the client writes is answered immediately.
 pub struct SimStream {
     inbox: VecDeque<u8>,
+    /// Set when the scripted broker closed this connection. Reads then report
+    /// end-of-stream, exactly as a real closed socket does.
+    closed: bool,
+    /// Set when the broker accepted the request and will never answer. Reads
+    /// then never complete — which is the whole difference from a close, and
+    /// the only case a deadline is needed for.
+    hung: bool,
 }
 
 /// The simulated runtime.
@@ -112,10 +144,22 @@ impl Transport for Sim {
     async fn connect(_addr: &str) -> io::Result<Self::Stream> {
         Ok(SimStream {
             inbox: VecDeque::new(),
+            closed: false,
+            hung: false,
         })
     }
 
     async fn read(stream: &mut Self::Stream, buf: &mut [u8]) -> io::Result<usize> {
+        if stream.hung {
+            // Never resolves. Only `with_timeout` gets the caller out, which is
+            // exactly what this case exists to exercise.
+            std::future::pending::<()>().await;
+        }
+        if stream.closed {
+            // Zero bytes is how a peer says "gone"; the client must treat it as
+            // a dead connection rather than an empty response.
+            return Ok(0);
+        }
         if stream.inbox.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -130,8 +174,13 @@ impl Transport for Sim {
     }
 
     async fn write_all(stream: &mut Self::Stream, buf: &[u8]) -> io::Result<()> {
-        let response = WORLD.with(|w| handle(&mut w.borrow_mut(), buf));
-        stream.inbox.extend(response);
+        match WORLD.with(|w| handle(&mut w.borrow_mut(), buf)) {
+            Answer::Bytes(response) => stream.inbox.extend(response),
+            Answer::Closed => stream.closed = true,
+            // The socket stays open and nothing arrives: only a timeout ends
+            // this, which is the case a closed connection would never produce.
+            Answer::Hang => stream.hung = true,
+        }
         Ok(())
     }
 
@@ -140,8 +189,15 @@ impl Transport for Sim {
     async fn sleep(_dur: Duration) {}
 }
 
+/// What the scripted broker does with a request.
+enum Answer {
+    Bytes(Vec<u8>),
+    Closed,
+    Hang,
+}
+
 /// Decode one framed request and produce the framed response.
-fn handle(world: &mut World, wire: &[u8]) -> Vec<u8> {
+fn handle(world: &mut World, wire: &[u8]) -> Answer {
     let mut buf = Bytes::copy_from_slice(&wire[4..]); // strip the length prefix
 
     // The header must be decoded with the *request* header version for this
@@ -152,6 +208,19 @@ fn handle(world: &mut World, wire: &[u8]) -> Vec<u8> {
     let header = RequestHeader::decode(&mut buf, api_key.request_header_version(version))
         .expect("decode request header");
     world.journal.requests.push(api_key);
+
+    if let Some(idx) = world
+        .closes
+        .iter()
+        .position(|c| c.api == api_key && c.times > 0)
+    {
+        world.closes[idx].times -= 1;
+        return Answer::Closed;
+    }
+    if let Some(idx) = world.hangs.iter().position(|h| h.api == api_key && h.times > 0) {
+        world.hangs[idx].times -= 1;
+        return Answer::Hang;
+    }
 
     let fault = take_fault(world, api_key);
     let body = match api_key {
@@ -217,7 +286,7 @@ fn handle(world: &mut World, wire: &[u8]) -> Vec<u8> {
         }
         other => panic!("the simulator was not taught {other:?}"),
     };
-    body
+    Answer::Bytes(body)
 }
 
 fn metadata_response(req: &MetadataRequest, fault: Option<i16>) -> MetadataResponse {

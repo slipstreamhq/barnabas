@@ -60,13 +60,14 @@ Both properties were mutation-proved: resetting sequences per transaction fails
 | **Producer** | idempotent and transactional — sequencing, coordinator routing, zombie fencing, keyed partitioning |
 | **Leader routing, metadata cache** | works — fetches go to the leader from the cluster map, `NOT_LEADER_OR_FOLLOWER` invalidates that partition and retries |
 | **Runtimes** | glommio and tokio, from one client. Adding a third is a `Transport` impl |
+| **Connection recovery** | a closed connection is evicted and redialled once; a request that outlives its deadline drops its connection, because the late response would desynchronise the stream |
 | **TLS, SASL** | not started. `Transport::Stream` is where TLS goes — `futures-rustls` for glommio, `tokio-rustls` for tokio |
 | **Consumer groups** | **out of scope** — callers assign partitions themselves |
 
 ## Tests
 
 ```sh
-cargo test                                        # 74 tests, no broker, no runtime
+cargo test                                        # 77 tests, no broker, no runtime
 cargo test -p kestrel-glommio -- --ignored --test-threads=1   # needs a broker
 cargo test -p kestrel-tokio   -- --ignored --test-threads=1   # the same suite, other runtime
 ```

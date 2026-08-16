@@ -37,6 +37,7 @@ use std::io;
 use std::time::Duration;
 
 pub mod cluster;
+mod timeout;
 pub mod consumer;
 pub mod producer;
 
@@ -104,6 +105,14 @@ pub enum Error {
     /// after being fenced.
     #[error("producer: {0}")]
     Producer(#[from] kestrel_core::producer::ProducerError),
+
+    /// A request outlived its deadline. The connection is dropped with it —
+    /// see [`Cluster::call_at`](cluster::Cluster).
+    #[error("{op:?} to {addr} timed out")]
+    Timeout {
+        op: kafka_protocol::messages::ApiKey,
+        addr: String,
+    },
 
     #[error("the broker's response contained no {0}")]
     Missing(&'static str),

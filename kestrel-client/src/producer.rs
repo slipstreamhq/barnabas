@@ -174,12 +174,8 @@ impl<T: Transport> Producer<T> {
         req.key_type = 1; // TRANSACTION
 
         for attempt in 0..MAX_RETRIES {
-            let resp: FindCoordinatorResponse = self
-                .cluster
-                .any_broker()
-                .await?
-                .call(ApiKey::FindCoordinator, 3, &req)
-                .await?;
+            let resp: FindCoordinatorResponse =
+                self.cluster.call_any(ApiKey::FindCoordinator, 3, &req).await?;
 
             let code = ErrorCode(resp.error_code);
             if code.is_ok() {
@@ -239,9 +235,9 @@ impl<T: Transport> Producer<T> {
         for attempt in 0..MAX_RETRIES {
             let addr = self.coordinator_addr().await?;
             let resp: Resp = if addr.is_empty() {
-                self.cluster.any_broker().await?.call(api_key, version, req).await?
+                self.cluster.call_any(api_key, version, req).await?
             } else {
-                self.cluster.broker_at(&addr).await?.call(api_key, version, req).await?
+                self.cluster.call_at(&addr, api_key, version, req).await?
             };
 
             let code = ErrorCode(error_of(&resp));
@@ -454,12 +450,8 @@ impl<T: Transport> Producer<T> {
             };
             let req = self.produce_request(topic, partition, batch.clone());
 
-            let resp: ProduceResponse = self
-                .cluster
-                .broker_at(&addr)
-                .await?
-                .call(ApiKey::Produce, 9, &req)
-                .await?;
+            let resp: ProduceResponse =
+                self.cluster.call_at(&addr, ApiKey::Produce, 9, &req).await?;
 
             let Some(part) = resp
                 .responses
@@ -552,11 +544,16 @@ impl<T: Transport> Producer<T> {
         let mut by_partition: std::collections::BTreeMap<i32, Vec<ProducerRecord>> =
             std::collections::BTreeMap::new();
         for record in records {
-            let partition = self.partitioner.partition_for(
-                record.key.as_deref(),
-                count,
-                &mut self.round_robin,
-            );
+            // `None` means the topic reported no partitions, which the loop
+            // above already waited out — so reaching here is a cluster that
+            // says a topic exists and has nowhere to put records.
+            let partition = self
+                .partitioner
+                .partition_for(record.key.as_deref(), count, &mut self.round_robin)
+                .ok_or_else(|| Error::NoLeader {
+                    topic: topic.to_owned(),
+                    partition: -1,
+                })?;
             by_partition.entry(partition).or_default().push(record.clone());
         }
 
@@ -578,7 +575,12 @@ impl<T: Transport> Producer<T> {
     pub async fn partition_for(&mut self, topic: &str, key: Option<&[u8]>) -> Result<i32> {
         let count = self.cluster.partition_count(topic).await?;
         let mut scratch = self.round_robin;
-        Ok(self.partitioner.partition_for(key, count, &mut scratch))
+        self.partitioner
+            .partition_for(key, count, &mut scratch)
+            .ok_or_else(|| Error::NoLeader {
+                topic: topic.to_owned(),
+                partition: -1,
+            })
     }
 
     fn encode_batch(&self, records: &[ProducerRecord], range: SequenceRange) -> Result<Bytes> {
