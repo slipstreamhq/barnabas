@@ -910,6 +910,58 @@ fn rdkafka_produce_many_clients(topic: &str, clients: usize, cell: &Cell) -> Dur
     start.elapsed()
 }
 
+/// The lean decode path, end to end.
+fn kestrel_consume_lean(topic: &str, expect: usize) -> Duration {
+    let topic = topic.to_owned();
+    glommio::LocalExecutorBuilder::default()
+        .make()
+        .expect("executor")
+        .run(async move {
+            let mut consumer = kestrel_glommio::Consumer::new(
+                kestrel_glommio::Glommio,
+                &brokers(),
+                "bench",
+                kestrel_core::IsolationLevel::ReadCommitted,
+            )
+            .await
+            .expect("consumer");
+            for partition in 0..PARTITIONS {
+                consumer
+                    .add(&topic, partition, kestrel_glommio::EARLIEST)
+                    .await
+                    .expect("assign");
+            }
+            consumer.set_max_wait(Duration::from_millis(100));
+
+            let start = Instant::now();
+            let mut seen = 0;
+            let mut checksum = 0u64;
+            while seen < expect {
+                let groups = consumer.fetch_lean().await.expect("fetch");
+                let mut got = 0;
+                for group in &groups {
+                    for batch in &group.batches {
+                        for record in &batch.records {
+                            // Touch the value, so the comparison includes
+                            // materialising it — a caller that never reads the
+                            // payload would flatter this path unfairly.
+                            checksum += batch.value(record).map_or(0, |v| v.len() as u64);
+                            got += 1;
+                        }
+                    }
+                    got += group.fallback.len();
+                }
+                if got == 0 {
+                    break;
+                }
+                seen += got;
+            }
+            assert_eq!(seen, expect, "lean consumed {seen} of {expect}");
+            assert!(checksum > 0);
+            start.elapsed()
+        })
+}
+
 /// The same consume loop on **tokio**, to separate the runtime from the code.
 ///
 /// If this matches the glommio number, the gap to rskafka is in what this
@@ -1534,6 +1586,12 @@ fn main() {
         create_topic(&rd_topic);
         rdkafka_produce(&rd_topic, &cell);
         let rdkafka_rate = cell.rate(rdkafka_consume(&rd_topic, cell.records));
+
+        let ln_topic = topic("ln");
+        create_topic(&ln_topic);
+        kestrel_produce(&ln_topic, &cell);
+        let lean_rate = cell.rate(kestrel_consume_lean(&ln_topic, cell.records));
+        println!("      (kestrel, lean decode: {lean_rate:.0} rec/s)");
 
         let pp_topic = topic("pp");
         create_topic(&pp_topic);

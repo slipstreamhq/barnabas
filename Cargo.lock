@@ -770,6 +770,7 @@ name = "kestrel-core"
 version = "0.0.1"
 dependencies = [
  "bytes",
+ "crc32c",
  "kafka-protocol",
  "thiserror 2.0.20",
 ]

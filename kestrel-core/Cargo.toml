@@ -9,3 +9,4 @@ publish.workspace = true
 kafka-protocol = { workspace = true }
 bytes          = { workspace = true }
 thiserror      = { workspace = true }
+crc32c = "0.6.8"

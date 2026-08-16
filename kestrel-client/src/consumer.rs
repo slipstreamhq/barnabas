@@ -26,6 +26,7 @@ use kafka_protocol::messages::{
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{Record, RecordBatchDecoder};
 use kestrel_core::consumer::{self, AbortedTransaction, Fetched};
+use kestrel_core::records::LeanBatch;
 use kestrel_core::{Disposition, ErrorCode, IsolationLevel};
 
 use crate::cluster::Cluster;
@@ -832,4 +833,167 @@ mod tests {
         wire.extend_from_slice(&[0u8; 32]);
         assert!(decode_records(wire.freeze()).is_err());
     }
+}
+
+/// One partition's batches, as [`kestrel_core::records`] read them.
+///
+/// The counterpart to [`FetchedRecords`] for [`Consumer::fetch_lean`]: batches
+/// rather than a flat list of records, because the facts a consumer filters on
+/// — producer id, whether the batch is transactional, whether it is a control
+/// batch — belong to the batch, and flattening them is what makes the ordinary
+/// path expensive.
+#[derive(Debug)]
+pub struct LeanFetched {
+    pub topic: String,
+    pub partition: i32,
+    pub batches: Vec<LeanBatch>,
+    /// Records from a batch the lean reader handed back — compressed, or
+    /// carrying headers — decoded the ordinary way. Kept separate rather than
+    /// converted, because building a `LeanBatch` from decoded records would
+    /// mean re-serialising them, which is worse than the cost being avoided.
+    pub fallback: Vec<kafka_protocol::records::Record>,
+}
+
+impl<T: Transport> Consumer<T> {
+    /// As [`Self::fetch`], without building a record per record.
+    ///
+    /// **Experimental, and deliberately a second method rather than a change to
+    /// the first.** Two things differ for a caller: records carry no headers,
+    /// and a key or value is materialised by asking the batch for it
+    /// ([`LeanBatch::value`]) rather than being built up front.
+    ///
+    /// Falls back to the ordinary decoder for anything
+    /// [`kestrel_core::records::decode_lean`] hands back — a compressed batch,
+    /// or one carrying headers — so the result is correct either way, at the
+    /// old cost for those.
+    ///
+    /// Filtering happens **per batch** here rather than per record, which it
+    /// can because `transactional`, `control` and `producer_id` are batch-level
+    /// in the format. That is most of why this path is cheaper.
+    ///
+    /// # Errors
+    /// As [`Self::fetch`].
+    pub async fn fetch_lean(&mut self) -> Result<Vec<LeanFetched>> {
+        if self.positions.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self
+            .outstanding
+            .as_ref()
+            .is_some_and(|o| o.generation != self.generation)
+        {
+            self.discard_outstanding().await;
+        }
+        if self.outstanding.is_none() {
+            self.issue_fetch().await?;
+        }
+
+        let groups = self.outstanding.take().expect("just issued").groups;
+        let addrs: Vec<String> = groups.iter().map(|(addr, _)| addr.clone()).collect();
+        let responses = self
+            .cluster
+            .recv_many::<FetchResponse>(ApiKey::Fetch, &addrs)
+            .await;
+
+        let mut out = Vec::new();
+        for ((addr, partitions), response) in groups.into_iter().zip(responses) {
+            let resp = response?;
+            if matches!(
+                resp.error_code,
+                FETCH_SESSION_ID_NOT_FOUND | INVALID_FETCH_SESSION_EPOCH
+            ) {
+                self.sessions.entry(addr.clone()).or_default().reset();
+                continue;
+            }
+            check("Fetch", resp.error_code)?;
+
+            if self.incremental {
+                let session = self.sessions.entry(addr.clone()).or_default();
+                session.id = resp.session_id;
+                session.epoch = session.epoch.wrapping_add(1).max(1);
+                for (topic, partition) in &partitions {
+                    if let Some(offset) = self.positions.get(&(topic.clone(), *partition)) {
+                        session.known.insert((topic.clone(), *partition), *offset);
+                    }
+                }
+            }
+
+            for topic_response in &resp.responses {
+                let topic = topic_response.topic.0.to_string();
+                for part in &topic_response.partitions {
+                    check("Fetch partition", part.error_code)?;
+                    let key = (topic.clone(), part.partition_index);
+                    let Some(fetch_offset) = self.positions.get(&key).copied() else {
+                        continue;
+                    };
+                    let Some(bytes) = part.records.clone().filter(|b| !b.is_empty()) else {
+                        continue;
+                    };
+
+                    let Some(decoded) = kestrel_core::records::decode_lean(&bytes)? else {
+                        // Compressed, or carrying headers: the ordinary decoder
+                        // handles it, and this partition pays the old price.
+                        let records = decode_records(bytes)?;
+                        let aborted = aborted_of(part);
+                        let Fetched {
+                            records,
+                            next_offset,
+                        } = consumer::filter(
+                            records,
+                            &aborted,
+                            part.last_stable_offset,
+                            self.isolation,
+                            fetch_offset,
+                        );
+                        self.positions.insert(key, next_offset);
+                        if !records.is_empty() {
+                            out.push(LeanFetched {
+                                topic: topic.clone(),
+                                partition: part.partition_index,
+                                batches: Vec::new(),
+                                fallback: records,
+                            });
+                        }
+                        continue;
+                    };
+
+                    let aborted = aborted_of(part);
+                    let (batches, next_offset) = kestrel_core::records::filter_batches(
+                        decoded,
+                        &aborted,
+                        part.last_stable_offset,
+                        self.isolation,
+                        fetch_offset,
+                    );
+                    self.positions.insert(key, next_offset);
+                    if !batches.is_empty() {
+                        out.push(LeanFetched {
+                            topic: topic.clone(),
+                            partition: part.partition_index,
+                            batches,
+                            fallback: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        self.start_prefetch().await;
+        Ok(out)
+    }
+}
+
+/// The aborted-transaction list a fetch response carries for one partition.
+fn aborted_of(part: &kafka_protocol::messages::fetch_response::PartitionData) -> Vec<AbortedTransaction> {
+    part.aborted_transactions
+        .as_ref()
+        .map(|list| {
+            list.iter()
+                .map(|a| AbortedTransaction {
+                    producer_id: a.producer_id.0,
+                    first_offset: a.first_offset,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }

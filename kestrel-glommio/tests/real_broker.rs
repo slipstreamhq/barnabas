@@ -434,3 +434,88 @@ async fn fetch_until(
     }
     out
 }
+
+/// **The lean decoder must agree with the ordinary one**, including on the
+/// filtering that matters: an aborted transaction is dropped a *batch* at a
+/// time there and a *record* at a time here, and those are different code
+/// paths that must not disagree.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn lean_decode_agrees_with_the_ordinary_path() {
+    run(|| async {
+        let topic = unique_topic("lean");
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
+        prod.create_topic().await;
+        prod.init_transactions().await;
+
+        // Plain records, an aborted transaction, then a committed one — so the
+        // batch-level filter has control batches and an abort range to handle.
+        prod.produce_plain(4).await;
+        prod.begin().await;
+        prod.produce_txn(3).await;
+        prod.end(false).await;
+        prod.begin().await;
+        prod.produce_txn(2).await;
+        prod.end(true).await;
+
+        let expected = {
+            let mut consumer = Consumer::assign(
+                kestrel_glommio::Glommio,
+                &bootstrap(),
+                "kestrel-test",
+                &topic,
+                0,
+                EARLIEST,
+                IsolationLevel::ReadCommitted,
+            )
+            .await
+            .expect("assign");
+            fetch_until(&mut consumer, 6)
+                .await
+                .iter()
+                .map(|r| String::from_utf8_lossy(r.value.as_ref().unwrap()).into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let mut consumer = Consumer::assign(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "kestrel-test",
+            &topic,
+            0,
+            EARLIEST,
+            IsolationLevel::ReadCommitted,
+        )
+        .await
+        .expect("assign");
+        consumer.set_max_wait(Duration::from_millis(200));
+
+        let mut actual = Vec::new();
+        for _ in 0..25 {
+            for group in consumer.fetch_lean().await.expect("fetch lean") {
+                for batch in &group.batches {
+                    for record in &batch.records {
+                        actual.push(
+                            String::from_utf8_lossy(&batch.value(record).expect("value"))
+                                .into_owned(),
+                        );
+                    }
+                }
+                for record in &group.fallback {
+                    actual.push(
+                        String::from_utf8_lossy(record.value.as_ref().unwrap()).into_owned(),
+                    );
+                }
+            }
+            if actual.len() >= expected.len() {
+                break;
+            }
+        }
+
+        assert_eq!(
+            actual, expected,
+            "lean decode disagreed with the ordinary path"
+        );
+        assert!(!expected.is_empty(), "the fixture produced nothing");
+    });
+}

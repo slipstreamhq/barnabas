@@ -37,6 +37,7 @@ pub mod frame;
 pub mod metadata;
 pub mod partitioner;
 pub mod producer;
+pub mod records;
 
 pub use conn::{Connection, PendingResponse};
 pub use consumer::{FetchPosition, IsolationLevel};

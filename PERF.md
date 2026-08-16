@@ -261,6 +261,43 @@ It also binds a client to **one partition**, so eight partitions are eight clien
 connections, and a write spanning them is eight requests. Ours is one request per *broker*. That is
 the trade this client was designed around, and at batch 1 000 it shows.
 
+### The lean decoder, built and measured
+
+Built it. `kestrel_core::records` reads a record batch without building a record per record: batch
+facts (producer id, transactional, control) are kept once, and a record is an offset, a timestamp and
+two ranges into the retained batch buffer. `Consumer::fetch_lean` is the path that uses it.
+
+| consume, 1 M records | rec/s |
+|---|---:|
+| ordinary path (`fetch`) | 7 848 000 – 8 296 000 |
+| **lean path (`fetch_lean`)** | **14 118 000 – 14 541 000** |
+| rskafka | 4 838 000 – 5 065 000 |
+
+**1.75× end to end**, and ~2.9× rskafka. The bench reads every value through `LeanBatch::value`, so
+materialising the payload is inside the measurement — a version that never touched the bytes would
+flatter it.
+
+Filtering gets cheaper for a second reason: `transactional`, `control` and `producer_id` are
+batch-level in the format, so an aborted transaction is dropped a batch at a time rather than a
+record at a time.
+
+**What it costs to own.** About 250 lines, and it is format-parsing code, where being wrong means
+handing the caller bad data rather than failing. Guarded three ways: it validates the CRC, it
+**falls back** to `kafka_protocol` for anything it does not handle, and a live test asserts the two
+paths return identical records on a topic containing plain records, an aborted transaction and a
+committed one.
+
+**What it does not handle**, each falling back at the old speed:
+
+- **compressed batches** — the codec would have to be run first;
+- **records with headers** — the lean record does not carry them, and dropping them silently would
+  lose caller data, so a batch containing any is handed back;
+- **anything but magic 2**.
+
+Those two gaps are also why this is a second method rather than a change to `fetch`. Closing them —
+header ranges, and decompressing into an owned buffer that is then parsed the same way — would let
+`fetch` use it and remove the dual API. That is the decision this measurement was for.
+
 ### Would SIMD help the decoder? No — measured
 
 Decode is now the largest single item in a consume: ~70 ns of a ~120 ns/record budget, where before
@@ -468,8 +505,8 @@ than defended.
   causing.
 - **Whether 25–29 M records/s is our ceiling or the cluster's** is unknown; the other clients are far
   enough below it that only our own number is in question.
-- **A lean record representation** is the largest identified win left (see the SIMD section):
-  ~12× on decode, which is ~58% of the consume budget.
+- **Whether the lean decoder should replace `fetch` rather than sit beside it**, which needs header
+  and compression support first. Measured at 1.75× on consume; see its section.
 - **Whether 64 MiB is the right response budget.** It was chosen to be clearly larger than the
   per-partition budget, not tuned; the memory a fetch may hold scales with it.
 - **rskafka has no many-core row.** Its per-partition client shape makes the comparison less direct,
