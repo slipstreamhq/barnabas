@@ -61,6 +61,7 @@ Both properties were mutation-proved: resetting sequences per transaction fails
 | **Compression** | gzip, snappy, lz4, zstd — round-tripped against a real broker, both directions |
 | **Leader routing, metadata cache** | works — fetches go to the leader from the cluster map, `NOT_LEADER_OR_FOLLOWER` invalidates that partition and retries |
 | **Runtimes** | glommio and tokio, from one client. Adding a third is a `Transport` impl |
+| **Consumer** | any number of partitions, **one `Fetch` per broker** rather than per partition — one connection where there were eight |
 | **Connection recovery** | a closed connection is evicted and redialled once; a request that outlives its deadline drops its connection, because the late response would desynchronise the stream |
 | **TLS** | opt-in `tls` feature on either binding. A second `Transport`, so `Consumer<GlommioTls>` is the same client over a different socket — the shared code needed no change at all |
 | **SASL** | PLAIN and SCRAM-SHA-256/512. Shared, since the handshake is protocol |
@@ -78,7 +79,7 @@ for every ratio:
 | produce, batch 1 × 128 B | 10–33 k rec/s | ~9.8 k rec/s |
 | produce latency p50 / p99 | 0.04 / 0.07 ms | 0.05 / 0.09 ms |
 | produce latency **max** | **1.7–2.0 ms** | **502–504 ms** |
-| consume, 128 B | 5.9–7.1 M rec/s | 123–327 k rec/s |
+| consume, 128 B | 7.6–8.1 M rec/s | 123–327 k rec/s |
 
 The consume gap is partly an API difference (batch-at-a-time versus message-at-a-time) and is
 labelled as such in `PERF.md`, along with two fairness mistakes that were found and corrected while

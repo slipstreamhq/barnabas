@@ -1,5 +1,19 @@
 //! The assign-only consumer.
+//!
+//! # One fetch per broker, not per partition
+//!
+//! A consumer holds any number of `(topic, partition)` assignments and fetches
+//! them **together**: partitions are grouped by the broker that leads them, and
+//! each broker gets one `Fetch` carrying all of them.
+//!
+//! This is the read-side twin of the producer's batching, and it matters more
+//! for a per-core client than for a threaded one. A core that owns thirty-two
+//! partitions was previously thirty-two connections and thirty-two round trips
+//! per poll; it is now one connection per broker and one request. That is also
+//! what makes the connection count affordable — the thing `PERF.md` and the
+//! design doc both flagged as the cost of being per-core.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -22,35 +36,55 @@ pub const EARLIEST: i64 = -2;
 pub const LATEST: i64 = -1;
 
 /// How many times a request is retried when the broker says leadership moved.
-///
-/// Bounded rather than unbounded: a partition whose leader never settles is a
-/// cluster problem, and spinning silently is worse than surfacing it.
 const MAX_LEADER_RETRIES: usize = 5;
 
-/// An assign-only consumer for one partition.
+/// What one partition yielded.
+#[derive(Debug)]
+pub struct FetchedRecords {
+    pub topic: String,
+    pub partition: i32,
+    pub records: Vec<Record>,
+}
+
+/// An assign-only consumer over any number of partitions.
 ///
 /// Assignment is the caller's: no group protocol, no rebalance, no offset
-/// commit. Where the position lives is also the caller's problem, which is what
+/// commit. Where the positions live is also the caller's problem, which is what
 /// makes this usable from a system that checkpoints offsets itself.
 pub struct Consumer<T: Transport> {
     cluster: Cluster<T>,
-    topic: String,
-    partition: i32,
-    next_offset: i64,
+    /// `(topic, partition)` → the offset the next fetch asks for.
+    positions: BTreeMap<(String, i32), i64>,
     isolation: IsolationLevel,
     max_wait: Duration,
     max_bytes: i32,
 }
 
 impl<T: Transport> Consumer<T> {
-    /// Connect and position on `topic`/`partition` at `offset`.
-    ///
-    /// `offset` may be [`EARLIEST`], [`LATEST`], or an absolute offset;
-    /// the first two are resolved with `ListOffsets` before the first fetch.
+    /// Connect with no assignments. Add them with [`Self::add`].
     ///
     /// # Errors
-    /// If no bootstrap address answers, the topic does not exist, or the broker
-    /// answers with an error code.
+    /// If no bootstrap address answers.
+    pub async fn new(
+        transport: T,
+        bootstrap: &[String],
+        client_id: &str,
+        isolation: IsolationLevel,
+    ) -> Result<Self> {
+        Ok(Self {
+            cluster: Cluster::connect(transport, bootstrap, client_id).await?,
+            positions: BTreeMap::new(),
+            isolation,
+            max_wait: Duration::from_millis(500),
+            max_bytes: 10 * 1024 * 1024,
+        })
+    }
+
+    /// Connect and assign one partition — the common case, and what the
+    /// single-partition callers use.
+    ///
+    /// # Errors
+    /// As [`Self::new`], plus a missing topic or partition.
     pub async fn assign(
         transport: T,
         bootstrap: &[String],
@@ -60,36 +94,86 @@ impl<T: Transport> Consumer<T> {
         offset: i64,
         isolation: IsolationLevel,
     ) -> Result<Self> {
-        let mut cluster = Cluster::connect(transport, bootstrap, client_id).await?;
-        // Up front so a missing topic fails here rather than as a fetch loop
-        // that never returns anything.
-        cluster.refresh_metadata(topic).await?;
-
-        let mut me = Self {
-            cluster,
-            topic: topic.to_owned(),
-            partition,
-            next_offset: offset,
-            isolation,
-            max_wait: Duration::from_millis(500),
-            max_bytes: 10 * 1024 * 1024,
-        };
-        if offset == EARLIEST || offset == LATEST {
-            me.next_offset = me.list_offset(offset).await?;
-        }
+        let mut me = Self::new(transport, bootstrap, client_id, isolation).await?;
+        me.add(topic, partition, offset).await?;
         Ok(me)
     }
 
-    /// Where the next fetch will start.
-    #[must_use]
-    pub fn position(&self) -> i64 {
-        self.next_offset
+    /// Assign another partition, starting at `offset`.
+    ///
+    /// `offset` may be [`EARLIEST`], [`LATEST`], or an absolute offset; the
+    /// first two are resolved with `ListOffsets` before the first fetch.
+    ///
+    /// # Errors
+    /// If the topic does not exist, or the broker answers with an error code.
+    pub async fn add(&mut self, topic: &str, partition: i32, offset: i64) -> Result<()> {
+        // Up front so a missing topic fails here rather than as a fetch loop
+        // that never returns anything.
+        self.cluster.refresh_metadata(topic).await?;
+        self.positions
+            .insert((topic.to_owned(), partition), offset);
+
+        if offset == EARLIEST || offset == LATEST {
+            let resolved = self.list_offset(topic, partition, offset).await?;
+            self.positions
+                .insert((topic.to_owned(), partition), resolved);
+        }
+        Ok(())
     }
 
-    /// Seek. The caller owns its offsets, so this is how a restored checkpoint
-    /// is applied.
+    /// Stop fetching a partition.
+    pub fn remove(&mut self, topic: &str, partition: i32) {
+        self.positions.remove(&(topic.to_owned(), partition));
+    }
+
+    /// Every partition this consumer holds.
+    pub fn assignments(&self) -> impl Iterator<Item = (&str, i32)> {
+        self.positions
+            .keys()
+            .map(|(topic, partition)| (topic.as_str(), *partition))
+    }
+
+    /// Where the next fetch will start for one partition.
+    #[must_use]
+    pub fn position_of(&self, topic: &str, partition: i32) -> Option<i64> {
+        self.positions.get(&(topic.to_owned(), partition)).copied()
+    }
+
+    /// Where the next fetch will start, for a consumer holding exactly one
+    /// partition.
+    ///
+    /// # Panics
+    /// If the consumer holds anything other than one assignment — with several,
+    /// "the position" is not a question with an answer.
+    #[must_use]
+    pub fn position(&self) -> i64 {
+        assert_eq!(
+            self.positions.len(),
+            1,
+            "position() needs exactly one assignment; use position_of()"
+        );
+        *self.positions.values().next().expect("checked length")
+    }
+
+    /// Seek one partition. The caller owns its offsets, so this is how a
+    /// restored checkpoint is applied.
+    pub fn seek_to(&mut self, topic: &str, partition: i32, offset: i64) {
+        self.positions
+            .insert((topic.to_owned(), partition), offset);
+    }
+
+    /// Seek, for a consumer holding exactly one partition.
+    ///
+    /// # Panics
+    /// As [`Self::position`].
     pub fn seek(&mut self, offset: i64) {
-        self.next_offset = offset;
+        assert_eq!(
+            self.positions.len(),
+            1,
+            "seek() needs exactly one assignment; use seek_to()"
+        );
+        let key = self.positions.keys().next().expect("checked length").clone();
+        self.positions.insert(key, offset);
     }
 
     /// How long a fetch waits for data before returning empty.
@@ -97,16 +181,14 @@ impl<T: Transport> Consumer<T> {
         self.max_wait = max_wait;
     }
 
-    /// The connections this consumer holds. See [`Cluster`] on why the count
-    /// matters for a per-core client.
+    /// The connections this consumer holds — one per broker it fetches from,
+    /// **not** one per partition.
     #[must_use]
     pub fn connection_count(&self) -> usize {
         self.cluster.connection_count()
     }
 
-    /// The address the cluster map currently names as this partition's leader,
-    /// if it knows one. Exposed for tests and for callers that want to see the
-    /// routing decision rather than infer it.
+    /// The address the cluster map names as this partition's leader.
     #[must_use]
     pub fn metadata_leader(&self, topic: &str, partition: i32) -> Option<String> {
         self.cluster
@@ -115,126 +197,205 @@ impl<T: Transport> Consumer<T> {
             .map(kestrel_core::BrokerAddr::addr)
     }
 
-    /// Resolve a timestamp to an offset. [`EARLIEST`] and [`LATEST`] are the
-    /// two a consumer normally wants; any millisecond timestamp works.
+    /// Resolve a timestamp to an offset for one partition. [`EARLIEST`] and
+    /// [`LATEST`] are the two a consumer normally wants.
     ///
     /// # Errors
     /// If the broker answers with an error code.
-    pub async fn list_offset(&mut self, timestamp: i64) -> Result<i64> {
-        let mut partition = ListOffsetsPartition::default();
-        partition.partition_index = self.partition;
-        partition.timestamp = timestamp;
+    pub async fn list_offset(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        timestamp: i64,
+    ) -> Result<i64> {
+        let mut req_partition = ListOffsetsPartition::default();
+        req_partition.partition_index = partition;
+        req_partition.timestamp = timestamp;
 
-        let mut topic = ListOffsetsTopic::default();
-        topic.name = TopicName(StrBytes::from_string(self.topic.clone()));
-        topic.partitions = vec![partition];
+        let mut req_topic = ListOffsetsTopic::default();
+        req_topic.name = TopicName(StrBytes::from_string(topic.to_owned()));
+        req_topic.partitions = vec![req_partition];
 
         let mut req = ListOffsetsRequest::default();
         req.replica_id = BrokerId(-1);
         req.isolation_level = self.isolation.as_i8();
-        req.topics = vec![topic];
+        req.topics = vec![req_topic];
 
-        self.with_leader("ListOffsets", |resp: ListOffsetsResponse, want| {
-            resp.topics
-                .iter()
-                .flat_map(|t| t.partitions.iter())
-                .find(|p| p.partition_index == want)
-                .map(|p| (p.error_code, p.offset))
-        })
-        .call(ApiKey::ListOffsets, 7, &req)
-        .await
-    }
-
-    /// Fetch once from the current position, advancing it.
-    ///
-    /// An empty result is normal: a fetch that waits out `max_wait` with no new
-    /// data is not an error. The position advances past filtered records as
-    /// well as returned ones, so an all-aborted fetch makes progress rather
-    /// than looping.
-    ///
-    /// # Errors
-    /// If the connection fails, leadership cannot be resolved, or the broker
-    /// answers with a code that is not about leadership.
-    pub async fn fetch(&mut self) -> Result<Vec<Record>> {
         for attempt in 0..=MAX_LEADER_RETRIES {
-            let addr = self.cluster.leader_addr(&self.topic, self.partition).await?;
-            let req = self.fetch_request();
+            let addr = self.cluster.leader_addr(topic, partition).await?;
+            let resp: ListOffsetsResponse = self
+                .cluster
+                .call_at(&addr, ApiKey::ListOffsets, 7, &req)
+                .await?;
 
-            let resp: FetchResponse = self.cluster.call_at(&addr, ApiKey::Fetch, 12, &req).await?;
-            check("Fetch", resp.error_code)?;
-
-            let Some(partition) = resp
-                .responses
+            let found = resp
+                .topics
                 .iter()
                 .flat_map(|t| t.partitions.iter())
-                .find(|p| p.partition_index == self.partition)
-            else {
-                // A response with no partition data is an empty fetch.
-                return Ok(Vec::new());
-            };
+                .find(|p| p.partition_index == partition)
+                .ok_or(Error::Missing("partition"))?;
 
-            let code = ErrorCode(partition.error_code);
+            let code = ErrorCode(found.error_code);
             if code.disposition() == Disposition::RefreshMetadata {
-                // The leader moved. Forget just this partition, ask again, and
-                // retry — the flow every metadata cache is built around.
-                self.cluster.invalidate(&self.topic, self.partition);
+                self.cluster.invalidate(topic, partition);
                 if attempt == MAX_LEADER_RETRIES {
                     return Err(Error::Broker {
-                        op: "Fetch",
+                        op: "ListOffsets",
                         code: code.0,
                         disposition: code.disposition(),
                     });
                 }
-                self.cluster.refresh_metadata(&self.topic).await?;
+                self.cluster.refresh_metadata(topic).await?;
                 continue;
             }
-            check("Fetch partition", partition.error_code)?;
-
-            let records = match &partition.records {
-                Some(bytes) if !bytes.is_empty() => decode_records(bytes.clone())?,
-                _ => return Ok(Vec::new()),
-            };
-            let aborted: Vec<AbortedTransaction> = partition
-                .aborted_transactions
-                .as_ref()
-                .map(|list| {
-                    list.iter()
-                        .map(|a| AbortedTransaction {
-                            producer_id: a.producer_id.0,
-                            first_offset: a.first_offset,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            // The filtering the broker does not do. See `kestrel_core::consumer`.
-            let Fetched {
-                records,
-                next_offset,
-            } = consumer::filter(
-                records,
-                &aborted,
-                partition.last_stable_offset,
-                self.isolation,
-                self.next_offset,
-            );
-            self.next_offset = next_offset;
-            return Ok(records);
+            check("ListOffsets", found.error_code)?;
+            return Ok(found.offset);
         }
-        unreachable!("the loop returns or errors on its last iteration")
+        unreachable!("the loop returns on its last attempt")
     }
 
-    fn fetch_request(&self) -> FetchRequest {
-        let mut partition = FetchPartition::default();
-        partition.partition = self.partition;
-        partition.fetch_offset = self.next_offset;
-        partition.partition_max_bytes = self.max_bytes;
-        partition.current_leader_epoch = -1;
-        partition.log_start_offset = -1;
+    /// Fetch every assigned partition, **one request per broker**.
+    ///
+    /// An empty result is normal: a fetch that waits out `max_wait` with no new
+    /// data is not an error. Positions advance past filtered records as well as
+    /// returned ones, so an all-aborted fetch makes progress rather than
+    /// looping.
+    ///
+    /// # Errors
+    /// If the connection fails, leadership cannot be resolved, or a broker
+    /// answers with a code that is not about leadership.
+    pub async fn fetch(&mut self) -> Result<Vec<FetchedRecords>> {
+        if self.positions.is_empty() {
+            return Ok(Vec::new());
+        }
 
-        let mut topic = FetchTopic::default();
-        topic.topic = TopicName(StrBytes::from_string(self.topic.clone()));
-        topic.partitions = vec![partition];
+        for attempt in 0..=MAX_LEADER_RETRIES {
+            // Group this round's partitions by the broker that leads them.
+            let mut by_broker: BTreeMap<String, Vec<(String, i32)>> = BTreeMap::new();
+            for (topic, partition) in self.positions.keys().cloned().collect::<Vec<_>>() {
+                let addr = self.cluster.leader_addr(&topic, partition).await?;
+                by_broker.entry(addr).or_default().push((topic, partition));
+            }
+
+            let mut out = Vec::new();
+            let mut needs_refresh: Vec<(String, i32)> = Vec::new();
+
+            for (addr, partitions) in by_broker {
+                let req = self.fetch_request(&partitions);
+                let resp: FetchResponse =
+                    self.cluster.call_at(&addr, ApiKey::Fetch, 12, &req).await?;
+                check("Fetch", resp.error_code)?;
+
+                for topic_response in &resp.responses {
+                    let topic = topic_response.topic.0.to_string();
+                    for part in &topic_response.partitions {
+                        let code = ErrorCode(part.error_code);
+                        if code.disposition() == Disposition::RefreshMetadata {
+                            // The leader moved. Forget just this partition and
+                            // ask again — the others in this response are fine.
+                            self.cluster.invalidate(&topic, part.partition_index);
+                            needs_refresh.push((topic.clone(), part.partition_index));
+                            continue;
+                        }
+                        check("Fetch partition", part.error_code)?;
+
+                        let key = (topic.clone(), part.partition_index);
+                        let Some(fetch_offset) = self.positions.get(&key).copied() else {
+                            continue;
+                        };
+
+                        let records = match &part.records {
+                            Some(bytes) if !bytes.is_empty() => decode_records(bytes.clone())?,
+                            _ => continue,
+                        };
+                        let aborted: Vec<AbortedTransaction> = part
+                            .aborted_transactions
+                            .as_ref()
+                            .map(|list| {
+                                list.iter()
+                                    .map(|a| AbortedTransaction {
+                                        producer_id: a.producer_id.0,
+                                        first_offset: a.first_offset,
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        // The filtering the broker does not do. See
+                        // `kestrel_core::consumer`.
+                        let Fetched {
+                            records,
+                            next_offset,
+                        } = consumer::filter(
+                            records,
+                            &aborted,
+                            part.last_stable_offset,
+                            self.isolation,
+                            fetch_offset,
+                        );
+                        self.positions.insert(key, next_offset);
+                        if !records.is_empty() {
+                            out.push(FetchedRecords {
+                                topic: topic.clone(),
+                                partition: part.partition_index,
+                                records,
+                            });
+                        }
+                    }
+                }
+            }
+
+            if needs_refresh.is_empty() || attempt == MAX_LEADER_RETRIES {
+                return Ok(out);
+            }
+            // Something moved. Refresh the topics involved and go round again;
+            // whatever was read this time is kept, because its offsets have
+            // already advanced.
+            if !out.is_empty() {
+                return Ok(out);
+            }
+            let mut topics: Vec<String> = needs_refresh.into_iter().map(|(t, _)| t).collect();
+            topics.sort_unstable();
+            topics.dedup();
+            for topic in topics {
+                self.cluster.refresh_metadata(&topic).await?;
+            }
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+
+    /// One `Fetch` naming every partition this broker leads, grouped by topic
+    /// as the protocol requires.
+    fn fetch_request(&self, partitions: &[(String, i32)]) -> FetchRequest {
+        let mut by_topic: BTreeMap<&str, Vec<i32>> = BTreeMap::new();
+        for (topic, partition) in partitions {
+            by_topic.entry(topic.as_str()).or_default().push(*partition);
+        }
+
+        let topics: Vec<FetchTopic> = by_topic
+            .into_iter()
+            .map(|(topic, partitions)| {
+                let mut fetch_topic = FetchTopic::default();
+                fetch_topic.topic = TopicName(StrBytes::from_string(topic.to_owned()));
+                fetch_topic.partitions = partitions
+                    .into_iter()
+                    .map(|partition| {
+                        let mut fetch_partition = FetchPartition::default();
+                        fetch_partition.partition = partition;
+                        fetch_partition.fetch_offset = self
+                            .positions
+                            .get(&(topic.to_owned(), partition))
+                            .copied()
+                            .unwrap_or(0);
+                        fetch_partition.partition_max_bytes = self.max_bytes;
+                        fetch_partition.current_leader_epoch = -1;
+                        fetch_partition.log_start_offset = -1;
+                        fetch_partition
+                    })
+                    .collect();
+                fetch_topic
+            })
+            .collect();
 
         let mut req = FetchRequest::default();
         req.replica_id = BrokerId(-1);
@@ -242,94 +403,41 @@ impl<T: Transport> Consumer<T> {
         req.min_bytes = 1;
         req.max_bytes = self.max_bytes;
         req.isolation_level = self.isolation.as_i8();
-        req.topics = vec![topic];
+        req.topics = topics;
         req
     }
-
-    /// Route a partition request to its leader, refreshing and retrying if the
-    /// broker says leadership moved.
-    ///
-    /// `extract` pulls `(error_code, value)` for the partition out of whatever
-    /// response shape the API uses — the one part that differs between them.
-    fn with_leader<Resp, V, F>(&mut self, op: &'static str, extract: F) -> LeaderCall<'_, T, Resp, V, F>
-    where
-        F: Fn(Resp, i32) -> Option<(i16, V)>,
-    {
-        LeaderCall {
-            consumer: self,
-            op,
-            extract,
-            _resp: std::marker::PhantomData,
-        }
-    }
 }
 
-/// A partition request in the middle of being routed. See
-/// [`Consumer::with_leader`].
+/// Decode the record batches in one partition's fetch data.
 ///
-/// A struct rather than a closure taking `&mut Consumer`: the closure would
-/// borrow the consumer mutably and return a future that outlives the borrow,
-/// which is a lifetime fight with nothing at the end of it.
-pub struct LeaderCall<'a, T: Transport, Resp, V, F> {
-    consumer: &'a mut Consumer<T>,
-    op: &'static str,
-    extract: F,
-    _resp: std::marker::PhantomData<(Resp, V)>,
-}
-
-impl<T: Transport, Resp, V, F> LeaderCall<'_, T, Resp, V, F>
-where
-    Resp: kafka_protocol::protocol::Decodable,
-    F: Fn(Resp, i32) -> Option<(i16, V)>,
-{
-    async fn call<Req: kafka_protocol::protocol::Encodable>(
-        self,
-        api_key: ApiKey,
-        version: i16,
-        req: &Req,
-    ) -> Result<V> {
-        let Self {
-            consumer,
-            op,
-            extract,
-            ..
-        } = self;
-        for attempt in 0..=MAX_LEADER_RETRIES {
-            let addr = consumer
-                .cluster
-                .leader_addr(&consumer.topic, consumer.partition)
-                .await?;
-            let resp: Resp = consumer.cluster.call_at(&addr, api_key, version, req).await?;
-
-            let (code, value) =
-                extract(resp, consumer.partition).ok_or(Error::Missing("partition"))?;
-            let code = ErrorCode(code);
-            if code.disposition() == Disposition::RefreshMetadata {
-                consumer
-                    .cluster
-                    .invalidate(&consumer.topic, consumer.partition);
-                if attempt == MAX_LEADER_RETRIES {
-                    return Err(Error::Broker {
-                        op,
-                        code: code.0,
-                        disposition: code.disposition(),
-                    });
-                }
-                consumer.cluster.refresh_metadata(&consumer.topic).await?;
-                continue;
-            }
-            check(op, code.0)?;
-            return Ok(value);
-        }
-        unreachable!("the loop returns or errors on its last iteration")
-    }
-}
-
+/// **The last batch may be truncated, and that is not corruption.** When a
+/// fetch hits `max_bytes` the broker cuts the response mid-batch rather than
+/// dropping it, and expects the client to ignore the fragment and ask again
+/// from where it got to. A decoder that treats the fragment as an error fails
+/// the whole fetch — which is exactly what happened the moment several
+/// partitions shared a response and the limit started binding.
+///
+/// So the length prefix is checked before decoding: a batch that is not
+/// entirely present ends the loop, while a batch that *is* present and fails to
+/// decode is still an error.
 fn decode_records(mut bytes: Bytes) -> Result<Vec<Record>> {
-    // A fetch response can carry several batches back to back; the decoder
-    // takes one at a time, so drain until the buffer is spent.
+    /// `baseOffset` (8) + `batchLength` (4) precede the rest of a v2 batch.
+    const HEADER: usize = 12;
+
     let mut all = Vec::new();
-    while !bytes.is_empty() {
+    while bytes.len() >= HEADER {
+        let batch_length = i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let Ok(batch_length) = usize::try_from(batch_length) else {
+            return Err(Error::Core(kestrel_core::Error::Codec(format!(
+                "record batch declares a negative length: {batch_length}"
+            ))));
+        };
+        if bytes.len() < HEADER + batch_length {
+            // Truncated by the broker's byte limit. Stop here; the next fetch
+            // starts from the offset this one reached.
+            break;
+        }
+
         let set = RecordBatchDecoder::decode(&mut bytes).map_err(|e| {
             Error::Core(kestrel_core::Error::Codec(format!(
                 "decode record batch: {e}"
@@ -338,4 +446,93 @@ fn decode_records(mut bytes: Bytes) -> Result<Vec<Record>> {
         all.extend(set.records);
     }
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+    use kafka_protocol::records::{
+        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+    };
+
+    fn batch(base_offset: i64, count: usize) -> Bytes {
+        let records: Vec<Record> = (0..count)
+            .map(|i| Record {
+                transactional: false,
+                control: false,
+                partition_leader_epoch: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                timestamp_type: TimestampType::Creation,
+                offset: base_offset + i as i64,
+                sequence: i as i32,
+                timestamp: 0,
+                key: None,
+                value: Some(Bytes::from(format!("v{i}"))),
+                headers: Default::default(),
+            })
+            .collect();
+        let mut buf = BytesMut::new();
+        RecordBatchEncoder::encode(
+            &mut buf,
+            records.iter(),
+            &RecordEncodeOptions {
+                version: 2,
+                compression: Compression::None,
+            },
+        )
+        .expect("encode");
+        buf.freeze()
+    }
+
+    #[test]
+    fn whole_batches_decode() {
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&batch(0, 3));
+        wire.extend_from_slice(&batch(3, 2));
+        let records = decode_records(wire.freeze()).expect("decode");
+        assert_eq!(records.len(), 5);
+    }
+
+    /// **A fetch that hits `max_bytes` ends mid-batch**, and the broker expects
+    /// the fragment to be ignored rather than treated as corruption. Failing
+    /// here fails the whole fetch — which is what happened the moment several
+    /// partitions shared one response and the limit started binding.
+    #[test]
+    fn a_truncated_trailing_batch_is_ignored() {
+        let complete = batch(0, 3);
+        let partial = batch(3, 2);
+
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&complete);
+        wire.extend_from_slice(&partial[..partial.len() - 4]);
+
+        let records = decode_records(wire.freeze()).expect("a truncated tail is not an error");
+        assert_eq!(
+            records.len(),
+            3,
+            "the complete batch must survive and the fragment must be dropped"
+        );
+    }
+
+    /// Even a fragment too short to hold a header is just "nothing more here".
+    #[test]
+    fn a_fragment_shorter_than_a_header_is_ignored() {
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&batch(0, 1));
+        wire.extend_from_slice(&[0u8; 5]);
+        assert_eq!(decode_records(wire.freeze()).expect("decode").len(), 1);
+    }
+
+    /// A batch that claims a negative length is corruption, not truncation, and
+    /// must not be silently skipped.
+    #[test]
+    fn a_negative_batch_length_is_an_error() {
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&0i64.to_be_bytes());
+        wire.extend_from_slice(&(-1i32).to_be_bytes());
+        wire.extend_from_slice(&[0u8; 32]);
+        assert!(decode_records(wire.freeze()).is_err());
+    }
 }

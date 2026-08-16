@@ -39,7 +39,12 @@ matters, and this is a three-orders-of-magnitude difference in it.
 
 | record | kestrel rec/s | rdkafka rec/s | ratio |
 |---:|---:|---:|---:|
-| 128 B | 5 919 000 – 7 129 000 | 123 000 – 327 000 | **21.7×** (against its best) |
+| 128 B | 7 589 000 – 8 065 000 | 123 000 – 327 000 | **~24×** (against its best) |
+
+Measured with **one consumer holding all eight partitions** — one connection, one `Fetch` per
+poll. The per-partition shape it replaced managed 5.9–7.1 M rec/s over eight connections, so
+multi-partition fetch bought roughly 13% and cut the connection count by 8×. The connection saving
+is the more important half: it is what makes a per-core client affordable to a broker.
 
 **`rdkafka`'s consumer is bimodal here** — roughly 125k or roughly 330k, with no configuration
 change between runs. The ratio above uses the fast mode; against the slow mode it would read 55×,
@@ -71,6 +76,8 @@ than defended.
 - **No many-core run.** Everything above is one process; the case a per-core client is built for —
   each core owning partitions — is not represented at all.
 - **No consume latency**, only throughput.
+- **No fetch sessions (KIP-227).** Each fetch re-states every partition; incremental fetch would
+  shrink the request and the broker's per-connection work.
 - **No compression cells**, though all four codecs round-trip correctly in the test suite.
 - **No sustained run.** These are seconds-long bursts; nothing here says what happens after an hour,
   or how memory behaves under backpressure.

@@ -124,7 +124,14 @@ fn an_aborted_transaction_is_invisible() {
         // looping on a partition of only-aborted data.
         let mut seen = Vec::new();
         for _ in 0..3 {
-            seen.extend(consumer.fetch().await.expect("fetch"));
+            seen.extend(
+            consumer
+                .fetch()
+                .await
+                .expect("fetch")
+                .into_iter()
+                .flat_map(|group| group.records),
+        );
         }
         assert!(
             seen.is_empty(),
@@ -295,7 +302,14 @@ async fn fetch_until(
     consumer.set_max_wait(Duration::from_millis(200));
     let mut out = Vec::new();
     for _ in 0..25 {
-        out.extend(consumer.fetch().await.expect("fetch"));
+        out.extend(
+            consumer
+                .fetch()
+                .await
+                .expect("fetch")
+                .into_iter()
+                .flat_map(|group| group.records),
+        );
         if out.len() >= want {
             break;
         }

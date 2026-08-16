@@ -157,39 +157,33 @@ fn kestrel_consume(topic: &str, expect: usize) -> Duration {
         .make()
         .expect("executor")
         .run(async move {
-            // One consumer per partition — the shape the client offers today,
-            // and the reason multi-partition fetch is the next thing to build.
-            let mut consumers = Vec::new();
+            // **One consumer for every partition.** All eight travel in one
+            // Fetch to the broker that leads them, over one connection.
+            let mut consumer = kestrel_glommio::Consumer::new(
+                kestrel_glommio::Glommio,
+                &[broker()],
+                "bench",
+                kestrel_core::IsolationLevel::ReadCommitted,
+            )
+            .await
+            .expect("consumer");
             for partition in 0..PARTITIONS {
-                let mut consumer = kestrel_glommio::Consumer::assign(
-                    kestrel_glommio::Glommio,
-                    &[broker()],
-                    "bench",
-                    &topic,
-                    partition,
-                    kestrel_glommio::EARLIEST,
-                    kestrel_core::IsolationLevel::ReadCommitted,
-                )
-                .await
-                .expect("assign");
-                consumer.set_max_wait(Duration::from_millis(100));
-                consumers.push(consumer);
+                consumer
+                    .add(&topic, partition, kestrel_glommio::EARLIEST)
+                    .await
+                    .expect("assign");
             }
+            consumer.set_max_wait(Duration::from_millis(100));
 
             let start = Instant::now();
             let mut seen = 0;
             while seen < expect {
-                let mut progressed = false;
-                for consumer in &mut consumers {
-                    let records = consumer.fetch().await.expect("fetch");
-                    if !records.is_empty() {
-                        progressed = true;
-                        seen += records.len();
-                    }
-                }
-                if !progressed {
+                let groups = consumer.fetch().await.expect("fetch");
+                let got: usize = groups.iter().map(|g| g.records.len()).sum();
+                if got == 0 {
                     break;
                 }
+                seen += got;
             }
             assert_eq!(seen, expect, "kestrel consumed {seen} of {expect}");
             start.elapsed()

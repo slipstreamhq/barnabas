@@ -78,7 +78,13 @@ async fn read_all(topic: &str, want: usize, isolation: IsolationLevel) -> Vec<St
 
     let mut out = Vec::new();
     for _ in 0..25 {
-        for record in consumer.fetch().await.expect("fetch") {
+        for record in consumer
+            .fetch()
+            .await
+            .expect("fetch")
+            .into_iter()
+            .flat_map(|group| group.records)
+        {
             out.push(
                 record
                     .value
@@ -363,7 +369,13 @@ fn keyed_records_land_on_the_partition_their_key_names() {
 
             let mut got = Vec::new();
             for _ in 0..10 {
-                for record in consumer.fetch().await.expect("fetch") {
+                for record in consumer
+            .fetch()
+            .await
+            .expect("fetch")
+            .into_iter()
+            .flat_map(|group| group.records)
+        {
                     got.push(
                         record
                             .key
