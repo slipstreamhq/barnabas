@@ -94,7 +94,7 @@ fn plain_records_round_trip() {
         let records = fetch_until(&mut consumer, 3).await;
         let values: Vec<String> = records
             .iter()
-            .map(|r| String::from_utf8_lossy(r.value.as_ref().unwrap()).into_owned())
+            .map(|v| String::from_utf8_lossy(v).into_owned())
             .collect();
         assert_eq!(values, vec!["v0", "v1", "v2"]);
         assert_eq!(consumer.position(), 3);
@@ -139,7 +139,7 @@ fn an_aborted_transaction_is_invisible() {
                 .await
                 .expect("fetch")
                 .into_iter()
-                .flat_map(|group| group.records),
+                .flat_map(|group| group.iter().filter_map(|r| r.value()).collect::<Vec<_>>()),
         );
         }
         assert!(
@@ -252,7 +252,7 @@ fn seek_positions_the_next_fetch() {
         let records = fetch_until(&mut consumer, 2).await;
         let values: Vec<String> = records
             .iter()
-            .map(|r| String::from_utf8_lossy(r.value.as_ref().unwrap()).into_owned())
+            .map(|v| String::from_utf8_lossy(v).into_owned())
             .collect();
         assert_eq!(values, vec!["v3", "v4"]);
     });
@@ -323,10 +323,9 @@ fn fetches_are_routed_to_the_partition_leader() {
 /// Fetch until `want` records have arrived or the attempts run out. A single
 /// fetch is allowed to return nothing — an empty fetch is normal, not a
 /// failure — so tests that assert on content must poll.
-async fn fetch_until(
-    consumer: &mut Consumer,
-    want: usize,
-) -> Vec<kafka_protocol::records::Record> {
+/// Values only: every caller wants the payloads, and a record is now a
+/// reference into its batch rather than an owned struct that can be collected.
+async fn fetch_until(consumer: &mut Consumer, want: usize) -> Vec<bytes::Bytes> {
     consumer.set_max_wait(Duration::from_millis(200));
     let mut out = Vec::new();
     for _ in 0..25 {
@@ -336,7 +335,7 @@ async fn fetch_until(
                 .await
                 .expect("fetch")
                 .into_iter()
-                .flat_map(|group| group.records),
+                .flat_map(|group| group.iter().filter_map(|r| r.value()).collect::<Vec<_>>()),
         );
         if out.len() >= want {
             break;

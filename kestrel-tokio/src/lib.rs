@@ -29,7 +29,9 @@ use tokio::net::TcpStream;
 #[cfg(feature = "tls")]
 pub mod tls;
 
-pub use kestrel_client::{Error, FetchedRecords, ProducerRecord, Result, EARLIEST, LATEST};
+pub use kestrel_client::{
+    Error, FetchedRecords, ProducerRecord, RecordRef, Result, EARLIEST, LATEST,
+};
 pub use kestrel_core::{Disposition, ErrorCode, IsolationLevel, Partitioner};
 
 /// The runtime selector. Never instantiated — it exists to name a choice.

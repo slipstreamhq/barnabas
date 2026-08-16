@@ -89,7 +89,107 @@ impl Session {
 pub struct FetchedRecords {
     pub topic: String,
     pub partition: i32,
-    pub records: Vec<Record>,
+    /// The batches as [`kestrel_core::records`] read them.
+    pub batches: Vec<LeanBatch>,
+    /// Records from a batch the lean reader handed back — only a pre-magic-2
+    /// batch does — decoded the ordinary way. Kept separate rather than
+    /// converted, because building a [`LeanBatch`] from decoded records would
+    /// mean re-serialising them.
+    pub fallback: Vec<Record>,
+}
+
+impl FetchedRecords {
+    /// Every record, whichever path decoded it.
+    ///
+    /// **This is what callers should use.** Records live in batches because
+    /// that is how the format stores them and how the filtering works, but a
+    /// caller almost never cares which batch a record came from — and having to
+    /// nest two loops, plus handle the fallback, would be a bad trade for the
+    /// speed it buys.
+    pub fn iter(&self) -> impl Iterator<Item = RecordRef<'_>> {
+        self.batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .records
+                    .iter()
+                    .map(move |record| RecordRef::Lean { batch, record })
+            })
+            .chain(self.fallback.iter().map(RecordRef::Full))
+    }
+
+    /// How many records this partition yielded.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.batches.iter().map(|b| b.records.len()).sum::<usize>() + self.fallback.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// One record, without a record having been built for it.
+///
+/// A key, value or header list is materialised when asked for, not at decode
+/// time — which is the point: every slice of a batch buffer increments the same
+/// atomic refcount, so a caller that skips a record should not pay for it.
+#[derive(Debug, Clone, Copy)]
+pub enum RecordRef<'a> {
+    Lean {
+        batch: &'a LeanBatch,
+        record: &'a kestrel_core::records::LeanRecord,
+    },
+    /// From a batch the lean reader handed back.
+    Full(&'a Record),
+}
+
+impl RecordRef<'_> {
+    #[must_use]
+    pub fn offset(&self) -> i64 {
+        match self {
+            Self::Lean { record, .. } => record.offset,
+            Self::Full(record) => record.offset,
+        }
+    }
+
+    #[must_use]
+    pub fn timestamp(&self) -> i64 {
+        match self {
+            Self::Lean { record, .. } => record.timestamp,
+            Self::Full(record) => record.timestamp,
+        }
+    }
+
+    #[must_use]
+    pub fn key(&self) -> Option<Bytes> {
+        match self {
+            Self::Lean { batch, record } => batch.key(record),
+            Self::Full(record) => record.key.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn value(&self) -> Option<Bytes> {
+        match self {
+            Self::Lean { batch, record } => batch.value(record),
+            Self::Full(record) => record.value.clone(),
+        }
+    }
+
+    /// # Errors
+    /// If the header block is malformed.
+    pub fn headers(&self) -> Result<Vec<(Bytes, Option<Bytes>)>> {
+        match self {
+            Self::Lean { batch, record } => Ok(batch.headers(record)?),
+            Self::Full(record) => Ok(record
+                .headers
+                .iter()
+                .map(|(k, v)| (Bytes::copy_from_slice(k.as_str().as_bytes()), v.clone()))
+                .collect()),
+        }
+    }
 }
 
 /// An assign-only consumer over any number of partitions.
@@ -488,156 +588,6 @@ impl<T: Transport> Consumer<T> {
         }
     }
 
-    /// Fetch every assigned partition, **one request per broker**.
-    ///
-    /// An empty result is normal: a fetch that waits out `max_wait` with no new
-    /// data is not an error. Positions advance past filtered records as well as
-    /// returned ones, so an all-aborted fetch makes progress rather than
-    /// looping.
-    ///
-    /// # Errors
-    /// If the connection fails, leadership cannot be resolved, or a broker
-    /// answers with a code that is not about leadership.
-    pub async fn fetch(&mut self) -> Result<Vec<FetchedRecords>> {
-        if self.positions.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // An outstanding fetch asked about the assignment as it was; if that
-        // changed, its answer is to a question nobody is asking any more.
-        if self
-            .outstanding
-            .as_ref()
-            .is_some_and(|o| o.generation != self.generation)
-        {
-            self.discard_outstanding().await;
-        }
-
-        for attempt in 0..=MAX_LEADER_RETRIES {
-            if self.outstanding.is_none() {
-                self.issue_fetch().await?;
-            }
-            let groups = self.outstanding.take().expect("just issued").groups;
-            let addrs: Vec<String> = groups.iter().map(|(addr, _)| addr.clone()).collect();
-
-            let mut out = Vec::new();
-            let mut needs_refresh: Vec<(String, i32)> = Vec::new();
-
-            let responses = self
-                .cluster
-                .recv_many::<FetchResponse>(ApiKey::Fetch, &addrs)
-                .await;
-
-            for ((addr, partitions), response) in groups.into_iter().zip(responses) {
-                let resp = response?;
-
-                // A session the broker has forgotten is not a failure: drop it
-                // and the next fetch is a full one.
-                if matches!(
-                    resp.error_code,
-                    FETCH_SESSION_ID_NOT_FOUND | INVALID_FETCH_SESSION_EPOCH
-                ) {
-                    self.sessions.entry(addr.clone()).or_default().reset();
-                    continue;
-                }
-                check("Fetch", resp.error_code)?;
-
-                if self.incremental {
-                    let session = self.sessions.entry(addr.clone()).or_default();
-                    session.id = resp.session_id;
-                    // The epoch advances only on a response the broker
-                    // accepted; incrementing optimistically would desynchronise
-                    // it from the broker's view.
-                    session.epoch = session.epoch.wrapping_add(1).max(1);
-                    for (topic, partition) in &partitions {
-                        if let Some(offset) = self.positions.get(&(topic.clone(), *partition)) {
-                            session
-                                .known
-                                .insert((topic.clone(), *partition), *offset);
-                        }
-                    }
-                }
-
-                for topic_response in &resp.responses {
-                    let topic = topic_response.topic.0.to_string();
-                    for part in &topic_response.partitions {
-                        let code = ErrorCode(part.error_code);
-                        if code.disposition() == Disposition::RefreshMetadata {
-                            // The leader moved. Forget just this partition and
-                            // ask again — the others in this response are fine.
-                            self.cluster.invalidate(&topic, part.partition_index);
-                            needs_refresh.push((topic.clone(), part.partition_index));
-                            continue;
-                        }
-                        check("Fetch partition", part.error_code)?;
-
-                        let key = (topic.clone(), part.partition_index);
-                        let Some(fetch_offset) = self.positions.get(&key).copied() else {
-                            continue;
-                        };
-
-                        let records = match &part.records {
-                            Some(bytes) if !bytes.is_empty() => decode_records(bytes.clone())?,
-                            _ => continue,
-                        };
-                        let aborted: Vec<AbortedTransaction> = part
-                            .aborted_transactions
-                            .as_ref()
-                            .map(|list| {
-                                list.iter()
-                                    .map(|a| AbortedTransaction {
-                                        producer_id: a.producer_id.0,
-                                        first_offset: a.first_offset,
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-
-                        // The filtering the broker does not do. See
-                        // `kestrel_core::consumer`.
-                        let Fetched {
-                            records,
-                            next_offset,
-                        } = consumer::filter(
-                            records,
-                            &aborted,
-                            part.last_stable_offset,
-                            self.isolation,
-                            fetch_offset,
-                        );
-                        self.positions.insert(key, next_offset);
-                        if !records.is_empty() {
-                            out.push(FetchedRecords {
-                                topic: topic.clone(),
-                                partition: part.partition_index,
-                                records,
-                            });
-                        }
-                    }
-                }
-            }
-
-            if needs_refresh.is_empty() || attempt == MAX_LEADER_RETRIES {
-                self.start_prefetch().await;
-                return Ok(out);
-            }
-            // Something moved. Refresh the topics involved and go round again;
-            // whatever was read this time is kept, because its offsets have
-            // already advanced.
-            if !out.is_empty() {
-                return Ok(out);
-            }
-            let mut topics: Vec<String> = needs_refresh.into_iter().map(|(t, _)| t).collect();
-            topics.sort_unstable();
-            topics.dedup();
-            for topic in topics {
-                self.cluster.refresh_metadata(&topic).await?;
-            }
-            T::sleep(LEADER_BACKOFF).await;
-        }
-        unreachable!("the loop returns on its last attempt")
-    }
-
     /// One `Fetch` for this broker.
     ///
     /// With a session open, only the partitions whose position moved since the
@@ -746,6 +696,157 @@ fn decode_records(mut bytes: Bytes) -> Result<Vec<Record>> {
     Ok(all)
 }
 
+
+impl<T: Transport> Consumer<T> {
+    /// Fetch every assigned partition, **one request per broker**.
+    ///
+    /// Records come back grouped in the batches the broker sent, because that
+    /// is how the format stores them and how the filtering works. Use
+    /// [`FetchedRecords::iter`] to walk them without caring; a key, value or
+    /// header list is materialised when asked for rather than at decode time.
+    ///
+    /// An empty result is normal: a fetch that waits out `max_wait` with no new
+    /// data is not an error. Positions advance past filtered records as well as
+    /// returned ones, so an all-aborted fetch makes progress rather than
+    /// looping.
+    ///
+    /// All four compression codecs and record headers are handled; only a
+    /// pre-magic-2 batch falls back to the ordinary decoder, and then only that
+    /// partition pays the old cost.
+    ///
+    /// Filtering happens **per batch** here rather than per record, which it
+    /// can because `transactional`, `control` and `producer_id` are batch-level
+    /// in the format. That is most of why this path is cheaper.
+    ///
+    /// # Errors
+    /// As [`Self::fetch`].
+    pub async fn fetch(&mut self) -> Result<Vec<FetchedRecords>> {
+        if self.positions.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self
+            .outstanding
+            .as_ref()
+            .is_some_and(|o| o.generation != self.generation)
+        {
+            self.discard_outstanding().await;
+        }
+        if self.outstanding.is_none() {
+            self.issue_fetch().await?;
+        }
+
+        let groups = self.outstanding.take().expect("just issued").groups;
+        let addrs: Vec<String> = groups.iter().map(|(addr, _)| addr.clone()).collect();
+        let responses = self
+            .cluster
+            .recv_many::<FetchResponse>(ApiKey::Fetch, &addrs)
+            .await;
+
+        let mut out = Vec::new();
+        for ((addr, partitions), response) in groups.into_iter().zip(responses) {
+            let resp = response?;
+            if matches!(
+                resp.error_code,
+                FETCH_SESSION_ID_NOT_FOUND | INVALID_FETCH_SESSION_EPOCH
+            ) {
+                self.sessions.entry(addr.clone()).or_default().reset();
+                continue;
+            }
+            check("Fetch", resp.error_code)?;
+
+            if self.incremental {
+                let session = self.sessions.entry(addr.clone()).or_default();
+                session.id = resp.session_id;
+                session.epoch = session.epoch.wrapping_add(1).max(1);
+                for (topic, partition) in &partitions {
+                    if let Some(offset) = self.positions.get(&(topic.clone(), *partition)) {
+                        session.known.insert((topic.clone(), *partition), *offset);
+                    }
+                }
+            }
+
+            for topic_response in &resp.responses {
+                let topic = topic_response.topic.0.to_string();
+                for part in &topic_response.partitions {
+                    check("Fetch partition", part.error_code)?;
+                    let key = (topic.clone(), part.partition_index);
+                    let Some(fetch_offset) = self.positions.get(&key).copied() else {
+                        continue;
+                    };
+                    let Some(bytes) = part.records.clone().filter(|b| !b.is_empty()) else {
+                        continue;
+                    };
+
+                    let Some(decoded) = kestrel_core::records::decode_lean(&bytes)? else {
+                        // Only a pre-magic-2 batch reaches this now: compression
+                        // and headers are both handled. Kept because a broker
+                        // holding very old data can still serve it, and being
+                        // wrong here means bad records rather than an error.
+                        let records = decode_records(bytes)?;
+                        let aborted = aborted_of(part);
+                        let Fetched {
+                            records,
+                            next_offset,
+                        } = consumer::filter(
+                            records,
+                            &aborted,
+                            part.last_stable_offset,
+                            self.isolation,
+                            fetch_offset,
+                        );
+                        self.positions.insert(key, next_offset);
+                        if !records.is_empty() {
+                            out.push(FetchedRecords {
+                                topic: topic.clone(),
+                                partition: part.partition_index,
+                                batches: Vec::new(),
+                                fallback: records,
+                            });
+                        }
+                        continue;
+                    };
+
+                    let aborted = aborted_of(part);
+                    let (batches, next_offset) = kestrel_core::records::filter_batches(
+                        decoded,
+                        &aborted,
+                        part.last_stable_offset,
+                        self.isolation,
+                        fetch_offset,
+                    );
+                    self.positions.insert(key, next_offset);
+                    if !batches.is_empty() {
+                        out.push(FetchedRecords {
+                            topic: topic.clone(),
+                            partition: part.partition_index,
+                            batches,
+                            fallback: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        self.start_prefetch().await;
+        Ok(out)
+    }
+}
+
+/// The aborted-transaction list a fetch response carries for one partition.
+fn aborted_of(part: &kafka_protocol::messages::fetch_response::PartitionData) -> Vec<AbortedTransaction> {
+    part.aborted_transactions
+        .as_ref()
+        .map(|list| {
+            list.iter()
+                .map(|a| AbortedTransaction {
+                    producer_id: a.producer_id.0,
+                    first_offset: a.first_offset,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -833,169 +934,4 @@ mod tests {
         wire.extend_from_slice(&[0u8; 32]);
         assert!(decode_records(wire.freeze()).is_err());
     }
-}
-
-/// One partition's batches, as [`kestrel_core::records`] read them.
-///
-/// The counterpart to [`FetchedRecords`] for [`Consumer::fetch_lean`]: batches
-/// rather than a flat list of records, because the facts a consumer filters on
-/// — producer id, whether the batch is transactional, whether it is a control
-/// batch — belong to the batch, and flattening them is what makes the ordinary
-/// path expensive.
-#[derive(Debug)]
-pub struct LeanFetched {
-    pub topic: String,
-    pub partition: i32,
-    pub batches: Vec<LeanBatch>,
-    /// Records from a batch the lean reader handed back — compressed, or
-    /// carrying headers — decoded the ordinary way. Kept separate rather than
-    /// converted, because building a `LeanBatch` from decoded records would
-    /// mean re-serialising them, which is worse than the cost being avoided.
-    pub fallback: Vec<kafka_protocol::records::Record>,
-}
-
-impl<T: Transport> Consumer<T> {
-    /// As [`Self::fetch`], without building a record per record.
-    ///
-    /// **Deliberately a second method rather than a change to the first**, for
-    /// now: it returns batches rather than a flat list of records, so adopting
-    /// it is a caller-visible change. A key, value or header list is
-    /// materialised by asking the batch for it ([`LeanBatch::value`]) rather
-    /// than being built up front.
-    ///
-    /// All four compression codecs and record headers are handled; only a
-    /// pre-magic-2 batch falls back to the ordinary decoder, and then only that
-    /// partition pays the old cost.
-    ///
-    /// Filtering happens **per batch** here rather than per record, which it
-    /// can because `transactional`, `control` and `producer_id` are batch-level
-    /// in the format. That is most of why this path is cheaper.
-    ///
-    /// # Errors
-    /// As [`Self::fetch`].
-    pub async fn fetch_lean(&mut self) -> Result<Vec<LeanFetched>> {
-        if self.positions.is_empty() {
-            return Ok(Vec::new());
-        }
-        if self
-            .outstanding
-            .as_ref()
-            .is_some_and(|o| o.generation != self.generation)
-        {
-            self.discard_outstanding().await;
-        }
-        if self.outstanding.is_none() {
-            self.issue_fetch().await?;
-        }
-
-        let groups = self.outstanding.take().expect("just issued").groups;
-        let addrs: Vec<String> = groups.iter().map(|(addr, _)| addr.clone()).collect();
-        let responses = self
-            .cluster
-            .recv_many::<FetchResponse>(ApiKey::Fetch, &addrs)
-            .await;
-
-        let mut out = Vec::new();
-        for ((addr, partitions), response) in groups.into_iter().zip(responses) {
-            let resp = response?;
-            if matches!(
-                resp.error_code,
-                FETCH_SESSION_ID_NOT_FOUND | INVALID_FETCH_SESSION_EPOCH
-            ) {
-                self.sessions.entry(addr.clone()).or_default().reset();
-                continue;
-            }
-            check("Fetch", resp.error_code)?;
-
-            if self.incremental {
-                let session = self.sessions.entry(addr.clone()).or_default();
-                session.id = resp.session_id;
-                session.epoch = session.epoch.wrapping_add(1).max(1);
-                for (topic, partition) in &partitions {
-                    if let Some(offset) = self.positions.get(&(topic.clone(), *partition)) {
-                        session.known.insert((topic.clone(), *partition), *offset);
-                    }
-                }
-            }
-
-            for topic_response in &resp.responses {
-                let topic = topic_response.topic.0.to_string();
-                for part in &topic_response.partitions {
-                    check("Fetch partition", part.error_code)?;
-                    let key = (topic.clone(), part.partition_index);
-                    let Some(fetch_offset) = self.positions.get(&key).copied() else {
-                        continue;
-                    };
-                    let Some(bytes) = part.records.clone().filter(|b| !b.is_empty()) else {
-                        continue;
-                    };
-
-                    let Some(decoded) = kestrel_core::records::decode_lean(&bytes)? else {
-                        // Only a pre-magic-2 batch reaches this now: compression
-                        // and headers are both handled. Kept because a broker
-                        // holding very old data can still serve it, and being
-                        // wrong here means bad records rather than an error.
-                        let records = decode_records(bytes)?;
-                        let aborted = aborted_of(part);
-                        let Fetched {
-                            records,
-                            next_offset,
-                        } = consumer::filter(
-                            records,
-                            &aborted,
-                            part.last_stable_offset,
-                            self.isolation,
-                            fetch_offset,
-                        );
-                        self.positions.insert(key, next_offset);
-                        if !records.is_empty() {
-                            out.push(LeanFetched {
-                                topic: topic.clone(),
-                                partition: part.partition_index,
-                                batches: Vec::new(),
-                                fallback: records,
-                            });
-                        }
-                        continue;
-                    };
-
-                    let aborted = aborted_of(part);
-                    let (batches, next_offset) = kestrel_core::records::filter_batches(
-                        decoded,
-                        &aborted,
-                        part.last_stable_offset,
-                        self.isolation,
-                        fetch_offset,
-                    );
-                    self.positions.insert(key, next_offset);
-                    if !batches.is_empty() {
-                        out.push(LeanFetched {
-                            topic: topic.clone(),
-                            partition: part.partition_index,
-                            batches,
-                            fallback: Vec::new(),
-                        });
-                    }
-                }
-            }
-        }
-
-        self.start_prefetch().await;
-        Ok(out)
-    }
-}
-
-/// The aborted-transaction list a fetch response carries for one partition.
-fn aborted_of(part: &kafka_protocol::messages::fetch_response::PartitionData) -> Vec<AbortedTransaction> {
-    part.aborted_transactions
-        .as_ref()
-        .map(|list| {
-            list.iter()
-                .map(|a| AbortedTransaction {
-                    producer_id: a.producer_id.0,
-                    first_offset: a.first_offset,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }

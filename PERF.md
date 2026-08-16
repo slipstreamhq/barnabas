@@ -180,7 +180,7 @@ Measured at 1 M records with **one consumer holding all eight partitions**, so a
 
 | | kestrel rec/s | rdkafka rec/s | ratio |
 |---|---:|---:|---:|
-| 128 B | 8 036 000 – 8 464 000 | 132 000 – 152 000 | **~55×** (against its best) |
+| 128 B | 14 791 000 – 15 835 000 | 132 000 – 152 000 | **~100×** (against its best) |
 
 **The old 200 000-record cell was not measuring throughput.** It was measuring the fixed cost at
 either end of a fetch loop: 200 k gives 1.58 M rec/s, 1 M gives 3.00 M, 2 M gives 3.20 M. The old
@@ -242,7 +242,7 @@ the closest thing to this client, and therefore the most informative comparison 
 | batch 100, 128 B | 1 094 000 – 1 170 000 | 2 435 | see below — not a real comparison |
 | batch 1 000, 128 B | 3 972 000 – 4 569 000 | 1 176 000 – 3 139 000 | kestrel, 1.3× – 3.9× |
 | batch 1 000, 1 KiB | 1 685 000 – 1 954 000 | 1 292 000 – 1 364 000 | kestrel, 1.2× – 1.5× |
-| consume, 128 B | **8 036 000 – 8 464 000** | 4 573 000 – 5 130 000 | kestrel, 1.6× – 1.8× |
+| consume, 128 B | **14 791 000 – 15 835 000** | 3 923 000 – 5 065 000 | kestrel, 3.4× – 4.0× |
 
 **We are not fastest on every dimension.** rskafka beats us at small batches and, more importantly,
 **beats us on consume by about 45%**. The ~20× consume advantage over librdkafka elsewhere in this
@@ -261,50 +261,48 @@ It also binds a client to **one partition**, so eight partitions are eight clien
 connections, and a write spanning them is eight requests. Ours is one request per *broker*. That is
 the trade this client was designed around, and at batch 1 000 it shows.
 
-### The lean decoder, built and measured
+### The lean decoder: built, measured, and now the only path
 
-Built it. `kestrel_core::records` reads a record batch without building a record per record: batch
-facts (producer id, transactional, control) are kept once, and a record is an offset, a timestamp and
-two ranges into the retained batch buffer. `Consumer::fetch_lean` is the path that uses it.
+`kestrel_core::records` reads a record batch without building a record per record. Batch facts —
+producer id, transactional, control — are kept once, and a record is an offset, a timestamp and
+ranges into the buffer the batch owns. Keys, values and headers are materialised when a caller asks
+for them, which matters because every slice of one buffer increments the same atomic refcount.
 
 | consume, 1 M records | rec/s |
 |---|---:|
-| ordinary path (`fetch`) | 7 848 000 – 8 296 000 |
-| **lean path (`fetch_lean`)** | **14 996 000 – 15 389 000** |
-| rskafka | 4 838 000 – 5 065 000 |
+| before (a record per record) | 8 021 000 – 8 296 000 |
+| **after** | **14 791 000 – 15 835 000** |
+| rskafka | 3 923 000 – 5 065 000 |
 
-**1.75× end to end**, and ~2.9× rskafka. The bench reads every value through `LeanBatch::value`, so
-materialising the payload is inside the measurement — a version that never touched the bytes would
-flatter it.
+**About 1.9× on consume**, and 3.4× – 4.0× rskafka. The measurement reads every value, so
+materialising the payload is inside it.
 
-Filtering gets cheaper for a second reason: `transactional`, `control` and `producer_id` are
+Filtering is cheaper for a second reason: `transactional`, `control` and `producer_id` are
 batch-level in the format, so an aborted transaction is dropped a batch at a time rather than a
 record at a time.
 
-**What it costs to own.** About 250 lines, and it is format-parsing code, where being wrong means
-handing the caller bad data rather than failing. Guarded three ways: it validates the CRC, it
-**falls back** to `kafka_protocol` for anything it does not handle, and a live test asserts the two
-paths return identical records on a topic containing plain records, an aborted transaction and a
-committed one.
+**Headers and compression are handled**, which the first version was not.
 
-**Headers and compression are handled**, which the first version of this did not do.
-
-- **Headers** were never the difficulty they looked like. The record keeps the header block's byte
-  range and count — eight bytes — and parses it only when a caller asks. A record without headers
-  costs nothing.
+- **Headers** were never the difficulty they looked like: the record keeps the header block's byte
+  range and count — eight bytes — and parses it only on demand. A record without headers costs
+  nothing. Holding them inline would have put a `Vec` in every record and undone the point.
 - **Compression** needs the codec run before anything can be parsed, so the records section is
-  decompressed into a buffer the batch then owns and slices from. One allocation per batch, which
-  `kafka_protocol` also pays. All four codecs are checked against the reference decoder.
+  decompressed into a buffer the batch then owns. One allocation per batch, which `kafka_protocol`
+  pays too.
 - **Kafka's snappy is xerial-framed** — a 16-byte magic header then `[u32 length][block]` repeated —
-  not raw snappy. Reading it as raw snappy fails immediately, which is how the test caught it. Java
-  falls back to raw when the header is absent, and so does this.
+  not raw snappy, and reading it as raw fails at once. The round-trip test against the reference
+  decoder caught it.
 
-Only a **pre-magic-2 batch** now falls back, and then only that partition pays the old cost.
+Only a **pre-magic-2 batch** falls back, and then only that partition pays the old cost.
 
-What remains is consolidation: `fetch` returns a flat `Vec<Record>` and `fetch_lean` returns
-batches, so adopting the fast path is a caller-visible change. Keeping both permanently would be the
-worst of the two — one job, two APIs — so the next step is to make the lean shape the only one and
-update the call sites.
+**It is now the only path.** `fetch` returns the batches and `FetchedRecords::iter` walks them as
+`RecordRef`s, so a caller that does not care about batching does not have to see it. Keeping the old
+decoder beside it would have been one job with two APIs.
+
+What it costs to own: about 350 lines of format-parsing code, where being wrong means handing a
+caller bad records rather than failing. Guarded by the CRC, by the fallback, by a round-trip test per
+codec against the reference decoder, and by a live test over a partition holding plain records, an
+aborted transaction and a committed one.
 
 ### Would SIMD help the decoder? No — measured
 
@@ -513,8 +511,7 @@ than defended.
   causing.
 - **Whether 25–29 M records/s is our ceiling or the cluster's** is unknown; the other clients are far
   enough below it that only our own number is in question.
-- **Whether the lean decoder should replace `fetch` rather than sit beside it**, which needs header
-  and compression support first. Measured at 1.75× on consume; see its section.
+- **Nothing outstanding on the decoder**: it handles headers and every codec, and is the only path.
 - **Whether 64 MiB is the right response budget.** It was chosen to be clearly larger than the
   per-partition budget, not tuned; the memory a fetch may hold scales with it.
 - **rskafka has no many-core row.** Its per-partition client shape makes the comparison less direct,

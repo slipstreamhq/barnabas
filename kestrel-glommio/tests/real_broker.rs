@@ -94,7 +94,7 @@ fn plain_records_round_trip() {
         let records = fetch_until(&mut consumer, 3).await;
         let values: Vec<String> = records
             .iter()
-            .map(|r| String::from_utf8_lossy(r.value.as_ref().unwrap()).into_owned())
+            .map(|v| String::from_utf8_lossy(v).into_owned())
             .collect();
         assert_eq!(values, vec!["v0", "v1", "v2"]);
         assert_eq!(consumer.position(), 3);
@@ -139,7 +139,7 @@ fn an_aborted_transaction_is_invisible() {
                 .await
                 .expect("fetch")
                 .into_iter()
-                .flat_map(|group| group.records),
+                .flat_map(|group| group.iter().filter_map(|r| r.value()).collect::<Vec<_>>()),
         );
         }
         assert!(
@@ -252,7 +252,7 @@ fn seek_positions_the_next_fetch() {
         let records = fetch_until(&mut consumer, 2).await;
         let values: Vec<String> = records
             .iter()
-            .map(|r| String::from_utf8_lossy(r.value.as_ref().unwrap()).into_owned())
+            .map(|v| String::from_utf8_lossy(v).into_owned())
             .collect();
         assert_eq!(values, vec!["v3", "v4"]);
     });
@@ -354,7 +354,7 @@ fn prefetch_returns_the_same_records() {
             values.push(
                 records
                     .iter()
-                    .map(|r| String::from_utf8_lossy(r.value.as_ref().unwrap()).into_owned())
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
                     .collect::<Vec<_>>(),
             );
         }
@@ -402,7 +402,7 @@ fn a_seek_discards_the_fetch_already_in_flight() {
 
         let values: Vec<String> = after
             .iter()
-            .map(|r| String::from_utf8_lossy(r.value.as_ref().unwrap()).into_owned())
+            .map(|v| String::from_utf8_lossy(v).into_owned())
             .collect();
         assert_eq!(
             values.first().map(String::as_str),
@@ -413,10 +413,9 @@ fn a_seek_discards_the_fetch_already_in_flight() {
     });
 }
 
-async fn fetch_until(
-    consumer: &mut Consumer,
-    want: usize,
-) -> Vec<kafka_protocol::records::Record> {
+/// Values only: every caller wants the payloads, and a record is now a
+/// reference into its batch rather than an owned struct that can be collected.
+async fn fetch_until(consumer: &mut Consumer, want: usize) -> Vec<bytes::Bytes> {
     consumer.set_max_wait(Duration::from_millis(200));
     let mut out = Vec::new();
     for _ in 0..25 {
@@ -426,7 +425,7 @@ async fn fetch_until(
                 .await
                 .expect("fetch")
                 .into_iter()
-                .flat_map(|group| group.records),
+                .flat_map(|group| group.iter().filter_map(|r| r.value()).collect::<Vec<_>>()),
         );
         if out.len() >= want {
             break;
@@ -435,47 +434,29 @@ async fn fetch_until(
     out
 }
 
-/// **The lean decoder must agree with the ordinary one**, including on the
-/// filtering that matters: an aborted transaction is dropped a *batch* at a
-/// time there and a *record* at a time here, and those are different code
-/// paths that must not disagree.
+/// **Batch-level filtering, end to end.**
+///
+/// Since records are read in the batches the broker sent, an aborted
+/// transaction is dropped a batch at a time — `transactional`, `control` and
+/// `producer_id` are batch-level in the format. This is the case that goes
+/// wrong if that reasoning is off by a batch: plain records, then an aborted
+/// transaction, then a committed one, all in the same partition.
 #[test]
 #[ignore = "needs a Kafka broker on localhost:9092"]
-fn lean_decode_agrees_with_the_ordinary_path() {
+fn batch_filtering_drops_only_the_aborted_transaction() {
     run(|| async {
         let topic = unique_topic("lean");
         let mut prod = TestProducer::connect(&broker(), &topic).await;
         prod.create_topic().await;
         prod.init_transactions().await;
 
-        // Plain records, an aborted transaction, then a committed one — so the
-        // batch-level filter has control batches and an abort range to handle.
         prod.produce_plain(4).await;
         prod.begin().await;
-        prod.produce_txn(3).await;
+        prod.produce_txn(3).await; // aborted
         prod.end(false).await;
         prod.begin().await;
-        prod.produce_txn(2).await;
+        prod.produce_txn(2).await; // committed
         prod.end(true).await;
-
-        let expected = {
-            let mut consumer = Consumer::assign(
-                kestrel_glommio::Glommio,
-                &bootstrap(),
-                "kestrel-test",
-                &topic,
-                0,
-                EARLIEST,
-                IsolationLevel::ReadCommitted,
-            )
-            .await
-            .expect("assign");
-            fetch_until(&mut consumer, 6)
-                .await
-                .iter()
-                .map(|r| String::from_utf8_lossy(r.value.as_ref().unwrap()).into_owned())
-                .collect::<Vec<_>>()
-        };
 
         let mut consumer = Consumer::assign(
             kestrel_glommio::Glommio,
@@ -488,34 +469,21 @@ fn lean_decode_agrees_with_the_ordinary_path() {
         )
         .await
         .expect("assign");
-        consumer.set_max_wait(Duration::from_millis(200));
 
-        let mut actual = Vec::new();
-        for _ in 0..25 {
-            for group in consumer.fetch_lean().await.expect("fetch lean") {
-                for batch in &group.batches {
-                    for record in &batch.records {
-                        actual.push(
-                            String::from_utf8_lossy(&batch.value(record).expect("value"))
-                                .into_owned(),
-                        );
-                    }
-                }
-                for record in &group.fallback {
-                    actual.push(
-                        String::from_utf8_lossy(record.value.as_ref().unwrap()).into_owned(),
-                    );
-                }
-            }
-            if actual.len() >= expected.len() {
-                break;
-            }
-        }
+        let values: Vec<String> = fetch_until(&mut consumer, 6)
+            .await
+            .iter()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .collect();
 
         assert_eq!(
-            actual, expected,
-            "lean decode disagreed with the ordinary path"
+            values.len(),
+            6,
+            "expected four plain and two committed records, got {values:?}"
         );
-        assert!(!expected.is_empty(), "the fixture produced nothing");
+        assert!(
+            values.iter().filter(|v| v.starts_with('v')).count() >= 4,
+            "the plain records must survive: {values:?}"
+        );
     });
 }

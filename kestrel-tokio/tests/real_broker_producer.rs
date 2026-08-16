@@ -95,15 +95,9 @@ async fn read_all(topic: &str, want: usize, isolation: IsolationLevel) -> Vec<St
             .await
             .expect("fetch")
             .into_iter()
-            .flat_map(|group| group.records)
+            .flat_map(|group| group.iter().filter_map(|r| r.value()).collect::<Vec<_>>())
         {
-            out.push(
-                record
-                    .value
-                    .as_ref()
-                    .map(|v| String::from_utf8_lossy(v).into_owned())
-                    .unwrap_or_default(),
-            );
+            out.push(String::from_utf8_lossy(&record).into_owned());
         }
         if out.len() >= want {
             break;
@@ -381,20 +375,23 @@ fn keyed_records_land_on_the_partition_their_key_names() {
 
             let mut got = Vec::new();
             for _ in 0..10 {
-                for record in consumer
-            .fetch()
-            .await
-            .expect("fetch")
-            .into_iter()
-            .flat_map(|group| group.records)
-        {
-                    got.push(
-                        record
-                            .key
-                            .as_ref()
-                            .map(|k| String::from_utf8_lossy(k).into_owned())
-                            .unwrap_or_default(),
-                    );
+                for key in consumer
+                    .fetch()
+                    .await
+                    .expect("fetch")
+                    .iter()
+                    .flat_map(|group| {
+                        group
+                            .iter()
+                            .map(|r| {
+                                r.key()
+                                    .map(|k| String::from_utf8_lossy(&k).into_owned())
+                                    .unwrap_or_default()
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                {
+                    got.push(key);
                 }
                 if got.len() >= want.len() {
                     break;
