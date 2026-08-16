@@ -66,6 +66,17 @@ Both properties were mutation-proved: resetting sequences per transaction fails
 | **SASL** | PLAIN and SCRAM-SHA-256/512. Shared, since the handshake is protocol |
 | **Consumer groups** | **out of scope** — callers assign partitions themselves |
 
+## Performance
+
+Measured, not asserted — `PERF.md` has the numbers, the machine, and what they do not say. On one
+local broker, 256 B records, `acks=all`: **~2.2M records/s produced** and **~5.3M consumed**,
+against **~350k** each for `rdkafka` given its best configuration. The consume comparison is partly
+an API difference (batch-at-a-time versus message-at-a-time) and is labelled as such.
+
+```sh
+cargo run -p kestrel-bench --release        # needs a broker
+```
+
 ## Tests
 
 ```sh

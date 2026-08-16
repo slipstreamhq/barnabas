@@ -1,0 +1,19 @@
+[package]
+name = "kestrel-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+kestrel-core   = { path = "../kestrel-core" }
+kestrel-client = { path = "../kestrel-client" }
+kestrel-tokio  = { path = "../kestrel-tokio" }
+kestrel-glommio = { path = "../kestrel-glommio" }
+kafka-protocol = { workspace = true }
+bytes          = { workspace = true }
+tokio          = { version = "1", features = ["full"] }
+glommio        = { git = "https://github.com/dahankzter/glommio", rev = "2acb59d1" }
+# The comparison everyone will ask for, available only while librdkafka is
+# still something we build against.
+rdkafka        = { version = "0.39", default-features = false, features = ["libz", "tokio"] }
