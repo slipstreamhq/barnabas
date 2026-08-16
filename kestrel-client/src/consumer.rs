@@ -119,6 +119,9 @@ pub struct Consumer<T: Transport> {
     generation: u64,
 }
 
+/// One broker's address, the partitions it was asked about, and the request.
+type Planned = (String, Vec<(String, i32)>, FetchRequest);
+
 /// A fetch that has been sent and not yet collected.
 struct Outstanding {
     /// The partitions each broker was asked about, in request order.
@@ -410,7 +413,7 @@ impl<T: Transport> Consumer<T> {
 
         // Built before sending: `fetch_request` borrows `self`, and sending
         // borrows the cluster mutably.
-        let planned: Vec<(String, Vec<(String, i32)>, FetchRequest)> = by_broker
+        let planned: Vec<Planned> = by_broker
             .into_iter()
             .map(|(addr, partitions)| {
                 let req = self.fetch_request(&addr, &partitions);

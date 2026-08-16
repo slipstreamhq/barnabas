@@ -222,6 +222,10 @@ impl<T: Transport> Broker<T> {
     }
 
     /// How many requests are awaiting an answer.
+    ///
+    /// Not used yet — it is the check producer pipelining will need before
+    /// putting a second request on a connection.
+    #[allow(dead_code)]
     pub(crate) fn in_flight(&self) -> usize {
         self.conn.in_flight()
     }
