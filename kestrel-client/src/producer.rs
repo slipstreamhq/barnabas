@@ -16,7 +16,7 @@
 //! Produce itself goes to the partition leader, like every other partition
 //! request.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -56,6 +56,21 @@ const MAX_RETRIES: usize = 40;
 const RETRY_BACKOFF: Duration = Duration::from_millis(5);
 const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(250);
 
+/// How many `Produce` requests may be in flight on one connection.
+///
+/// Five is what the Java client allows with idempotence enabled, and for the
+/// same reason: the broker processes a connection's requests in order, so
+/// batches for one partition stay in sequence — but a failure partway through
+/// the window invalidates everything behind it, and recovering from that is
+/// only bounded work if the window is.
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 5;
+
+/// One broker's address and the partitions its request carried.
+type RoundTarget = (String, Vec<(String, i32)>);
+
+/// The window: what each round sent, in the order the rounds went out.
+type Window = Vec<Vec<RoundTarget>>;
+
 /// A record to produce. Deliberately not `kafka_protocol`'s `Record`: sequence
 /// numbers, producer id and epoch are the producer's to set, and letting a
 /// caller supply them is how they get set wrong.
@@ -93,6 +108,14 @@ pub struct Producer<T: Transport> {
     /// Round-robin counter for null-keyed records. See
     /// [`kestrel_core::partitioner`].
     round_robin: u32,
+    /// Encoded batches waiting to go out, per partition, **in sequence order**.
+    /// The order is the invariant the whole pipelining scheme rests on.
+    pending: BTreeMap<(String, i32), VecDeque<Bytes>>,
+    /// How many `Produce` requests may be in flight on one connection.
+    max_in_flight: usize,
+    /// Base offsets from the window being processed, keyed by partition and
+    /// round. Cleared each time the window is retired.
+    offsets: BTreeMap<((String, i32), usize), i64>,
 }
 
 impl<T: Transport> Producer<T> {
@@ -119,6 +142,9 @@ impl<T: Transport> Producer<T> {
             compression: Compression::None,
             partitioner: Partitioner::default(),
             round_robin: 0,
+            pending: BTreeMap::new(),
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            offsets: BTreeMap::new(),
         };
         me.init_producer_id().await?;
         Ok(me)
@@ -139,6 +165,9 @@ impl<T: Transport> Producer<T> {
             compression: Compression::None,
             partitioner: Partitioner::default(),
             round_robin: 0,
+            pending: BTreeMap::new(),
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            offsets: BTreeMap::new(),
         };
         me.init_producer_id().await?;
         Ok(me)
@@ -438,6 +467,11 @@ impl<T: Transport> Producer<T> {
     /// Produce `records` to one partition, returning the base offset the broker
     /// assigned.
     ///
+    /// Enqueues and flushes in one call, so a caller that wants pipelining uses
+    /// [`Self::enqueue`] several times and then [`Self::flush`] — this is the
+    /// convenience for the one-shot case, and it has exactly one request in
+    /// flight because there is exactly one batch.
+    ///
     /// # Errors
     /// If the producer is fenced, no transaction is open when one is required,
     /// or the broker answers with an error that is not about leadership.
@@ -450,10 +484,61 @@ impl<T: Transport> Producer<T> {
         if records.is_empty() {
             return Ok(-1);
         }
+        self.enqueue(topic, partition, records).await?;
+        let written = self.flush().await?;
+        Ok(written.first().map_or(-1, |(_, _, offset)| *offset))
+    }
+
+    /// Queue a batch for `partition` **without sending anything**.
+    ///
+    /// This is what lets a caller have more than one write outstanding, which
+    /// is the whole point of pipelining: sequence numbers are allocated and the
+    /// batch is encoded here, in call order, and [`Self::flush`] puts up to
+    /// `max_in_flight` of them on the connection at once.
+    ///
+    /// Order matters and is preserved: batches for one partition are sent in
+    /// the order they were enqueued, because that is the order their sequence
+    /// numbers were allocated in.
+    ///
+    /// # Errors
+    /// If the producer is fenced, or no transaction is open when one is
+    /// required.
+    pub async fn enqueue(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        records: &[ProducerRecord],
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        // Transactional producers must enroll the partition before a sequence
+        // can be allocated for it; idempotent ones do no work here.
         self.enroll_all(topic, &[partition]).await?;
         let batch = self.encode_for(topic, partition, records)?;
-        let written = self.dispatch(topic, vec![(partition, batch)]).await?;
-        Ok(written.first().map_or(-1, |(_, offset)| *offset))
+        self.pending
+            .entry((topic.to_owned(), partition))
+            .or_default()
+            .push_back(batch);
+        Ok(())
+    }
+
+    /// How many `Produce` requests may be in flight on one connection.
+    ///
+    /// Defaults to [`DEFAULT_MAX_IN_FLIGHT`]. One restores strict
+    /// request-response, which is what this client did before pipelining.
+    ///
+    /// # Panics
+    /// If `max` is zero.
+    pub fn set_max_in_flight(&mut self, max: usize) {
+        assert!(max > 0, "max_in_flight must be at least 1");
+        self.max_in_flight = max;
+    }
+
+    /// How many batches are queued and not yet acknowledged.
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.pending.values().map(VecDeque::len).sum()
     }
 
     /// Allocate this batch's sequence numbers and encode it **once**.
@@ -475,128 +560,277 @@ impl<T: Transport> Producer<T> {
         self.encode_batch(records, range)
     }
 
-    /// Send pre-encoded batches, **one request per broker rather than one per
-    /// partition**.
+    /// Send every queued batch, **pipelining up to `max_in_flight` requests per
+    /// connection**, and return the base offset each partition was written at.
     ///
-    /// This is the difference between eight round trips and one when a producer
-    /// writes to eight partitions, and it is the reason a per-core client can
-    /// afford to own many partitions: everything a core holds on a given broker
-    /// travels together.
+    /// # How the window stays in sequence
     ///
-    /// Retries are per partition. A partition whose leader moved is re-sent —
-    /// with its original bytes, so its sequence numbers are unchanged — while
-    /// the partitions that succeeded are not touched.
-    async fn dispatch(
-        &mut self,
-        topic: &str,
-        batches: Vec<(i32, Bytes)>,
-    ) -> Result<Vec<(i32, i64)>> {
-        let mut pending: BTreeMap<i32, Bytes> = batches.into_iter().collect();
-        let mut written: Vec<(i32, i64)> = Vec::with_capacity(pending.len());
+    /// Each partition has a queue of batches already encoded with contiguous
+    /// sequence numbers. Round *r* carries the *r*-th batch of every partition
+    /// that has one, so a broker receives rounds 0, 1, 2… on one connection and
+    /// Kafka processes a connection's requests in order — partition `p`'s
+    /// batches therefore arrive in sequence even though several are in flight.
+    ///
+    /// **The recovery rule is what makes it safe.** Only the *contiguous
+    /// leading run* of successes is removed from a partition's queue. If round
+    /// 2 failed for `p`, then rounds 3 and 4 for `p` are void whatever they
+    /// answered — the broker never wrote round 2, so it rejected them for being
+    /// out of sequence — and they stay queued, in order, to be sent again
+    /// behind the retry of round 2. That is the ordered-window retry the Java
+    /// client performs, and without it a pipelined idempotent producer either
+    /// gaps or duplicates.
+    ///
+    /// # Errors
+    /// If the producer is fenced, or a broker answers with an error that is
+    /// neither about leadership nor a consequence of an earlier failure in the
+    /// same window.
+    pub async fn flush(&mut self) -> Result<Vec<(String, i32, i64)>> {
+        let mut written: Vec<(String, i32, i64)> = Vec::new();
 
         for attempt in 0..MAX_RETRIES {
-            if pending.is_empty() {
-                break;
+            self.pending.retain(|_, queue| !queue.is_empty());
+            if self.pending.is_empty() {
+                written.sort_unstable();
+                return Ok(written);
             }
 
-            // Group this round's partitions by the broker that leads them.
-            let mut by_broker: BTreeMap<String, Vec<i32>> = BTreeMap::new();
-            let mut unroutable = Vec::new();
-            for partition in pending.keys().copied() {
-                match self.cluster.leader_addr(topic, partition).await {
-                    Ok(addr) => by_broker.entry(addr).or_default().push(partition),
-                    // A topic still being created has no leader yet; that is a
-                    // wait, not a failure.
-                    Err(Error::NoLeader { .. }) => unroutable.push(partition),
+            // Route: which broker leads each partition that still has work.
+            let mut by_broker: BTreeMap<String, Vec<(String, i32)>> = BTreeMap::new();
+            let mut unroutable = false;
+            for (topic, partition) in self.pending.keys().cloned().collect::<Vec<_>>() {
+                match self.cluster.leader_addr(&topic, partition).await {
+                    Ok(addr) => by_broker.entry(addr).or_default().push((topic, partition)),
+                    // A topic still being created has no leader yet; a wait,
+                    // not a failure.
+                    Err(Error::NoLeader { .. }) => unroutable = true,
                     Err(e) => return Err(e),
                 }
             }
-            if !unroutable.is_empty() && by_broker.is_empty() {
-                if attempt + 1 == MAX_RETRIES {
-                    return Err(Error::NoLeader {
-                        topic: topic.to_owned(),
-                        partition: unroutable[0],
-                    });
+            if by_broker.is_empty() {
+                if !unroutable || attempt + 1 == MAX_RETRIES {
+                    let (topic, partition) =
+                        self.pending.keys().next().expect("non-empty").clone();
+                    return Err(Error::NoLeader { topic, partition });
                 }
                 Self::backoff(attempt).await;
                 continue;
             }
 
-            let mut retry_after_refresh = Vec::new();
-            // **One request per broker, all in flight together.** Batching by
-            // broker already turned eight partition writes into one request per
-            // broker; awaiting those requests in turn put the round trips back
-            // as soon as there was more than one broker to write to.
-            let requests: Vec<(String, ProduceRequest)> = by_broker
-                .iter()
-                .map(|(addr, partitions)| {
-                    (addr.clone(), self.produce_request(topic, partitions, &pending))
-                })
-                .collect();
-            let responses = self
-                .cluster
-                .call_many::<_, ProduceResponse>(ApiKey::Produce, 9, &requests)
-                .await;
+            let depth = self.window_depth(&by_broker);
+            let rounds = self.send_window(&by_broker, depth).await?;
+            let (outcomes, transport_error) = self.collect_window(&rounds).await;
+            if let Some(e) = transport_error {
+                // Whatever succeeded in this window stays queued rather than
+                // being retired on a guess: the window's later rounds are void
+                // once anything in it failed.
+                self.offsets.clear();
+                match e {
+                    // A pooled connection can be closed at any time — a rolling
+                    // upgrade, an idle reaper — and the client only finds out
+                    // by using it. Re-sending is safe: the batches carry their
+                    // original sequence numbers, so anything the broker did
+                    // write is deduplicated rather than doubled.
+                    Error::Io(_) if attempt + 1 < MAX_RETRIES => {
+                        Self::backoff(attempt).await;
+                        continue;
+                    }
+                    // A broker that accepted the request and never answered is
+                    // a different thing, and retrying it would spend the whole
+                    // retry budget waiting on someone who is not talking.
+                    e => return Err(e),
+                }
+            }
 
-            for resp in responses {
-                let resp = resp?;
-
-                for part in resp
-                    .responses
-                    .iter()
-                    .flat_map(|t| t.partition_responses.iter())
-                {
-                    let code = ErrorCode(part.error_code);
+            // `failed_at[p]` is the earliest round that failed for `p`;
+            // everything at or after it stays queued.
+            let mut failed_at: BTreeMap<(String, i32), usize> = BTreeMap::new();
+            let mut needs_refresh = false;
+            for (round, results) in outcomes.iter().enumerate() {
+                for (key, code) in results {
                     if code.is_ok() {
-                        pending.remove(&part.index);
-                        written.push((part.index, part.base_offset));
+                        continue;
+                    }
+                    let earlier = failed_at.get(key).copied();
+                    if earlier.is_some() {
+                        // Already broken for this partition. Whatever this
+                        // round says — almost always OUT_OF_ORDER_SEQUENCE —
+                        // is a consequence, not a new fact.
                         continue;
                     }
                     match code.disposition() {
                         Disposition::RefreshMetadata => {
-                            self.cluster.invalidate(topic, part.index);
-                            retry_after_refresh.push(part.index);
+                            let (topic, partition) = key;
+                            self.cluster.invalidate(topic, *partition);
+                            needs_refresh = true;
                         }
                         Disposition::Retry => {}
-                        Disposition::Fatal => {
-                            // A sequence or fencing error means this producer's
-                            // stream is already wrong. Refusing further writes
-                            // is the point.
+                        Disposition::Fatal | Disposition::FindCoordinator | Disposition::Ok => {
+                            // A sequence error with nothing failed before it is
+                            // the real thing: this producer's stream is wrong.
                             self.state.fence();
                             return Err(Error::Broker {
                                 op: "Produce",
                                 code: code.0,
-                                disposition: Disposition::Fatal,
+                                disposition: code.disposition(),
                             });
                         }
-                        Disposition::FindCoordinator | Disposition::Ok => {
-                            return Err(Error::Broker {
-                                op: "Produce",
-                                code: code.0,
-                                disposition: code.disposition(),
-                            })
+                    }
+                    failed_at.insert(key.clone(), round);
+                }
+            }
+
+            // Retire the contiguous leading run of successes per partition.
+            for (round, results) in outcomes.iter().enumerate() {
+                for (key, _) in results {
+                    if failed_at.get(key).is_some_and(|first| round >= *first) {
+                        continue;
+                    }
+                    if let Some(queue) = self.pending.get_mut(key) {
+                        if queue.pop_front().is_some() {
+                            let offset = self
+                                .offsets
+                                .get(&(key.clone(), round))
+                                .copied()
+                                .unwrap_or(-1);
+                            written.push((key.0.clone(), key.1, offset));
                         }
                     }
                 }
             }
+            self.offsets.clear();
 
-            if !pending.is_empty() {
-                if !retry_after_refresh.is_empty() {
-                    self.cluster.refresh_metadata(topic).await?;
-                }
-                Self::backoff(attempt).await;
+            self.pending.retain(|_, queue| !queue.is_empty());
+            if self.pending.is_empty() {
+                written.sort_unstable();
+                return Ok(written);
             }
+            if needs_refresh {
+                let mut topics: Vec<String> =
+                    self.pending.keys().map(|(topic, _)| topic.clone()).collect();
+                topics.sort_unstable();
+                topics.dedup();
+                for topic in topics {
+                    self.cluster.refresh_metadata(&topic).await?;
+                }
+            }
+            Self::backoff(attempt).await;
         }
 
-        if !pending.is_empty() {
-            return Err(Error::Broker {
-                op: "Produce",
-                code: ErrorCode::NOT_LEADER_OR_FOLLOWER.0,
-                disposition: Disposition::RefreshMetadata,
-            });
+        let (topic, partition) = self.pending.keys().next().expect("non-empty").clone();
+        Err(Error::NoLeader { topic, partition })
+    }
+
+    /// How many rounds this window will have: the longest queue, capped.
+    fn window_depth(&self, by_broker: &BTreeMap<String, Vec<(String, i32)>>) -> usize {
+        by_broker
+            .values()
+            .flatten()
+            .filter_map(|key| self.pending.get(key).map(VecDeque::len))
+            .max()
+            .unwrap_or(0)
+            .min(self.max_in_flight)
+    }
+
+    /// Write every round of the window without waiting for any of it.
+    ///
+    /// Rounds go out in order per connection, which is what puts a partition's
+    /// batches on the wire in sequence.
+    async fn send_window(
+        &mut self,
+        by_broker: &BTreeMap<String, Vec<(String, i32)>>,
+        depth: usize,
+    ) -> Result<Window> {
+        let mut rounds: Window = Vec::with_capacity(depth);
+
+        for round in 0..depth {
+            let mut this_round: Vec<RoundTarget> = Vec::new();
+            for (addr, keys) in by_broker {
+                let taking: Vec<(String, i32)> = keys
+                    .iter()
+                    .filter(|key| self.pending.get(*key).is_some_and(|q| q.len() > round))
+                    .cloned()
+                    .collect();
+                if taking.is_empty() {
+                    continue;
+                }
+                let req = self.produce_request(&taking, round);
+                match self.cluster.send_at(ApiKey::Produce, 9, addr, &req).await {
+                    Ok(()) => this_round.push((addr.clone(), taking)),
+                    Err(e) => {
+                        // Whatever already went out is still outstanding and
+                        // must be collected, or the connections are left
+                        // holding answers nobody reads.
+                        rounds.push(this_round);
+                        let _ = self.collect_window(&rounds).await;
+                        return Err(e);
+                    }
+                }
+            }
+            if this_round.is_empty() {
+                break;
+            }
+            rounds.push(this_round);
         }
-        written.sort_unstable();
-        Ok(written)
+        Ok(rounds)
+    }
+
+    /// Read every round's answers, in the order they were sent.
+    ///
+    /// Returns, per round, the error code each partition came back with.
+    /// A transport failure — a dropped connection, a broker that never
+    /// answered — is returned rather than folded into a per-partition code.
+    /// Every round is still drained first: the answers are on their way whether
+    /// or not anyone wants them, and leaving them unread desynchronises the
+    /// connection. Retrying a timeout in place would also spin the whole
+    /// retry budget against a broker that is simply not answering.
+    async fn collect_window(
+        &mut self,
+        rounds: &[Vec<RoundTarget>],
+    ) -> (Vec<Vec<((String, i32), ErrorCode)>>, Option<Error>) {
+        let mut out = Vec::with_capacity(rounds.len());
+        let mut transport_error = None;
+
+        for (round, sent) in rounds.iter().enumerate() {
+            let addrs: Vec<String> = sent.iter().map(|(addr, _)| addr.clone()).collect();
+            let responses = self
+                .cluster
+                .recv_many::<ProduceResponse>(ApiKey::Produce, &addrs)
+                .await;
+
+            let mut codes: Vec<((String, i32), ErrorCode)> = Vec::new();
+            for ((_, keys), response) in sent.iter().zip(responses) {
+                match response {
+                    Ok(resp) => {
+                        for topic_response in &resp.responses {
+                            let topic = topic_response.name.0.to_string();
+                            for part in &topic_response.partition_responses {
+                                let key = (topic.clone(), part.index);
+                                let code = ErrorCode(part.error_code);
+                                if code.is_ok() {
+                                    self.offsets.insert((key.clone(), round), part.base_offset);
+                                }
+                                codes.push((key, code));
+                            }
+                        }
+                    }
+                    // A failed connection says nothing about which partition is
+                    // at fault. The batches stay queued — their bytes carry
+                    // their original sequence numbers, so re-sending is
+                    // deduplicated by the broker — but the error is the
+                    // caller's to see.
+                    Err(e) => {
+                        if transport_error.is_none() {
+                            transport_error = Some(e);
+                        }
+                        for key in keys {
+                            codes.push((key.clone(), ErrorCode::REQUEST_TIMED_OUT));
+                        }
+                    }
+                }
+            }
+            out.push(codes);
+        }
+        (out, transport_error)
     }
 
     /// Produce records to whichever partitions their keys hash to.
@@ -656,11 +890,14 @@ impl<T: Transport> Producer<T> {
         let partitions: Vec<i32> = by_partition.keys().copied().collect();
         self.enroll_all(topic, &partitions).await?;
 
-        let mut batches = Vec::with_capacity(by_partition.len());
         for (partition, records) in by_partition {
-            batches.push((partition, self.encode_for(topic, partition, &records)?));
+            self.enqueue(topic, partition, &records).await?;
         }
-        self.dispatch(topic, batches).await
+        let written = self.flush().await?;
+        Ok(written
+            .into_iter()
+            .map(|(_, partition, offset)| (partition, offset))
+            .collect())
     }
 
     /// Which partition a key would go to, without sending anything.
@@ -727,32 +964,34 @@ impl<T: Transport> Producer<T> {
         Ok(buf.freeze())
     }
 
-    /// One request carrying every partition this broker leads.
-    fn produce_request(
-        &self,
-        topic: &str,
-        partitions: &[i32],
-        batches: &BTreeMap<i32, Bytes>,
-    ) -> ProduceRequest {
-        let partition_data: Vec<PartitionProduceData> = partitions
-            .iter()
-            .filter_map(|partition| {
-                let batch = batches.get(partition)?;
-                let mut data = PartitionProduceData::default();
-                data.index = *partition;
-                data.records = Some(batch.clone());
-                Some(data)
+    /// One request carrying every partition this broker leads, taking each
+    /// one's `round`-th queued batch.
+    fn produce_request(&self, keys: &[(String, i32)], round: usize) -> ProduceRequest {
+        let mut by_topic: BTreeMap<String, Vec<PartitionProduceData>> = BTreeMap::new();
+        for key in keys {
+            let Some(batch) = self.pending.get(key).and_then(|queue| queue.get(round)) else {
+                continue;
+            };
+            let mut data = PartitionProduceData::default();
+            data.index = key.1;
+            data.records = Some(batch.clone());
+            by_topic.entry(key.0.clone()).or_default().push(data);
+        }
+
+        let topic_data: Vec<TopicProduceData> = by_topic
+            .into_iter()
+            .map(|(name, partition_data)| {
+                let mut data = TopicProduceData::default();
+                data.name = TopicName(StrBytes::from_string(name));
+                data.partition_data = partition_data;
+                data
             })
             .collect();
-
-        let mut topic_data = TopicProduceData::default();
-        topic_data.name = TopicName(StrBytes::from_string(topic.to_owned()));
-        topic_data.partition_data = partition_data;
 
         let mut req = ProduceRequest::default();
         req.acks = self.acks;
         req.timeout_ms = self.timeout_ms;
-        req.topic_data = vec![topic_data];
+        req.topic_data = topic_data;
         req.transactional_id = self
             .transactional_id
             .as_ref()

@@ -63,13 +63,15 @@ up() {
     echo "kafka$i on 127.0.0.1:$port"
   done
 
-  # Wait for the quorum rather than sleeping a guessed number of seconds: a
-  # cluster that is still electing answers Metadata with no leaders, and every
-  # cell built on that is noise.
+  # Wait for **all three** brokers to be registered, not just for the first one
+  # to answer. A cluster where only one broker is up answers Metadata perfectly
+  # well — with every partition led by that broker — so a test or a benchmark
+  # started too early measures a single-broker cluster and a transaction
+  # coordinator that does not yet know the topics it is being asked about.
   echo -n "waiting for quorum"
-  for _ in $(seq 1 60); do
-    if podman exec kafka1 /opt/kafka/bin/kafka-broker-api-versions.sh \
-        --bootstrap-server kafka1:9092 >/dev/null 2>&1; then
+  for _ in $(seq 1 90); do
+    if [ "$(podman exec kafka1 /opt/kafka/bin/kafka-broker-api-versions.sh \
+        --bootstrap-server kafka1:9092 2>/dev/null | grep -c 'id:')" = "$NODES" ]; then
       echo " ok"
       ports
       return 0

@@ -46,6 +46,7 @@ fn a_moved_leader_is_retried_without_duplicating() {
         api: ApiKey::Produce,
         code: 6, // NOT_LEADER_OR_FOLLOWER
         times: 1,
+        after: 0,
     }]);
 
     drive(async {
@@ -77,6 +78,7 @@ fn repeated_retries_keep_the_same_sequence() {
         api: ApiKey::Produce,
         code: 6,
         times: 5,
+        after: 0,
     }]);
 
     drive(async {
@@ -100,6 +102,7 @@ fn a_moved_coordinator_is_rediscovered() {
         api: ApiKey::InitProducerId,
         code: 16, // NOT_COORDINATOR
         times: 1,
+        after: 0,
     }]);
 
     drive(async {
@@ -123,6 +126,7 @@ fn a_warming_coordinator_is_waited_out() {
         api: ApiKey::InitProducerId,
         code: 14, // COORDINATOR_LOAD_IN_PROGRESS
         times: 3,
+        after: 0,
     }]);
 
     drive(async {
@@ -140,6 +144,7 @@ fn concurrent_transactions_is_waited_out() {
         api: ApiKey::AddPartitionsToTxn,
         code: 51,
         times: 2,
+        after: 0,
     }]);
 
     drive(async {
@@ -164,6 +169,7 @@ fn a_fenced_producer_refuses_everything_afterwards() {
         api: ApiKey::Produce,
         code: 90, // PRODUCER_FENCED
         times: 1,
+        after: 0,
     }]);
 
     drive(async {
@@ -208,6 +214,7 @@ fn an_out_of_sequence_error_is_not_retried() {
         api: ApiKey::Produce,
         code: 45, // OUT_OF_ORDER_SEQUENCE_NUMBER
         times: 1,
+        after: 0,
     }]);
 
     drive(async {
@@ -473,6 +480,7 @@ fn only_the_failed_partition_is_retried() {
         api: ApiKey::Produce,
         code: 6, // NOT_LEADER_OR_FOLLOWER — applied to the whole first request
         times: 1,
+        after: 0,
     }]);
 
     drive(async {
@@ -500,4 +508,174 @@ fn only_the_failed_partition_is_retried() {
         unique.len(),
         "a partition was written twice: {partitions:?}"
     );
+}
+
+// ── pipelining ───────────────────────────────────────────────────────────────
+
+/// **Several batches in flight at once, and the log still reads in order.**
+///
+/// Five enqueued batches for one partition go out as five `Produce` requests
+/// before any is awaited. The simulator now enforces the sequence rule a real
+/// broker enforces, so a client that reordered or gapped them would be rejected
+/// rather than quietly accepted.
+#[test]
+fn a_window_of_batches_arrives_in_sequence() {
+    sim::start(Vec::new());
+
+    drive(async {
+        let mut producer = transactional().await;
+        producer.begin_transaction().expect("begin");
+        for _ in 0..5 {
+            producer.enqueue("t", 0, &records(2)).await.expect("enqueue");
+        }
+        assert_eq!(producer.queued(), 5);
+
+        let written = producer.flush().await.expect("flush");
+        assert_eq!(written.len(), 5, "every batch must be acknowledged");
+        assert_eq!(producer.queued(), 0);
+
+        let journal = journal();
+        assert_eq!(
+            journal.produced,
+            vec![(0, 0, 2), (0, 2, 2), (0, 4, 2), (0, 6, 2), (0, 8, 2)],
+            "sequences must be contiguous and in order"
+        );
+        // Five batches, one request each: they were pipelined, not merged.
+        assert_eq!(
+            journal.produce_widths.len(),
+            5,
+            "expected five requests, got {:?}",
+            journal.produce_widths
+        );
+    });
+}
+
+/// **The window is bounded.** Ten batches with a limit of three must go out as
+/// windows of three, not as ten requests at once — the recovery cost of a
+/// failure is proportional to the window, which is why it has a limit at all.
+#[test]
+fn the_window_is_bounded_by_max_in_flight() {
+    sim::start(Vec::new());
+
+    drive(async {
+        let mut producer = transactional().await;
+        producer.set_max_in_flight(3);
+        producer.begin_transaction().expect("begin");
+        for _ in 0..10 {
+            producer.enqueue("t", 0, &records(1)).await.expect("enqueue");
+        }
+        producer.flush().await.expect("flush");
+
+        let journal = journal();
+        assert_eq!(journal.produced.len(), 10);
+        for (i, (_, base, _)) in journal.produced.iter().enumerate() {
+            assert_eq!(*base, i as i32, "sequences must be 0..10 in order");
+        }
+    });
+}
+
+/// **The case pipelining exists to get wrong: a failure in the middle of the
+/// window.**
+///
+/// The broker rejects the first request with `NOT_LEADER_OR_FOLLOWER`. Every
+/// later request in that window is then for a partition whose earlier batch was
+/// never written, so the broker answers `OUT_OF_ORDER_SEQUENCE_NUMBER` — which
+/// this client classifies as fatal when it appears on its own. Here it must be
+/// read as a consequence, the whole window must be re-sent in order, and
+/// nothing may be written twice or skipped.
+#[test]
+fn a_failure_mid_window_resends_everything_behind_it() {
+    sim::start(vec![Fault {
+        api: ApiKey::Produce,
+        code: 6, // NOT_LEADER_OR_FOLLOWER
+        times: 1,
+        after: 0,
+    }]);
+
+    drive(async {
+        let mut producer = transactional().await;
+        producer.begin_transaction().expect("begin");
+        for _ in 0..4 {
+            producer.enqueue("t", 0, &records(2)).await.expect("enqueue");
+        }
+        let written = producer.flush().await.expect("flush");
+
+        assert_eq!(written.len(), 4, "every batch must land exactly once");
+        let journal = journal();
+        assert_eq!(
+            journal.produced,
+            vec![(0, 0, 2), (0, 2, 2), (0, 4, 2), (0, 6, 2)],
+            "the log must read in order with no gap and no duplicate"
+        );
+        assert!(
+            !matches!(producer.state(), kestrel_core::TxnState::Fatal),
+            "an out-of-sequence answer caused by an earlier failure must not fence"
+        );
+    });
+}
+
+/// A sequence error with **nothing failed before it** is still fatal. That is
+/// the check the pipelining path must not have weakened: it means the
+/// producer's stream is genuinely wrong, and retrying is how duplicates happen.
+#[test]
+fn an_unexplained_sequence_error_still_fences() {
+    sim::start(vec![Fault {
+        api: ApiKey::Produce,
+        code: 45, // OUT_OF_ORDER_SEQUENCE_NUMBER
+        times: 1,
+        after: 0,
+    }]);
+
+    drive(async {
+        let mut producer = transactional().await;
+        producer.begin_transaction().expect("begin");
+        producer.enqueue("t", 0, &records(1)).await.expect("enqueue");
+        let err = producer.flush().await.expect_err("must not be tolerated");
+        assert!(
+            matches!(
+                err,
+                kestrel_client::Error::Broker {
+                    disposition: kestrel_core::Disposition::Fatal,
+                    ..
+                }
+            ),
+            "expected a fatal sequence error, got: {err}"
+        );
+        assert!(matches!(producer.state(), kestrel_core::TxnState::Fatal));
+    });
+}
+
+/// **Only the contiguous leading run of successes is retired.**
+///
+/// The first request in the window lands; the second is rejected. Batch 0 is
+/// therefore done, while batches 1 onward — including the ones the broker
+/// answered *after* the failure, which it rejected for being out of sequence —
+/// must all go again, in order. Retiring a batch because its own round happened
+/// to succeed, without checking whether an earlier one failed, is how a
+/// pipelined producer leaves a gap in the log.
+#[test]
+fn a_success_after_a_failure_is_not_retired() {
+    sim::start(vec![Fault {
+        api: ApiKey::Produce,
+        code: 6, // NOT_LEADER_OR_FOLLOWER
+        times: 1,
+        after: 1, // let the first request through
+    }]);
+
+    drive(async {
+        let mut producer = transactional().await;
+        producer.begin_transaction().expect("begin");
+        for _ in 0..4 {
+            producer.enqueue("t", 0, &records(2)).await.expect("enqueue");
+        }
+        let written = producer.flush().await.expect("flush");
+
+        assert_eq!(written.len(), 4, "every batch must land exactly once");
+        let journal = journal();
+        assert_eq!(
+            journal.produced,
+            vec![(0, 0, 2), (0, 2, 2), (0, 4, 2), (0, 6, 2)],
+            "the log must read in order with no gap and no duplicate"
+        );
+    });
 }

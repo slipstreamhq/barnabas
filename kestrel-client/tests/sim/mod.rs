@@ -42,6 +42,12 @@ pub struct Fault {
     pub code: i16,
     /// How many times to answer with it before behaving.
     pub times: usize,
+    /// How many matching requests to let through **first**.
+    ///
+    /// Without this a fault can only ever hit the first request, so a window of
+    /// pipelined requests could not be made to fail in the *middle* — which is
+    /// the case that decides whether recovery re-sends the right batches.
+    pub after: usize,
 }
 
 /// What the simulated cluster did, so a test can assert on behaviour rather
@@ -94,6 +100,9 @@ struct World {
     next_offset: i64,
     /// Bumped by every `InitProducerId`, as a coordinator does.
     epoch: i16,
+    /// The next sequence number each partition will accept. A real broker keeps
+    /// this per producer id; one producer at a time is all the simulator needs.
+    expected_sequence: std::collections::HashMap<i32, i32>,
 }
 
 thread_local! {
@@ -125,6 +134,10 @@ pub fn journal() -> Journal {
 /// Pop a scripted fault for `api`, if one is due.
 fn take_fault(world: &mut World, api: ApiKey) -> Option<i16> {
     let idx = world.faults.iter().position(|f| f.api == api && f.times > 0)?;
+    if world.faults[idx].after > 0 {
+        world.faults[idx].after -= 1;
+        return None;
+    }
     world.faults[idx].times -= 1;
     Some(world.faults[idx].code)
 }
@@ -371,13 +384,27 @@ fn produce_response(
                     let set = kafka_protocol::records::RecordBatchDecoder::decode(&mut bytes)
                         .expect("decode produced batch");
                     let base_sequence = set.records.first().map_or(-1, |r| r.sequence);
-                    world.journal.produced.push((
-                        partition.index,
-                        base_sequence,
-                        set.records.len(),
-                    ));
-                    response.base_offset = world.next_offset;
-                    world.next_offset += set.records.len() as i64;
+
+                    // **The sequence check a real broker does.** Without it the
+                    // simulator accepts anything and a pipelined producer that
+                    // gapped or reordered its batches would still pass — which
+                    // is precisely the bug pipelining risks. 45 is
+                    // OUT_OF_ORDER_SEQUENCE_NUMBER, 46 DUPLICATE_SEQUENCE_NUMBER.
+                    let expected = world.expected_sequence.entry(partition.index).or_insert(0);
+                    if base_sequence < *expected {
+                        response.error_code = 46;
+                    } else if base_sequence > *expected {
+                        response.error_code = 45;
+                    } else {
+                        *expected += set.records.len() as i32;
+                        world.journal.produced.push((
+                            partition.index,
+                            base_sequence,
+                            set.records.len(),
+                        ));
+                        response.base_offset = world.next_offset;
+                        world.next_offset += set.records.len() as i64;
+                    }
                 }
             }
             partition_responses.push(response);

@@ -2,7 +2,7 @@
 
 `cargo run -p kestrel-bench --release`, 2026-08-16. Reproduce before believing; the harness prints
 its own parameters and asserts that every run handled every record before dividing.
-`KESTREL_CELLS=cores` (or `produce`, `latency`, `consume`, `compression`, `e2e`, `idle`) runs one
+`KESTREL_CELLS=cores` (or `produce`, `latency`, `consume`, `compression`, `e2e`, `idle`, `pipeline`) runs one
 section, because re-measuring one cell should not cost the others.
 
 **Machine:** AMD Ryzen Threadripper PRO 9975WX (32 cores / 64 threads), Linux 7.1.8.
@@ -71,6 +71,42 @@ latency `max` column went from an occasional 253 ms to a steady ~1.1 ms.
 **One run put `rdkafka`'s batch-1 row at 47 795 rec/s**, five times its own steady figure of ~9 850
 and more than double ours. It did not repeat in any other run and is recorded rather than dropped:
 if it is reproducible, the batch-1 row is a loss and this table is wrong.
+
+## Pipelining: requests in flight per connection
+
+Batch 100, 128 B records, spread over 8 partitions. The caller enqueues a window and flushes it, so
+several `Produce` requests are on one connection at once.
+
+| in flight | rec/s | vs 1 |
+|---:|---:|---:|
+| 1 | 594 000 – 946 000 | 1.00× |
+| 2 | 1 390 000 – 1 681 000 | 1.8× – 2.3× |
+| 5 | 2 410 000 – 2 992 000 | **3.1× – 4.1×** |
+| 10 | 1 616 000 – 2 840 000 | 1.7× – 3.2× |
+
+**Five is the default**, which is what the Java client allows with idempotence enabled. Ten buys
+nothing here and one run of three was markedly worse, so the cap is doing its job rather than
+holding anything back.
+
+### Why a window needs a limit
+
+The broker processes one connection's requests in order, so a partition's batches stay in sequence
+even with several outstanding. The cost is recovery: if round 2 of a five-round window fails, the
+broker never wrote it, so rounds 3 and 4 for that partition were rejected as out of sequence
+whatever they contain. All three must be re-sent, in order. That work is proportional to the window,
+which is the reason to bound it.
+
+`flush` therefore retires **only the contiguous leading run of successes** per partition. A batch
+whose own round succeeded but which sits behind a failure stays queued. Getting this wrong leaves a
+gap in the log, and it returns `Ok`.
+
+`OUT_OF_ORDER_SEQUENCE_NUMBER` is still fatal when it arrives with nothing failed before it — that
+means the producer's stream is genuinely wrong and retrying is how duplicates get written. It is
+treated as a consequence only when this client already knows an earlier batch for that partition
+failed in the same window.
+
+The simulator now enforces the sequence rule a real broker enforces. Before that it accepted any
+sequence, so a pipelined producer that gapped or reordered its batches would have passed.
 
 ## Produce latency, one record at a time
 
@@ -194,21 +230,17 @@ than defended.
 - **lz4's slowness** is unexplained.
 - **No sustained run in this file.** `KESTREL_SOAK_SECONDS` produces continuously and prints per-10s
   rates and RSS, but no long run has been recorded here yet.
-- **Producer in-flight is still one per connection.** Two things block it, and neither is plumbing:
-  an idempotent producer may not let two batches for the *same partition* be in flight unless a
-  failure of the first re-sends every later one in sequence order, or the broker answers
-  `OUT_OF_ORDER_SEQUENCE_NUMBER`; and the current `send`/`send_keyed` API awaits each call, so a
-  caller has no way to express more than one outstanding write. The gain would land exactly on the
-  small-batch rows where this client is weakest, which is what makes it worth doing properly.
-- **Producer pipelining.** The consumer now overlaps its network with the caller's work; the
-  producer does not. `Broker::send`/`recv` and `Cluster::send_at`/`recv_many` are the foundation
-  and are in place, but raising in-flight above one for *produce* needs more than plumbing — see
-  below.
+- **The produce-throughput table above still uses `send_keyed`**, which awaits each call and so has
+  one request in flight. Those rows understate what the client can do; the pipelining table is
+  measured separately rather than folded in, because changing the table's shape would make it
+  incomparable with every earlier revision of this file.
 
 ## Why produce is fast
 
 - **One `Produce` per broker, not per partition** — eight partitions on one broker travel in one
   request — and **every broker's request is in flight at once**.
+- **Up to five requests in flight per connection**, with the ordered-window retry that makes that
+  safe for an idempotent producer.
 - **Batches are encoded once** and re-sent byte-identically on retry, so a retry costs a write, not
   a re-encode.
 - **Zero-copy reads**: record values are `Bytes` slices into the fetch buffer.

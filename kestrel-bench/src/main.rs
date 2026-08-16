@@ -515,6 +515,54 @@ fn rdkafka_produce_compressed(topic: &str, cell: &Cell, codec: &str) -> Duration
     })
 }
 
+// ── pipelining ───────────────────────────────────────────────────────────────
+
+/// Produce with a bounded window of requests in flight per connection.
+///
+/// The caller enqueues `window` batches and flushes them together, which is the
+/// only way to have more than one write outstanding — `send` awaits, so it can
+/// never have two.
+fn kestrel_produce_pipelined(topic: &str, cell: &Cell, in_flight: usize) -> Duration {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    runtime.block_on(async {
+        let mut producer =
+            kestrel_tokio::Producer::idempotent(kestrel_tokio::Tokio, &brokers(), "bench")
+                .await
+                .expect("producer");
+        producer.set_max_in_flight(in_flight);
+
+        let value = payload(cell.value_bytes);
+        let batch: Vec<ProducerRecord> = (0..cell.batch)
+            .map(|i| ProducerRecord::new(Some(Bytes::from(format!("k{i}"))), Some(value.clone())))
+            .collect();
+
+        let rounds = cell.records / cell.batch;
+        let start = Instant::now();
+        let mut queued = 0;
+        for round in 0..rounds {
+            // Spread across partitions so this is not one partition's log.
+            let partition = (round % PARTITIONS as usize) as i32;
+            producer
+                .enqueue(topic, partition, &batch)
+                .await
+                .expect("enqueue");
+            queued += 1;
+            if queued == in_flight {
+                producer.flush().await.expect("flush");
+                queued = 0;
+            }
+        }
+        if queued > 0 {
+            producer.flush().await.expect("flush");
+        }
+        start.elapsed()
+    })
+}
+
 // ── end-to-end latency ───────────────────────────────────────────────────────
 
 /// **Produce to consume**, which is the latency a pipeline actually feels.
@@ -916,7 +964,28 @@ fn main() {
             );
         }
 
-        // ── fetch sessions ──────────────────────────────────────────────────────
+        // ── pipelining ──────────────────────────────────────────────────────────
+    }
+
+    if want("pipeline") {
+        println!("\nin-flight per connection            rec/s      vs 1 in flight");
+        let cell = Cell { batch: 100, value_bytes: 128, records: 200_000 };
+        let mut single = 0.0;
+        for in_flight in [1usize, 2, 5, 10] {
+            let topic = topic("pl");
+            create_topic(&topic);
+            let rate = cell.rate(kestrel_produce_pipelined(&topic, &cell, in_flight));
+            if in_flight == 1 {
+                single = rate;
+            }
+            println!(
+                "{in_flight:>2} in flight                 {:>12.0}   {:>12.2}x",
+                rate,
+                rate / single
+            );
+        }
+
+    // ── fetch sessions ──────────────────────────────────────────────────────
     }
 
     if want("idle") {
