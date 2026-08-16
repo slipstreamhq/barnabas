@@ -7,6 +7,7 @@ section, because re-measuring one cell should not cost the others.
 
 **Machine:** AMD Ryzen Threadripper PRO 9975WX (32 cores / 64 threads), Linux 7.1.8.
 **Cluster:** three `apache/kafka:3.9.0` brokers in KRaft mode over loopback — `./cluster.sh up`.
+`./cluster.sh up redpanda` runs the same cells against three Redpanda brokers instead; see below.
 Still one machine and still no network, but partition leadership is spread across three brokers.
 **Common to every cell:** 8 partitions, replication factor 1, `acks=all`, idempotent producer, no
 compression unless the cell says otherwise.
@@ -211,6 +212,34 @@ partition busy — so until now it shipped unmeasured.
 **The first version of this cell could not have shown a difference.** It used `max_wait` of 1 ms,
 which floors every poll at ~1.2 ms, and duly reported 839 vs 851 polls/s — a 1% "result" that was
 entirely the broker's wait timer.
+
+## Against Redpanda
+
+Same client, same cells, three `redpandadata/redpanda:v24.2.7` brokers instead of Kafka
+(`./cluster.sh up redpanda`).
+
+| cell | Kafka | Redpanda |
+|---|---:|---:|
+| batch 1, 128 B | 20 000 – 25 300 | 30 600 – 33 500 |
+| batch 10, 128 B | 129 000 – 159 000 | 161 000 – 176 000 |
+| batch 100, 128 B | 1 059 000 – 1 299 000 | 1 148 000 – 1 207 000 |
+| batch 1 000, 128 B | 3 745 000 – 4 505 000 | 3 243 000 – 3 710 000 |
+| batch 1 000, 1 KiB | 1 415 000 – 1 946 000 | 1 205 000 – 1 505 000 |
+| batch 1 000, 8 KiB | 189 000 – 259 000 | 128 000 – 159 000 |
+| consume, 128 B | 2 944 000 – 3 080 000 | 2 643 000 – 2 893 000 |
+
+**Small batches are faster against Redpanda, large ones slower** — the crossover is somewhere around
+batch 100. Both are single-machine loopback clusters and neither is tuned, so this says more about
+the two brokers' defaults under a benchmark than about either product; it is recorded because the
+client is the same in both columns and the shape of the difference is consistent across runs.
+
+`rdkafka`'s consumer is notably steadier here (~178 000 rec/s against Kafka's bimodal
+132 000 – 152 000), which narrows our consume ratio to ~15–16× from ~20×.
+
+**Redpanda found a real bug on its first run**, which is the actual reason to keep it: this client
+did the `ApiVersions` handshake and then ignored the answer, sending hardcoded versions that only
+Apache Kafka happens to support. Redpanda closes the connection on a version it does not know, so it
+failed at connect. Versions are now negotiated per broker.
 
 ## Two fairness mistakes, both mine, both corrected
 
