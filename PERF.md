@@ -68,9 +68,15 @@ latency `max` column went from an occasional 253 ms to a steady ~1.1 ms.
 | 1 000 | 1 KiB | 1 415 000 – 1 946 000 | 316 000 – 333 000 | 4.4× – 5.9× |
 | 1 000 | 8 KiB | 189 000 – 232 000 | 83 400 – 90 700 | 2.2× – 2.7× |
 
-**One run put `rdkafka`'s batch-1 row at 47 795 rec/s**, five times its own steady figure of ~9 850
-and more than double ours. It did not repeat in any other run and is recorded rather than dropped:
-if it is reproducible, the batch-1 row is a loss and this table is wrong.
+**`rdkafka`'s small-batch rows are bimodal, and the fast mode beats us.** One run put its batch-1 at
+47 795 rec/s against its usual ~9 850; another put its batch-10 at 177 947 against its usual
+~39 000 — faster than our 158 983 in the same run. Neither repeated, but it has now happened twice
+on two different rows, so **treat the batch-1 and batch-10 ratios as unsettled**: whatever puts
+librdkafka into its fast mode is not understood, and if it is the normal state on some machine then
+those two rows are losses rather than 2–4× wins. The batched rows have never shown this.
+
+The first run of a fresh cluster is also always slow for both clients — one showed us at 11 152 and
+librdkafka at 4 888, roughly half their steady figures — so a cold run is not a data point.
 
 ## Pipelining: requests in flight per connection
 
@@ -231,7 +237,8 @@ than defended.
 - **No sustained run in this file.** `KESTREL_SOAK_SECONDS` produces continuously and prints per-10s
   rates and RSS, but no long run has been recorded here yet.
 - **The produce-throughput table above still uses `send_keyed`**, which awaits each call and so has
-  one request in flight. Those rows understate what the client can do; the pipelining table is
+  one request in flight. **A caller that does not switch to `enqueue`/`flush` sees no pipelining
+  benefit at all**; the default path is exactly as fast as it was. Those rows understate what the client can do; the pipelining table is
   measured separately rather than folded in, because changing the table's shape would make it
   incomparable with every earlier revision of this file.
 
