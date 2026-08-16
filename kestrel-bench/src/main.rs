@@ -521,7 +521,12 @@ fn rdkafka_produce_compressed(topic: &str, cell: &Cell, codec: &str) -> Duration
 ///
 /// The producer and consumer share one executor, so this is one core doing both
 /// halves — the shape a per-core stream processor has.
-fn kestrel_end_to_end(topic: &str, samples: usize, value_bytes: usize) -> Latency {
+fn kestrel_end_to_end(
+    topic: &str,
+    samples: usize,
+    value_bytes: usize,
+    prefetch: bool,
+) -> Latency {
     let topic = topic.to_owned();
     glommio::LocalExecutorBuilder::default()
         .make()
@@ -547,6 +552,7 @@ fn kestrel_end_to_end(topic: &str, samples: usize, value_bytes: usize) -> Latenc
             .await
             .expect("consumer");
             consumer.set_max_wait(Duration::from_millis(50));
+            consumer.set_prefetch(prefetch);
 
             let value = payload(value_bytes);
             let mut latencies = Vec::with_capacity(samples);
@@ -879,11 +885,19 @@ fn main() {
     }
 
     if want("e2e") {
-        println!("\nend-to-end latency              kestrel        rdkafka");
+        println!("\nend-to-end latency (produce to consume)");
+        println!("           kestrel   no prefetch       rdkafka");
         let samples = 500;
         let kestrel_topic = topic("ke");
         create_topic(&kestrel_topic);
-        let mut kestrel = kestrel_end_to_end(&kestrel_topic, samples, 128);
+        let mut kestrel = kestrel_end_to_end(&kestrel_topic, samples, 128, true);
+
+        // The same measurement with prefetch off. Running both in one process
+        // is the only honest way to say what it bought: the cluster moves
+        // enough between runs to swamp the difference otherwise.
+        let plain_topic = topic("kn");
+        create_topic(&plain_topic);
+        let mut no_prefetch = kestrel_end_to_end(&plain_topic, samples, 128, false);
 
         let rd_topic = topic("re");
         create_topic(&rd_topic);
@@ -891,11 +905,13 @@ fn main() {
 
         for (label, p) in [("p50", 0.50), ("p99", 0.99), ("max", 1.0)] {
             let k = kestrel.percentile(p);
+            let n = no_prefetch.percentile(p);
             let r = rdkafka.percentile(p);
             let marker = if k > r { "  <-- slower" } else { "" };
             println!(
-                "{label:<8} {:>18.3} ms {:>12.3} ms{marker}",
+                "{label:<6} {:>9.3} ms {:>10.3} ms {:>10.3} ms{marker}",
                 k.as_secs_f64() * 1e3,
+                n.as_secs_f64() * 1e3,
                 r.as_secs_f64() * 1e3
             );
         }

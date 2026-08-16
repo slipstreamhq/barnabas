@@ -323,6 +323,96 @@ fn fetches_are_routed_to_the_partition_leader() {
 /// Fetch until `want` records have arrived or the attempts run out. A single
 /// fetch is allowed to return nothing — an empty fetch is normal, not a
 /// failure — so tests that assert on content must poll.
+/// **Prefetch must not change what a consumer sees**, only when the request for
+/// it left. The same topic read both ways must give the same records in the
+/// same order.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn prefetch_returns_the_same_records() {
+    run(|| async {
+        let topic = unique_topic("prefetch");
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
+        prod.create_topic().await;
+        prod.produce_plain(20).await;
+
+        let mut values = Vec::new();
+        for prefetch in [true, false] {
+            let mut consumer = Consumer::assign(
+                kestrel_glommio::Glommio,
+                &bootstrap(),
+                "kestrel-test",
+                &topic,
+                0,
+                EARLIEST,
+                IsolationLevel::ReadCommitted,
+            )
+            .await
+            .expect("assign");
+            consumer.set_prefetch(prefetch);
+
+            let records = fetch_until(&mut consumer, 20).await;
+            values.push(
+                records
+                    .iter()
+                    .map(|r| String::from_utf8_lossy(r.value.as_ref().unwrap()).into_owned())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(values[0].len(), 20, "prefetching consumer lost records");
+        assert_eq!(values[0], values[1], "prefetch changed what was delivered");
+    });
+}
+
+/// **A seek must beat the fetch already in flight.**
+///
+/// With prefetch on, the request for the next poll goes out before the caller
+/// gets a chance to seek. That outstanding answer is to the old position, and
+/// returning it would silently replay or skip records — so it has to be
+/// discarded rather than decoded.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn a_seek_discards_the_fetch_already_in_flight() {
+    run(|| async {
+        let topic = unique_topic("seek-prefetch");
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
+        prod.create_topic().await;
+        prod.produce_plain(10).await;
+
+        let mut consumer = Consumer::assign(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "kestrel-test",
+            &topic,
+            0,
+            EARLIEST,
+            IsolationLevel::ReadCommitted,
+        )
+        .await
+        .expect("assign");
+        consumer.set_max_wait(Duration::from_millis(200));
+
+        // Read something, which also puts the next fetch in flight.
+        let first = fetch_until(&mut consumer, 1).await;
+        assert!(!first.is_empty());
+
+        // Now rewind. The in-flight fetch is asking from wherever the consumer
+        // had reached, not from 0.
+        consumer.seek(0);
+        let after = fetch_until(&mut consumer, 10).await;
+
+        let values: Vec<String> = after
+            .iter()
+            .map(|r| String::from_utf8_lossy(r.value.as_ref().unwrap()).into_owned())
+            .collect();
+        assert_eq!(
+            values.first().map(String::as_str),
+            Some("v0"),
+            "seek did not take effect; got {values:?}"
+        );
+        assert_eq!(consumer.position(), 10);
+    });
+}
+
 async fn fetch_until(
     consumer: &mut Consumer,
     want: usize,

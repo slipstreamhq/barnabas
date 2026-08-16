@@ -108,6 +108,22 @@ pub struct Consumer<T: Transport> {
     /// Whether to use incremental fetch at all. On by default; a caller with a
     /// broker that mishandles sessions can turn it off without changing code.
     incremental: bool,
+    /// A fetch already in flight, waiting to be collected. See
+    /// [`Self::fetch`].
+    outstanding: Option<Outstanding>,
+    /// Whether to keep a fetch permanently in flight. On by default.
+    prefetch: bool,
+    /// Bumped whenever the assignment or a position changes for a reason other
+    /// than consuming records. An outstanding fetch from an older generation
+    /// asked a question that is no longer the one being asked.
+    generation: u64,
+}
+
+/// A fetch that has been sent and not yet collected.
+struct Outstanding {
+    /// The partitions each broker was asked about, in request order.
+    groups: Vec<(String, Vec<(String, i32)>)>,
+    generation: u64,
 }
 
 impl<T: Transport> Consumer<T> {
@@ -129,6 +145,9 @@ impl<T: Transport> Consumer<T> {
             max_bytes: 10 * 1024 * 1024,
             sessions: BTreeMap::new(),
             incremental: true,
+            outstanding: None,
+            prefetch: true,
+            generation: 0,
         })
     }
 
@@ -159,6 +178,12 @@ impl<T: Transport> Consumer<T> {
     /// # Errors
     /// If the topic does not exist, or the broker answers with an error code.
     pub async fn add(&mut self, topic: &str, partition: i32, offset: i64) -> Result<()> {
+        // **Before anything else touches a connection.** A prefetched `Fetch`
+        // may be sitting unread on one of them, and a `Metadata` sent past it
+        // would be answered by that fetch — responses come back in order, so
+        // the decode would be of the wrong message for the wrong request.
+        self.discard_outstanding().await;
+
         // Up front so a missing topic fails here rather than as a fetch loop
         // that never returns anything.
         self.cluster.refresh_metadata(topic).await?;
@@ -174,6 +199,7 @@ impl<T: Transport> Consumer<T> {
         for session in self.sessions.values_mut() {
             session.reset();
         }
+        self.generation += 1;
         Ok(())
     }
 
@@ -184,6 +210,7 @@ impl<T: Transport> Consumer<T> {
     /// more machinery than a fresh full fetch costs.
     pub fn remove(&mut self, topic: &str, partition: i32) {
         self.positions.remove(&(topic.to_owned(), partition));
+        self.generation += 1;
         for session in self.sessions.values_mut() {
             session.reset();
         }
@@ -223,6 +250,7 @@ impl<T: Transport> Consumer<T> {
     pub fn seek_to(&mut self, topic: &str, partition: i32, offset: i64) {
         self.positions
             .insert((topic.to_owned(), partition), offset);
+        self.generation += 1;
     }
 
     /// Seek, for a consumer holding exactly one partition.
@@ -237,6 +265,7 @@ impl<T: Transport> Consumer<T> {
         );
         let key = self.positions.keys().next().expect("checked length").clone();
         self.positions.insert(key, offset);
+        self.generation += 1;
     }
 
     /// Use incremental fetch sessions (KIP-227). On by default.
@@ -249,11 +278,30 @@ impl<T: Transport> Consumer<T> {
         if !incremental {
             self.sessions.clear();
         }
+        self.generation += 1;
+    }
+
+    /// Keep a fetch permanently in flight. On by default.
+    ///
+    /// **This is what overlaps the network with the caller's work.** Without
+    /// it a fetch is issued only when [`Self::fetch`] is called, so every poll
+    /// pays a full round trip before it can return anything; with it the
+    /// request for the next poll goes out as soon as the current one is
+    /// decoded, and the caller's processing happens while the broker is
+    /// already working.
+    ///
+    /// Exactly one fetch per broker is outstanding, never more: the fetch
+    /// session epoch advances per accepted response, so a second in-flight
+    /// request would carry an epoch the broker has not reached.
+    pub fn set_prefetch(&mut self, prefetch: bool) {
+        self.prefetch = prefetch;
+        self.generation += 1;
     }
 
     /// How long a fetch waits for data before returning empty.
     pub fn set_max_wait(&mut self, max_wait: Duration) {
         self.max_wait = max_wait;
+        self.generation += 1;
     }
 
     /// The connections this consumer holds — one per broker it fetches from,
@@ -283,6 +331,10 @@ impl<T: Transport> Consumer<T> {
         partition: i32,
         timestamp: i64,
     ) -> Result<i64> {
+        // Public, so it can be called with a prefetch in flight. See
+        // [`Self::add`].
+        self.discard_outstanding().await;
+
         let mut req_partition = ListOffsetsPartition::default();
         req_partition.partition_index = partition;
         req_partition.timestamp = timestamp;
@@ -344,6 +396,83 @@ impl<T: Transport> Consumer<T> {
         unreachable!("the loop returns on its last attempt")
     }
 
+    /// Send one `Fetch` per broker and record what was asked, without waiting.
+    ///
+    /// If a send fails partway, whatever was already sent is still recorded —
+    /// those answers are outstanding whether or not the rest went out, and
+    /// leaving them unrecorded would strand them on the connection.
+    async fn issue_fetch(&mut self) -> Result<()> {
+        let mut by_broker: BTreeMap<String, Vec<(String, i32)>> = BTreeMap::new();
+        for (topic, partition) in self.positions.keys().cloned().collect::<Vec<_>>() {
+            let addr = self.cluster.leader_addr(&topic, partition).await?;
+            by_broker.entry(addr).or_default().push((topic, partition));
+        }
+
+        // Built before sending: `fetch_request` borrows `self`, and sending
+        // borrows the cluster mutably.
+        let planned: Vec<(String, Vec<(String, i32)>, FetchRequest)> = by_broker
+            .into_iter()
+            .map(|(addr, partitions)| {
+                let req = self.fetch_request(&addr, &partitions);
+                (addr, partitions, req)
+            })
+            .collect();
+
+        let mut sent: Vec<(String, Vec<(String, i32)>)> = Vec::with_capacity(planned.len());
+        let mut failure = None;
+        for (addr, partitions, req) in planned {
+            match self.cluster.send_at(ApiKey::Fetch, 12, &addr, &req).await {
+                Ok(()) => sent.push((addr, partitions)),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+
+        if sent.is_empty() {
+            return failure.map_or(Ok(()), Err);
+        }
+        self.outstanding = Some(Outstanding {
+            groups: sent,
+            generation: self.generation,
+        });
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Put the next round's fetch in flight, if prefetch is on.
+    ///
+    /// A failure here is deliberately not surfaced: nothing is outstanding
+    /// afterwards, so the next [`Self::fetch`] issues the request itself and
+    /// reports whatever goes wrong then. Returning it from *this* call would
+    /// fail a poll that had already succeeded.
+    async fn start_prefetch(&mut self) {
+        if self.prefetch && !self.positions.is_empty() {
+            let _ = self.issue_fetch().await;
+        }
+    }
+
+    /// Read and throw away an outstanding fetch whose question is stale.
+    ///
+    /// The sessions are reset because the broker advanced its own view when it
+    /// answered; the next request has to be a full fetch for the two to agree.
+    async fn discard_outstanding(&mut self) {
+        let Some(outstanding) = self.outstanding.take() else {
+            return;
+        };
+        let addrs: Vec<String> = outstanding
+            .groups
+            .iter()
+            .map(|(addr, _)| addr.clone())
+            .collect();
+        self.cluster
+            .discard_many::<FetchResponse>(ApiKey::Fetch, &addrs)
+            .await;
+        for session in self.sessions.values_mut() {
+            session.reset();
+        }
+    }
+
     /// Fetch every assigned partition, **one request per broker**.
     ///
     /// An empty result is normal: a fetch that waits out `max_wait` with no new
@@ -359,31 +488,32 @@ impl<T: Transport> Consumer<T> {
             return Ok(Vec::new());
         }
 
+        // An outstanding fetch asked about the assignment as it was; if that
+        // changed, its answer is to a question nobody is asking any more.
+        if self
+            .outstanding
+            .as_ref()
+            .is_some_and(|o| o.generation != self.generation)
+        {
+            self.discard_outstanding().await;
+        }
+
         for attempt in 0..=MAX_LEADER_RETRIES {
-            // Group this round's partitions by the broker that leads them.
-            let mut by_broker: BTreeMap<String, Vec<(String, i32)>> = BTreeMap::new();
-            for (topic, partition) in self.positions.keys().cloned().collect::<Vec<_>>() {
-                let addr = self.cluster.leader_addr(&topic, partition).await?;
-                by_broker.entry(addr).or_default().push((topic, partition));
+            if self.outstanding.is_none() {
+                self.issue_fetch().await?;
             }
+            let groups = self.outstanding.take().expect("just issued").groups;
+            let addrs: Vec<String> = groups.iter().map(|(addr, _)| addr.clone()).collect();
 
             let mut out = Vec::new();
             let mut needs_refresh: Vec<(String, i32)> = Vec::new();
 
-            // **Every broker's fetch goes out before any of them is awaited.**
-            // A core holding partitions on three brokers otherwise pays three
-            // round trips per poll where one would do; see
-            // [`Cluster::call_many`].
-            let requests: Vec<(String, FetchRequest)> = by_broker
-                .iter()
-                .map(|(addr, partitions)| (addr.clone(), self.fetch_request(addr, partitions)))
-                .collect();
             let responses = self
                 .cluster
-                .call_many::<_, FetchResponse>(ApiKey::Fetch, 12, &requests)
+                .recv_many::<FetchResponse>(ApiKey::Fetch, &addrs)
                 .await;
 
-            for ((addr, partitions), response) in by_broker.into_iter().zip(responses) {
+            for ((addr, partitions), response) in groups.into_iter().zip(responses) {
                 let resp = response?;
 
                 // A session the broker has forgotten is not a failure: drop it
@@ -473,6 +603,7 @@ impl<T: Transport> Consumer<T> {
             }
 
             if needs_refresh.is_empty() || attempt == MAX_LEADER_RETRIES {
+                self.start_prefetch().await;
                 return Ok(out);
             }
             // Something moved. Refresh the topics involved and go round again;

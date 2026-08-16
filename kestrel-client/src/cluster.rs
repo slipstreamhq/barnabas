@@ -171,11 +171,6 @@ impl<T: Transport> Broker<T> {
     }
 
     /// Send one request and read its response.
-    ///
-    /// Strictly one in flight, which is all an assign-only consumer needs: it
-    /// has a single outstanding fetch per partition by construction. The core
-    /// already correlates pipelined requests ([`Connection::in_flight`]), so
-    /// raising this is a change here, not there.
     pub(crate) async fn call<Req, Resp>(
         &mut self,
         api_key: ApiKey,
@@ -186,9 +181,30 @@ impl<T: Transport> Broker<T> {
         Req: Encodable,
         Resp: Decodable,
     {
+        self.send(api_key, version, req).await?;
+        self.recv().await
+    }
+
+    /// Write a request and **do not wait for it**.
+    ///
+    /// The half of `call` that makes a request outstanding. Kafka answers a
+    /// connection's requests in the order they arrived and the core matches
+    /// them by position ([`Connection::in_flight`]), so several may be in
+    /// flight at once — which is what lets the consumer keep a fetch permanently
+    /// outstanding instead of issuing one only when its caller asks.
+    pub(crate) async fn send<Req: Encodable>(
+        &mut self,
+        api_key: ApiKey,
+        version: i16,
+        req: &Req,
+    ) -> Result<()> {
         let wire = self.conn.request(api_key, version, req)?;
         T::write_all(&mut self.stream, &wire).await?;
+        Ok(())
+    }
 
+    /// Read the answer to the **oldest** outstanding request.
+    pub(crate) async fn recv<Resp: Decodable>(&mut self) -> Result<Resp> {
         loop {
             if let Some(resp) = self.conn.next_response()? {
                 return Ok(Connection::decode(&resp)?);
@@ -203,6 +219,11 @@ impl<T: Transport> Broker<T> {
             }
             self.conn.push_bytes(&buf[..n]);
         }
+    }
+
+    /// How many requests are awaiting an answer.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.conn.in_flight()
     }
 }
 
@@ -404,6 +425,106 @@ impl<T: Transport> Cluster<T> {
             .into_iter()
             .map(|o| o.expect("every request produced an outcome"))
             .collect()
+    }
+
+    /// Write a request to `addr` and leave it outstanding.
+    ///
+    /// Reconnects once if the pooled connection turns out to be dead, like
+    /// [`Self::call_at`]. Pair with [`Self::recv_many`].
+    pub(crate) async fn send_at<Req: Encodable>(
+        &mut self,
+        api_key: ApiKey,
+        version: i16,
+        addr: &str,
+        req: &Req,
+    ) -> Result<()> {
+        for attempt in 0..2 {
+            let broker = self.broker_at(addr).await?;
+            match broker.send(api_key, version, req).await {
+                Ok(()) => return Ok(()),
+                Err(Error::Io(e)) => {
+                    self.conns.remove(addr);
+                    if attempt == 1 {
+                        return Err(Error::Io(e));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+
+    /// Collect one outstanding answer from each of `addrs`, **all at once**.
+    ///
+    /// Connections are taken out of the pool for the duration for the same
+    /// reason [`Self::call_many`] does it. A broker whose read failed or timed
+    /// out is dropped rather than returned: its stream position is no longer
+    /// known, and reading a late response as the answer to the next request
+    /// would desynchronise it.
+    ///
+    /// No reconnect-once here, deliberately — the request this would retry was
+    /// already sent and its answer lost, so re-sending is the caller's decision.
+    /// Both callers re-issue on the next round, which for a fetch is free.
+    pub(crate) async fn recv_many<Resp: Decodable>(
+        &mut self,
+        op: ApiKey,
+        addrs: &[String],
+    ) -> Vec<Result<Resp>> {
+        let timeout = self.request_timeout;
+        let mut taken = Vec::with_capacity(addrs.len());
+        let mut outcomes: Vec<Option<Result<Resp>>> = (0..addrs.len()).map(|_| None).collect();
+
+        for (index, addr) in addrs.iter().enumerate() {
+            match self.conns.remove(addr) {
+                Some(broker) => taken.push((index, addr.clone(), broker)),
+                // Dropped between send and receive — nothing outstanding to
+                // read, so say so rather than block forever.
+                None => {
+                    outcomes[index] = Some(Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "connection dropped before its response was read",
+                    ))))
+                }
+            }
+        }
+
+        let reads: Vec<_> = taken
+            .into_iter()
+            .map(|(index, addr, mut broker)| async move {
+                let outcome = with_timeout::<T, _>(timeout, broker.recv()).await;
+                (index, addr, broker, outcome)
+            })
+            .collect();
+
+        for (index, addr, broker, outcome) in crate::join::join_all(reads).await {
+            outcomes[index] = Some(match outcome {
+                Some(Ok(resp)) => {
+                    self.conns.insert(addr, broker);
+                    Ok(resp)
+                }
+                Some(Err(e @ Error::Io(_))) => Err(e),
+                Some(Err(e)) => {
+                    self.conns.insert(addr, broker);
+                    Err(e)
+                }
+                None => Err(Error::Timeout { op, addr }),
+            });
+        }
+
+        outcomes
+            .into_iter()
+            .map(|o| o.expect("every address produced an outcome"))
+            .collect()
+    }
+
+    /// Read and throw away one outstanding answer per address.
+    ///
+    /// Used when a request in flight has been made irrelevant — the consumer's
+    /// assignment changed under it. The bytes must still be consumed or the
+    /// connection is left pointing at a response nobody expects; a connection
+    /// that cannot be drained is dropped instead.
+    pub(crate) async fn discard_many<Resp: Decodable>(&mut self, op: ApiKey, addrs: &[String]) {
+        let _ = self.recv_many::<Resp>(op, addrs).await;
     }
 
     /// As [`Self::call_at`], for requests any broker can serve.

@@ -89,20 +89,29 @@ been wrong in both directions once.
 
 ## End-to-end latency, produce to consume
 
-| | kestrel | rdkafka |
-|---|---:|---:|
-| p50 | 0.056 – 0.113 ms | 0.061 – 0.077 ms |
-| p99 | 0.082 – 0.173 ms | 0.101 – 0.168 ms |
-| max | 0.80 – 1.62 ms | 503 – 504 ms |
+500 samples, one record at a time, producer and consumer sharing one executor.
 
-**Read this as a tie that we sometimes lose.** The ranges overlap: one run had us at 0.094 ms p50
-against 0.063, another at 0.056 against 0.061.
+| | kestrel | kestrel, no prefetch | rdkafka |
+|---|---:|---:|---:|
+| p50 | 0.064 – 0.106 ms | 0.099 – 0.115 ms | 0.062 – 0.088 ms |
+| p99 | 0.129 – 0.332 ms | 0.204 – 0.252 ms | 0.139 – 0.224 ms |
+| max | 1.19 – 1.91 ms | 1.50 – 4.72 ms | 503 – 504 ms |
 
-There is a structural reason to expect us to be behind here, and it is worth stating plainly:
-**librdkafka keeps a fetch outstanding continuously**, so when a record lands the broker answers a
-request that is already in flight. `kestrel` issues a fetch only when the caller polls, so the
-fetch round trip is serialised *after* the produce round trip instead of overlapping it. A
-background prefetch would close this, and does not exist.
+**The consumer now keeps a fetch permanently in flight** (`set_prefetch`, on by
+default): the request for the next poll is sent as soon as the current response is decoded, so the
+broker is already working while the caller processes records. Exactly one fetch per broker is
+outstanding — the fetch-session epoch advances per accepted response, so a second would carry an
+epoch the broker has not reached.
+
+**It bought less than expected.** Both configurations run in the same process precisely because the
+cluster moves enough between runs to swamp the difference, and even then the p50 improvement is
+small and the p99 goes both ways. What can be said is that end-to-end is now **roughly parity with
+librdkafka rather than a clear loss** — one run had us at 0.064 ms against its 0.062 — where the
+previous revision of this file recorded a consistent loss and named the missing prefetch as the
+cause. That diagnosis was right about the mechanism and wrong about the size of it.
+
+An earlier measurement of this cell without the in-process comparison showed both clients degrading
+together between runs, which is what prompted running them side by side.
 
 ## Consume throughput
 
@@ -185,10 +194,16 @@ than defended.
 - **lz4's slowness** is unexplained.
 - **No sustained run in this file.** `KESTREL_SOAK_SECONDS` produces continuously and prints per-10s
   rates and RSS, but no long run has been recorded here yet.
-- **In-flight is still one request per connection.** Concurrency across brokers is done; pipelining
-  several requests onto one connection is not, and `kestrel_core::Connection` already correlates
-  them, so it is a change in `Broker::call`, not in the core.
-- **No background prefetch**, which is the structural reason for the end-to-end latency row.
+- **Producer in-flight is still one per connection.** Two things block it, and neither is plumbing:
+  an idempotent producer may not let two batches for the *same partition* be in flight unless a
+  failure of the first re-sends every later one in sequence order, or the broker answers
+  `OUT_OF_ORDER_SEQUENCE_NUMBER`; and the current `send`/`send_keyed` API awaits each call, so a
+  caller has no way to express more than one outstanding write. The gain would land exactly on the
+  small-batch rows where this client is weakest, which is what makes it worth doing properly.
+- **Producer pipelining.** The consumer now overlaps its network with the caller's work; the
+  producer does not. `Broker::send`/`recv` and `Cluster::send_at`/`recv_many` are the foundation
+  and are in place, but raising in-flight above one for *produce* needs more than plumbing — see
+  below.
 
 ## Why produce is fast
 
