@@ -12,6 +12,7 @@
 #
 #   ./java-bench.sh            against the Kafka cluster
 #   ./java-bench.sh redpanda   against the Redpanda cluster
+#   ./java-bench.sh kafka cores    N concurrent producers, aggregate rate
 #
 # **Fairness**: the Java producer is given its best configuration, not its
 # defaults — `linger.ms=0`, a large `batch.size`, five in flight — for the same
@@ -86,6 +87,54 @@ consume_cell() {
     --timeout 60000 \
     2>/dev/null | tail -1
 }
+
+# N concurrent producers against one topic, rates summed.
+#
+# The counterpart to `kestrel-bench`'s many-core cell. One producer per process
+# is what `kafka-producer-perf-test` gives, which is also what N application
+# instances would look like; each JVM has its own sender thread, and the rate
+# each reports covers only its send loop, so JVM startup is not counted.
+cores_cell() {
+  local topic
+  topic=$(topic_for "cores")
+  echo "producers   aggregate rec/s"
+  for n in 1 2 4 8; do
+    local per=$((2000000 / n))
+    local pids=() out
+    out=$(mktemp -d)
+    for i in $(seq 1 "$n"); do
+      (
+        run /opt/kafka/bin/kafka-producer-perf-test.sh \
+          --topic "$topic" \
+          --num-records "$per" \
+          --record-size 128 \
+          --throughput -1 \
+          --producer-props \
+            bootstrap.servers="$BOOTSTRAP" \
+            acks=all \
+            enable.idempotence=true \
+            linger.ms=0 \
+            batch.size=131072 \
+            max.in.flight.requests.per.connection=5 \
+            compression.type=none \
+          2>/dev/null | tail -1 > "$out/$i"
+      ) &
+      pids+=($!)
+    done
+    for pid in "${pids[@]}"; do wait "$pid"; done
+    # Sum the per-process rates. They ran concurrently, so the sum is the
+    # aggregate the cluster actually saw.
+    awk -v n="$n" '{ for (i = 1; i <= NF; i++) if ($i == "records/sec") total += $(i-1) }
+         END { printf "%9d   %15.0f\n", n, total }' "$out"/*
+    rm -rf "$out"
+  done
+}
+
+if [ "${2:-}" = "cores" ]; then
+  echo "Java client, N concurrent producers against $FLAVOUR"
+  cores_cell
+  exit 0
+fi
 
 echo "Java client (kafka-producer-perf-test) against $FLAVOUR"
 echo "records sent, rate, MB/s, avg latency, max latency, 50th, 95th, 99th, 99.9th"

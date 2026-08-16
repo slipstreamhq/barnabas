@@ -17,21 +17,37 @@ client, so a ratio against it flatters us regardless.
 
 ## Many cores — the claim the design rests on
 
-| cores | rec/s | per core |
-|---:|---:|---:|
-| 1 | 3.69 – 4.01 M | 3.7 – 4.0 M |
-| 2 | 3.80 – 9.53 M | 1.9 – 4.8 M |
-| 4 | 7.32 – 17.96 M | 1.8 – 4.5 M |
-| 8 | **25.0 – 33.1 M** | 3.1 – 4.1 M |
+N producer instances, each owning its own partitions of one 8-partition topic. `kestrel` uses N
+glommio executors pinned to N cores; `rdkafka` uses N threads each with its own client; the Java
+column is N concurrent `kafka-producer-perf-test` processes, rates summed. Connection setup is
+outside the timing for all three.
 
-**Per-core throughput is flat from one core to eight** — about 3.1–4.1 M records/s each, with
-eight cores reaching 25–33 M records/s in aggregate. Six consecutive runs, no collapses. That is
-what "N cores that own partitions and never coordinate" is supposed to look like, and it is the
-first version of this cell that shows it.
+| instances | kestrel | Java | rdkafka |
+|---:|---:|---:|---:|
+| 1 | 3.50 – 4.07 M | 1.70 M | 0.56 M |
+| 2 | 4.17 – 8.45 M | 2.63 M | 0.66 M |
+| 4 | 15.2 – 16.9 M | 3.71 M | 0.66 M |
+| 8 | **24.9 – 29.1 M** | 5.38 M | 0.66 M |
+| scaling, 1→8 | **6.1× – 8.3×** | 3.2× | 1.2× |
 
-The 2- and 4-core rows still have occasional dips (one run in six landed at 3.80 M on 2 cores, two
-at ~7–8 M on 4). They are roughly 2× dips, not the 20× swings this cell used to produce, and the
-8-core row did not dip at all in six runs.
+**This is the result the design exists for.** Per-core throughput stays flat — about 3.1–4.2 M
+records/s each, from one core to eight — so the aggregate tracks the core count. Java scales too,
+at roughly 3.2×; librdkafka is **flat from two clients onward**, gaining nothing from 2 to 8.
+
+At 8 instances we are **4.6× – 5.4× the Java client** and **37× – 44× librdkafka**.
+
+Two honest qualifications:
+
+- **We may be approaching what this cluster can absorb at 25–29 M records/s, and the other two are
+  not.** Java at 5.4 M and librdkafka at 0.66 M are nowhere near the ceiling we are pushing against,
+  so their limits here are client-side, not broker-side. That makes the *ratio* trustworthy and the
+  *absolute* ceiling ours alone — a bigger cluster would raise our number and probably not theirs.
+- **Eight JVMs is a much heavier footprint** than eight glommio executors on the same machine:
+  eight heaps, eight GCs, eight sender threads, all competing with the brokers for the same box.
+  Some of Java's shortfall at 8 is that crowding rather than the client.
+
+The 2-core row still dips occasionally (one run of two came out at 4.17 M, a 1.19× step, against
+8.45 M and 2.08× in the other). Unexplained, and milder than what it used to be.
 
 ### Three bugs this cell had, all mine
 
@@ -301,8 +317,10 @@ than defended.
 
 - **No real network and no replication.** Three brokers on one machine share a page cache and a
   disk; RF is 1. A cluster on separate hosts could move every row here.
-- **The occasional 2-core and 4-core dips** are unexplained, though far milder than what the retry
-  backoff was causing.
+- **The occasional 2-core dips** are unexplained, though far milder than what the retry backoff was
+  causing.
+- **Whether 25–29 M records/s is our ceiling or the cluster's** is unknown; the other two clients are
+  far enough below it that only our own number is in question.
 - **lz4's slowness** is unexplained.
 - **No sustained run in this file.** `KESTREL_SOAK_SECONDS` produces continuously and prints per-10s
   rates and RSS, but no long run has been recorded here yet.

@@ -67,6 +67,10 @@ fn want(section: &str) -> bool {
 }
 
 fn topic(prefix: &str) -> String {
+    unique_topic(prefix)
+}
+
+fn unique_topic(prefix: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -798,6 +802,72 @@ fn kestrel_soak(topic: &str, seconds: u64) {
     });
 }
 
+/// The same shape as [`kestrel_produce_many_cores`], for librdkafka: **N
+/// independent clients**, each owning its own partitions of one topic.
+///
+/// Threads rather than pinned executors, deliberately. librdkafka runs its own
+/// background sender threads and pinning the calling thread would not pin
+/// those, so pinning would constrain the API thread and nothing else. This
+/// gives it the shape it is built for: N clients, each accumulating and
+/// sending on its own schedule.
+fn rdkafka_produce_many_clients(topic: &str, clients: usize, cell: &Cell) -> Duration {
+    assert!(clients <= PARTITIONS as usize);
+    let per_client = cell.records / clients;
+    let partitions_per_client = (PARTITIONS as usize).div_ceil(clients);
+
+    let ready = std::sync::Arc::new(std::sync::Barrier::new(clients + 1));
+    let handles: Vec<_> = (0..clients)
+        .map(|client| {
+            let ready = std::sync::Arc::clone(&ready);
+            let topic = topic.to_owned();
+            let value_bytes = cell.value_bytes;
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                runtime.block_on(async move {
+                    let producer = rdkafka_producer("0");
+                    let value = payload(value_bytes);
+                    let owned: Vec<i32> = (0..PARTITIONS)
+                        .filter(|p| *p as usize / partitions_per_client == client)
+                        .collect();
+
+                    // Connection setup excluded from the timing, as it is for
+                    // kestrel.
+                    ready.wait();
+
+                    let mut waits = Vec::with_capacity(per_client);
+                    for i in 0..per_client {
+                        let partition = owned[i % owned.len()];
+                        let key = format!("k{client}-{i}");
+                        waits.push(
+                            producer
+                                .send_result(
+                                    FutureRecord::to(&topic)
+                                        .partition(partition)
+                                        .key(&key)
+                                        .payload(&value[..]),
+                                )
+                                .expect("enqueue"),
+                        );
+                    }
+                    for wait in waits {
+                        wait.await.expect("delivery").expect("delivered");
+                    }
+                });
+            })
+        })
+        .collect();
+
+    ready.wait();
+    let start = Instant::now();
+    for handle in handles {
+        handle.join().expect("client finished");
+    }
+    start.elapsed()
+}
+
 fn main() {
     println!(
         "{PARTITIONS} partitions, acks=all, idempotent, RF 1, {} broker(s)\n",
@@ -860,7 +930,9 @@ fn main() {
     }
 
     if want("cores") {
-        println!("\nproduce, N cores (glommio)          rec/s      per core   scaling");
+        println!(
+            "\nproduce, N cores      kestrel rec/s      per core   scaling   rdkafka rec/s   ratio"
+        );
         let cell = Cell { batch: 1_000, value_bytes: 128, records: 400_000 };
         let mut single_core = 0.0;
         for cores in [1usize, 2, 4, 8] {
@@ -870,11 +942,21 @@ fn main() {
             if cores == 1 {
                 single_core = rate;
             }
+
+            // **The same shape for librdkafka**, so the scaling claim has
+            // something to be a claim against. Without this the row said only
+            // that we scale, not that we scale better than anyone.
+            let rd_topic = unique_topic("mr");
+            create_topic(&rd_topic);
+            let rd_rate = cell.rate(rdkafka_produce_many_clients(&rd_topic, cores, &cell));
+
             println!(
-                "{cores:>2} cores                     {:>12.0}  {:>12.0}   {:>6.2}x",
+                "{cores:>2} cores        {:>12.0}  {:>12.0}   {:>6.2}x   {:>12.0}   {:>5.1}x",
                 rate,
                 rate / cores as f64,
-                rate / single_core
+                rate / single_core,
+                rd_rate,
+                rate / rd_rate
             );
         }
     }
