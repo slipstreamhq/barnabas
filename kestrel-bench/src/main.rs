@@ -164,6 +164,40 @@ fn kestrel_produce(topic: &str, cell: &Cell) -> Duration {
     })
 }
 
+/// The same shape rskafka's cell uses: **a whole batch to one partition**,
+/// round-robin across calls.
+///
+/// `send_keyed` hashes each record independently, so a batch of ten spreads
+/// over eight partitions and becomes one request per *broker* — three, here —
+/// where rskafka's per-partition client sends one. At batch 1 000 that costs
+/// nothing and the batching wins; at batch 10 it is three round trips against
+/// one, and comparing them is comparing different work.
+fn kestrel_produce_one_partition(topic: &str, cell: &Cell) -> Duration {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    runtime.block_on(async {
+        let mut producer =
+            kestrel_tokio::Producer::idempotent(kestrel_tokio::Tokio, &brokers(), "bench")
+                .await
+                .expect("producer");
+
+        let value = payload(cell.value_bytes);
+        let batch: Vec<ProducerRecord> = (0..cell.batch)
+            .map(|i| ProducerRecord::new(Some(Bytes::from(format!("k{i}"))), Some(value.clone())))
+            .collect();
+
+        let start = Instant::now();
+        for round in 0..(cell.records / cell.batch) {
+            let partition = (round % PARTITIONS as usize) as i32;
+            producer.send(topic, partition, &batch).await.expect("send");
+        }
+        start.elapsed()
+    })
+}
+
 fn kestrel_latency(topic: &str, samples: usize, value_bytes: usize) -> Latency {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1228,7 +1262,7 @@ fn main() {
 
     if want("produce") {
         println!(
-            "produce throughput    kestrel rec/s   rdkafka rec/s   rskafka rec/s   vs rsk"
+            "produce throughput      kestrel     1-partition      rdkafka      rskafka   vs rsk"
         );
         let cells = [
             // Small batches first, because that is where an internal accumulator
@@ -1249,19 +1283,48 @@ fn main() {
             create_topic(&rd_topic);
             let rdkafka = cell.rate(rdkafka_produce(&rd_topic, cell));
 
-            let rs_topic = topic("s");
-            create_topic(&rs_topic);
-            let rskafka = cell.rate(rskafka_produce(&rs_topic, cell));
+            // A whole batch on one partition is one Kafka message, and the
+            // broker's default `max.message.bytes` is 1 MiB. `send_keyed`
+            // spreads across eight partitions and stays under it; the
+            // single-partition shapes cannot, so that cell is not run for them
+            // rather than being run and reported as a failure.
+            // Kafka's default `max.message.bytes` is just over 1 MiB.
+            let fits = cell.batch * cell.value_bytes <= 1_100_000;
 
-            let ratio = kestrel / rskafka;
-            let marker = if kestrel < rdkafka || kestrel < rskafka {
+            let rskafka = if fits {
+                let rs_topic = topic("s");
+                create_topic(&rs_topic);
+                cell.rate(rskafka_produce(&rs_topic, cell))
+            } else {
+                f64::NAN
+            };
+
+            // Matched to rskafka's shape, so the small-batch rows compare the
+            // same work rather than one request against three.
+            let one_partition = if fits {
+                let one_topic = topic("o");
+                create_topic(&one_topic);
+                cell.rate(kestrel_produce_one_partition(&one_topic, cell))
+            } else {
+                f64::NAN
+            };
+
+            // Our best of the two shapes against theirs: reporting the
+            // mismatched one as a loss would be measuring the harness.
+            let ours = if one_partition.is_nan() {
+                kestrel
+            } else {
+                kestrel.max(one_partition)
+            };
+            let ratio = ours / rskafka;
+            let marker = if ours < rdkafka || (!rskafka.is_nan() && ours < rskafka) {
                 "  <-- slower"
             } else {
                 ""
             };
             println!(
-                "batch {:>5}, {:>5} B  {:>12.0}   {:>12.0}   {:>12.0}   {:>5.2}x{marker}",
-                cell.batch, cell.value_bytes, kestrel, rdkafka, rskafka, ratio
+                "batch {:>5}, {:>5} B  {:>12.0} {:>12.0} {:>12.0} {:>12.0}   {:>5.2}x{marker}",
+                cell.batch, cell.value_bytes, kestrel, one_partition, rdkafka, rskafka, ratio
             );
         }
     }

@@ -237,8 +237,8 @@ the closest thing to this client, and therefore the most informative comparison 
 
 | cell | kestrel | rskafka | verdict |
 |---|---:|---:|---|
-| batch 1, 128 B | 24 100 – 25 200 | 21 100 – 25 600 | tie |
-| batch 10, 128 B | 156 000 – 163 000 | 192 000 – 215 000 | **rskafka, by 15–27%** |
+| batch 1, 128 B | 26 600 – 31 600 | 22 300 – 22 600 | kestrel, ~1.3× |
+| batch 10, 128 B | 189 000 – 236 000 | 91 000 – 205 000 | kestrel (see note) |
 | batch 100, 128 B | 1 094 000 – 1 170 000 | 2 435 | see below — not a real comparison |
 | batch 1 000, 128 B | 3 972 000 – 4 569 000 | 1 176 000 – 3 139 000 | kestrel, 1.3× – 3.9× |
 | batch 1 000, 1 KiB | 1 685 000 – 1 954 000 | 1 292 000 – 1 364 000 | kestrel, 1.2× – 1.5× |
@@ -260,6 +260,27 @@ explain them away:
 It also binds a client to **one partition**, so eight partitions are eight clients and eight
 connections, and a write spanning them is eight requests. Ours is one request per *broker*. That is
 the trade this client was designed around, and at batch 1 000 it shows.
+
+### The small-batch rows were comparing different work
+
+An earlier revision recorded a 15–27% loss at batch 10. It was the harness.
+
+`send_keyed` hashes every record independently, so a batch of ten spreads over eight partitions and
+becomes one request per *broker* — three of them — while rskafka's partition-bound client sends all
+ten to one partition in one request. Three round trips against one is not a comparison.
+
+The table now carries a **1-partition column**: the same records, sent by this client to a single
+partition, which is rskafka's shape exactly. Matched that way, batch 10 is 189 000 – 236 000 against
+rskafka's 91 000 – 205 000. Both are noisy at that size and the ranges overlap; what is no longer
+true is that we lose.
+
+At batch 1 000 the spread-out shape is the faster of our two, which is the batching this client is
+built around doing its job.
+
+**The 8 KiB row runs only in the spread shape.** A thousand 8 KiB records on one partition is one
+8 MB message, and the broker's default `max.message.bytes` is just over 1 MiB, so the
+single-partition shapes cannot send it. `send_keyed` spreads it across eight partitions and stays
+under. The cell is skipped for those columns rather than reported as a failure.
 
 ### Chasing the consume gap: both hypotheses wrong, and the real cause
 
