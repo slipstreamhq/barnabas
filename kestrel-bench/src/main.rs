@@ -918,6 +918,54 @@ fn kestrel_consume_tokio(topic: &str, expect: usize) -> Duration {
     })
 }
 
+/// **One consumer per partition**, the shape this client deliberately replaced.
+///
+/// Eight consumers means eight connections and eight `Fetch` requests per
+/// round, against one request per broker for the batched shape. If this is
+/// faster, the consume gap is connection parallelism rather than anything in
+/// the decode path — and the per-broker batching that makes this client cheap
+/// for a broker to serve costs throughput on a bulk read.
+fn kestrel_consume_per_partition(topic: &str, expect: usize) -> Duration {
+    let topic = topic.to_owned();
+    glommio::LocalExecutorBuilder::default()
+        .make()
+        .expect("executor")
+        .run(async move {
+            let mut consumers = Vec::new();
+            for partition in 0..PARTITIONS {
+                let mut consumer = kestrel_glommio::Consumer::assign(
+                    kestrel_glommio::Glommio,
+                    &brokers(),
+                    "bench",
+                    &topic,
+                    partition,
+                    kestrel_glommio::EARLIEST,
+                    kestrel_core::IsolationLevel::ReadCommitted,
+                )
+                .await
+                .expect("consumer");
+                consumer.set_max_wait(Duration::from_millis(100));
+                consumers.push(consumer);
+            }
+
+            let start = Instant::now();
+            let mut seen = 0;
+            while seen < expect {
+                let mut got = 0;
+                for consumer in &mut consumers {
+                    let groups = consumer.fetch().await.expect("fetch");
+                    got += groups.iter().map(|g| g.records.len()).sum::<usize>();
+                }
+                if got == 0 {
+                    break;
+                }
+                seen += got;
+            }
+            assert_eq!(seen, expect, "per-partition consumed {seen} of {expect}");
+            start.elapsed()
+        })
+}
+
 // ── rskafka ──────────────────────────────────────────────────────────────────
 //
 // The other pure-Rust client, and the closest peer to this one: async, no C
@@ -1041,11 +1089,142 @@ fn rskafka_consume(topic: &str, expect: usize) -> Duration {
     })
 }
 
+// ── decode, in isolation ─────────────────────────────────────────────────────
+//
+// No broker, no sockets. One record batch in memory, decoded by both clients,
+// so the per-record cost that the consume cell only hints at can be attributed.
+//
+// The two suspects from profiling the consume gap:
+//   1. `Bytes` refcounting — every key and value is a slice into the fetch
+//      buffer, so a million records is two million atomic increments and as
+//      many decrements. rskafka copies into `Vec<u8>` instead.
+//   2. Struct size — `kafka_protocol`'s `Record` carries producer id, epoch,
+//      sequence, timestamp type, two flags and an `IndexMap` of headers.
+
+/// One record batch, encoded the way a broker would send it.
+fn encoded_batch(count: usize, value_bytes: usize) -> Bytes {
+    use kafka_protocol::records::{
+        Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
+    };
+
+    let value = payload(value_bytes);
+    let records: Vec<Record> = (0..count)
+        .map(|i| Record {
+            transactional: false,
+            control: false,
+            partition_leader_epoch: 0,
+            producer_id: 1,
+            producer_epoch: 0,
+            timestamp_type: TimestampType::Creation,
+            offset: i as i64,
+            sequence: i as i32,
+            timestamp: 0,
+            key: Some(Bytes::from(format!("k{i}"))),
+            value: Some(value.clone()),
+            headers: Default::default(),
+        })
+        .collect();
+
+    let mut buf = bytes::BytesMut::new();
+    RecordBatchEncoder::encode(
+        &mut buf,
+        records.iter(),
+        &RecordEncodeOptions {
+            version: 2,
+            compression: Compression::None,
+        },
+    )
+    .expect("encode");
+    buf.freeze()
+}
+
+fn time<T>(label: &str, iterations: usize, records: usize, mut f: impl FnMut() -> T) {
+    // One untimed pass, so the first-touch page faults and any lazy
+    // initialisation are not charged to the measurement.
+    let _ = f();
+
+    let start = Instant::now();
+    for _ in 0..iterations {
+        std::hint::black_box(f());
+    }
+    let elapsed = start.elapsed();
+    let per_record = elapsed.as_secs_f64() / (iterations * records) as f64;
+    println!(
+        "{label:<34} {:>9.1} ns/record   {:>12.0} records/s",
+        per_record * 1e9,
+        1.0 / per_record
+    );
+}
+
+fn decode_cell() {
+    const COUNT: usize = 1_000;
+    const ITERATIONS: usize = 2_000;
+
+    let batch = encoded_batch(COUNT, 128);
+    println!(
+        "\ndecode in isolation: {COUNT} records x 128 B, {} B on the wire\n",
+        batch.len()
+    );
+
+    // The floor: what the bytes cost to look at at all.
+    time("crc32c over the batch", ITERATIONS, COUNT, || {
+        crc32c::crc32c(&batch)
+    });
+
+    // What this client does today.
+    time("kafka-protocol -> Vec<Record>", ITERATIONS, COUNT, || {
+        let mut cursor = batch.clone();
+        kafka_protocol::records::RecordBatchDecoder::decode(&mut cursor).expect("decode")
+    });
+
+    // What rskafka does, on the same bytes.
+    time("rskafka -> RecordBatch", ITERATIONS, COUNT, || {
+        use rskafka::protocol::traits::ReadType;
+        let mut cursor = std::io::Cursor::new(batch.as_ref());
+        rskafka::protocol::record::RecordBatch::read(&mut cursor).expect("decode")
+    });
+
+    // Suspect 1, isolated: refcounting a slice against copying the same bytes.
+    let decoded = {
+        let mut cursor = batch.clone();
+        kafka_protocol::records::RecordBatchDecoder::decode(&mut cursor)
+            .expect("decode")
+            .records
+    };
+    time("  clone every key+value (Bytes)", ITERATIONS, COUNT, || {
+        let mut sink = Vec::with_capacity(decoded.len());
+        for record in &decoded {
+            sink.push((record.key.clone(), record.value.clone()));
+        }
+        sink
+    });
+    time("  copy every key+value (Vec<u8>)", ITERATIONS, COUNT, || {
+        let mut sink = Vec::with_capacity(decoded.len());
+        for record in &decoded {
+            sink.push((
+                record.key.as_ref().map(|k| k.to_vec()),
+                record.value.as_ref().map(|v| v.to_vec()),
+            ));
+        }
+        sink
+    });
+
+    // Suspect 2, isolated: moving the decoded records once, which is what the
+    // filter used to do unconditionally and what any extra pass costs.
+    time("  move Vec<Record> once", ITERATIONS, COUNT, || {
+        decoded.clone().into_iter().collect::<Vec<_>>()
+    });
+}
+
 fn main() {
     println!(
         "{PARTITIONS} partitions, acks=all, idempotent, RF 1, {} broker(s)\n",
         brokers().len()
     );
+
+    if want("decode") {
+        decode_cell();
+    }
 
     if want("produce") {
         println!(
@@ -1159,6 +1338,12 @@ fn main() {
         create_topic(&rd_topic);
         rdkafka_produce(&rd_topic, &cell);
         let rdkafka_rate = cell.rate(rdkafka_consume(&rd_topic, cell.records));
+
+        let pp_topic = topic("pp");
+        create_topic(&pp_topic);
+        kestrel_produce(&pp_topic, &cell);
+        let pp_rate = cell.rate(kestrel_consume_per_partition(&pp_topic, cell.records));
+        println!("      (kestrel, one consumer per partition: {pp_rate:.0} rec/s)");
 
         let tk_topic = topic("tc");
         create_topic(&tk_topic);

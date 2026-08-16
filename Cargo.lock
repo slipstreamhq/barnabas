@@ -740,6 +740,7 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "chrono",
+ "crc32c",
  "glommio",
  "kafka-protocol",
  "kestrel-client",

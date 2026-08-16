@@ -180,7 +180,7 @@ Measured at 1 M records with **one consumer holding all eight partitions**, so a
 
 | | kestrel rec/s | rdkafka rec/s | ratio |
 |---|---:|---:|---:|
-| 128 B | 2 944 000 – 3 080 000 | 132 000 – 152 000 | **~20×** (against its best) |
+| 128 B | 8 036 000 – 8 464 000 | 132 000 – 152 000 | **~55×** (against its best) |
 
 **The old 200 000-record cell was not measuring throughput.** It was measuring the fixed cost at
 either end of a fetch loop: 200 k gives 1.58 M rec/s, 1 M gives 3.00 M, 2 M gives 3.20 M. The old
@@ -242,7 +242,7 @@ the closest thing to this client, and therefore the most informative comparison 
 | batch 100, 128 B | 1 094 000 – 1 170 000 | 2 435 | see below — not a real comparison |
 | batch 1 000, 128 B | 3 972 000 – 4 569 000 | 1 176 000 – 3 139 000 | kestrel, 1.3× – 3.9× |
 | batch 1 000, 1 KiB | 1 685 000 – 1 954 000 | 1 292 000 – 1 364 000 | kestrel, 1.2× – 1.5× |
-| consume, 128 B | 3 232 000 – 3 259 000 | **4 327 000 – 5 130 000** | **rskafka, by ~35–55%** |
+| consume, 128 B | **8 036 000 – 8 464 000** | 4 573 000 – 5 130 000 | kestrel, 1.6× – 1.8× |
 
 **We are not fastest on every dimension.** rskafka beats us at small batches and, more importantly,
 **beats us on consume by about 45%**. The ~20× consume advantage over librdkafka elsewhere in this
@@ -261,36 +261,44 @@ It also binds a client to **one partition**, so eight partitions are eight clien
 connections, and a write spanning them is eight requests. Ours is one request per *broker*. That is
 the trade this client was designed around, and at batch 1 000 it shows.
 
-### Chasing the consume gap: four hypotheses, two dead
+### Chasing the consume gap: both hypotheses wrong, and the real cause
 
-Measured rather than argued, and two of the obvious answers are wrong.
+Isolating the two suspects in a broker-free microbenchmark (`KESTREL_CELLS=decode`, one record batch
+in memory, both decoders on the same bytes) refuted both of them:
 
-**Instrumented first.** Per 1 M records: this client does **6 polls at 167 000 records each**;
-rskafka does **16 fetches at 62 500 each**. We make *fewer* sequential round trips and still lose, so
-the gap is per-byte CPU, not I/O shape. That killed two hypotheses before either was coded.
+| | ns/record |
+|---|---:|
+| crc32c over the batch — the floor | 13.3 – 14.3 |
+| **kafka-protocol → `Vec<Record>` (ours)** | **66** |
+| **rskafka → `RecordBatch` (theirs)** | **121 – 125** |
+| clone every key+value (`Bytes`, refcounted) | 24.8 – 25.1 |
+| copy every key+value (`Vec<u8>`) | 23.6 – 24.4 |
+| move the decoded `Vec<Record>` once | 32 |
 
-| hypothesis | result |
-|---|---|
-| Reads were 16 KiB chunks into a stack buffer, copying every byte twice — 600+ syscalls for a 10 MiB response | **No effect.** Reads are now sized from the length prefix, which is correct and cheaper in syscalls, but it moved no number. |
-| Fewer, larger fetches would win | **Disproven by measurement** — we already make fewer. |
-| `filter` moved every record into a second `Vec` even when nothing was dropped | **5–8%.** A scan touching three fields per record decides whether anything needs removing, and hands the input back untouched when it does not. Kept. |
-| glommio is the problem | **Eliminated.** The same consumer on tokio: 3 268 000 and 3 274 000 rec/s, against glommio's 3 232 000 – 3 259 000. Identical. The gap is in what this client does per record, not where it runs. |
+**Our decoder is about twice as fast as rskafka's**, and **refcounting a `Bytes` costs the same as
+copying the bytes** at this record size. Both hypotheses in the previous revision of this file were
+wrong, and the "zero-copy is secretly expensive" worry was unfounded.
 
-**Still open, with evidence but untested:**
+That reframed the arithmetic: decoding costs 66 ns/record, but consuming cost 308 ns/record. The
+other 242 ns were not in the decoder at all.
 
-- **Atomic refcount traffic on `Bytes`.** A profile puts `bytes::shared_clone`, `shared_drop` and
-  `bytes_mut::shared_v_clone` at ~7.4% combined. Every record's key and value is a `Bytes` slice into
-  the fetch buffer, so a million records is two million refcount increments and as many decrements —
-  on a thread-per-core executor where nothing else touches those counts. **rskafka copies into
-  `Vec<u8>` instead**, and for 128-byte values a memcpy may well beat two atomic read-modify-writes.
-  The "zero-copy" claim in this file may be costing more than it saves at small record sizes.
-- **The record struct is fat.** `kafka_protocol::records::Record` carries producer id, epoch,
-  sequence, timestamp type, control and transactional flags and an `IndexMap` of headers — roughly
-  160 bytes — where rskafka's carries key, value, headers and timestamp. Materialising a million of
-  those costs regardless of what is in them.
+**The cause was one number used for two budgets.** `max_bytes` was applied both to each partition
+(`partition_max_bytes`) *and* to the whole response (`fetch.max.bytes`), at 10 MiB. One `Fetch` per
+broker carries many partitions, so the response cap was shared between them — while a client that
+fetches each partition on its own connection gets the full budget for each. The test that found it
+was running our own consumer in the shape we had deliberately replaced:
 
-Both point the same way: the decode path materialises too much per record. Testing them means a
-leaner record representation, which is a larger change than anything above and is not attempted here.
+| shape | rec/s |
+|---|---:|
+| one `Fetch` per broker, shared 10 MiB response cap | 3 102 000 – 3 109 000 |
+| one consumer per partition (the shape we replaced) | 8 695 000 – 9 749 000 |
+| **one `Fetch` per broker, 64 MiB response cap** | **8 036 000 – 8 464 000** |
+
+Splitting the two budgets recovers nearly all of it: **consume went from 3.10 M to 8.0–8.5 M
+records/s**, and this client now leads rskafka by 1.6× – 1.8× on the cell it was losing by 45%.
+
+The per-broker batching was never the problem — starving it was. It is still worth one connection
+per broker instead of one per partition.
 
 ### The batch-100 figure is not a comparison
 
@@ -399,8 +407,8 @@ than defended.
   causing.
 - **Whether 25–29 M records/s is our ceiling or the cluster's** is unknown; the other clients are far
   enough below it that only our own number is in question.
-- **Why rskafka still consumes faster** — narrowed to the per-record decode path, with two named
-  suspects and two hypotheses eliminated. See the rskafka section.
+- **Whether 64 MiB is the right response budget.** It was chosen to be clearly larger than the
+  per-partition budget, not tuned; the memory a fetch may hold scales with it.
 - **rskafka has no many-core row.** Its per-partition client shape makes the comparison less direct,
   and it has not been run.
 - **lz4's slowness** is unexplained.

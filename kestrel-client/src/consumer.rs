@@ -102,7 +102,17 @@ pub struct Consumer<T: Transport> {
     positions: BTreeMap<(String, i32), i64>,
     isolation: IsolationLevel,
     max_wait: Duration,
+    /// Per **partition** budget.
     max_bytes: i32,
+    /// Per **response** budget, across every partition in the request.
+    ///
+    /// These were the same number, and that was the whole consume bottleneck.
+    /// One `Fetch` per broker carries many partitions, so a single 10 MiB cap
+    /// on the response is 10 MiB shared between them — while a client that
+    /// fetches each partition separately gets 10 MiB *each*. Measured, the
+    /// per-partition shape was nearly three times faster, which had nothing to
+    /// do with connections or decoding and everything to do with this.
+    max_response_bytes: i32,
     /// One session per broker address.
     sessions: BTreeMap<String, Session>,
     /// Whether to use incremental fetch at all. On by default; a caller with a
@@ -146,6 +156,7 @@ impl<T: Transport> Consumer<T> {
             isolation,
             max_wait: Duration::from_millis(500),
             max_bytes: 10 * 1024 * 1024,
+            max_response_bytes: 64 * 1024 * 1024,
             sessions: BTreeMap::new(),
             incremental: true,
             outstanding: None,
@@ -680,7 +691,7 @@ impl<T: Transport> Consumer<T> {
         req.replica_id = BrokerId(-1);
         req.max_wait_ms = i32::try_from(self.max_wait.as_millis()).unwrap_or(i32::MAX);
         req.min_bytes = 1;
-        req.max_bytes = self.max_bytes;
+        req.max_bytes = self.max_response_bytes;
         req.isolation_level = self.isolation.as_i8();
         req.topics = topics;
         if self.incremental {
