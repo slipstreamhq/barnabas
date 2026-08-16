@@ -38,6 +38,15 @@ pub const LATEST: i64 = -1;
 /// How many times a request is retried when the broker says leadership moved.
 const MAX_LEADER_RETRIES: usize = 5;
 
+/// How long to wait before asking again after a leadership answer that said
+/// "not yet".
+///
+/// Refreshing metadata and retrying *immediately* asks the same question of the
+/// same not-yet-propagated cluster state, so five attempts cost five round
+/// trips and learn nothing. Assigning a consumer to a topic created moments ago
+/// failed for exactly this reason.
+const LEADER_BACKOFF: Duration = Duration::from_millis(100);
+
 /// The broker forgot our fetch session, or our epoch is stale. Both mean
 /// "start again with a full fetch" rather than "fail".
 const FETCH_SESSION_ID_NOT_FOUND: i16 = 70;
@@ -288,7 +297,21 @@ impl<T: Transport> Consumer<T> {
         req.topics = vec![req_topic];
 
         for attempt in 0..=MAX_LEADER_RETRIES {
-            let addr = self.cluster.leader_addr(topic, partition).await?;
+            // A partition mid-election has no leader *yet*. That is a wait, not
+            // a failure — the producer has always treated it that way, and a
+            // consumer assigned to a topic created a moment ago hit the other
+            // behaviour and simply failed.
+            let addr = match self.cluster.leader_addr(topic, partition).await {
+                Ok(addr) => addr,
+                Err(e @ Error::NoLeader { .. }) => {
+                    if attempt == MAX_LEADER_RETRIES {
+                        return Err(e);
+                    }
+                    T::sleep(LEADER_BACKOFF).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let resp: ListOffsetsResponse = self
                 .cluster
                 .call_at(&addr, ApiKey::ListOffsets, 7, &req)
@@ -312,6 +335,7 @@ impl<T: Transport> Consumer<T> {
                     });
                 }
                 self.cluster.refresh_metadata(topic).await?;
+                T::sleep(LEADER_BACKOFF).await;
                 continue;
             }
             check("ListOffsets", found.error_code)?;
@@ -463,6 +487,7 @@ impl<T: Transport> Consumer<T> {
             for topic in topics {
                 self.cluster.refresh_metadata(&topic).await?;
             }
+            T::sleep(LEADER_BACKOFF).await;
         }
         unreachable!("the loop returns on its last attempt")
     }

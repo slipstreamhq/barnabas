@@ -42,7 +42,19 @@ use crate::{Error, Result, Transport};
 /// Bounded rather than unbounded: a coordinator that never settles is a cluster
 /// problem, and spinning silently is worse than surfacing it.
 const MAX_RETRIES: usize = 40;
-const RETRY_BACKOFF: Duration = Duration::from_millis(250);
+
+/// The first retry waits this long; each further one doubles, up to
+/// [`RETRY_BACKOFF_MAX`].
+///
+/// **It used to be a flat 250 ms on the first attempt**, which is a very long
+/// time to wait for something that is usually over in a millisecond — a
+/// partition mid-election, a broker briefly behind. One such retry inside a
+/// 400 000-record run cut the measured rate by six, and it was the cause of the
+/// 8-core "collapse" in PERF.md that went unexplained for two revisions. The
+/// `attempt` argument was already threaded through every call site and then
+/// ignored by the function that received it.
+const RETRY_BACKOFF: Duration = Duration::from_millis(5);
+const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(250);
 
 /// A record to produce. Deliberately not `kafka_protocol`'s `Record`: sequence
 /// numbers, producer id and epoch are the producer's to set, and letting a
@@ -213,8 +225,13 @@ impl<T: Transport> Producer<T> {
         }
     }
 
-    async fn backoff(_attempt: usize) {
-        T::sleep(RETRY_BACKOFF).await;
+    /// Exponential, capped: 5 ms, 10, 20, … 250, 250, …
+    async fn backoff(attempt: usize) {
+        let shift = u32::try_from(attempt).unwrap_or(u32::MAX).min(16);
+        let delay = RETRY_BACKOFF
+            .saturating_mul(1u32 << shift)
+            .min(RETRY_BACKOFF_MAX);
+        T::sleep(delay).await;
     }
 
     /// Send a coordinator request, honouring the disposition of whatever comes
