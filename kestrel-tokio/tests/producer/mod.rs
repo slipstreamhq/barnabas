@@ -46,6 +46,11 @@ pub struct TestProducer {
     /// The transaction coordinator's own connection. See
     /// [`Self::call_coordinator`].
     coordinator: Option<(TcpStream, Connection)>,
+    /// What the broker said it speaks, per API key. Scaffolding needs this for
+    /// the same reason the client does: a broker that does not know the version
+    /// asked for may simply close the connection, and then every test fails
+    /// with an unexplained EOF.
+    versions: std::collections::HashMap<i16, (i16, i16)>,
     topic: String,
     txn_id: String,
     producer_id: ProducerId,
@@ -87,16 +92,38 @@ impl TestProducer {
     pub async fn connect(addr: &str, topic: &str) -> Self {
         let stream = TcpStream::connect(addr).await.expect("connect");
         let txn_id = format!("{topic}-txn");
-        Self {
+        let mut me = Self {
             stream,
             conn: Connection::new(StrBytes::from_static_str("kestrel-test-producer")),
             addr: addr.to_owned(),
             coordinator: None,
+            versions: std::collections::HashMap::new(),
             topic: topic.to_owned(),
             txn_id,
             producer_id: ProducerId(-1),
             producer_epoch: -1,
             next_sequence: 0,
+        };
+        me.learn_versions().await;
+        me
+    }
+
+    /// Ask the broker what it speaks, so requests can be sent at a version it
+    /// accepts rather than at whatever this file was written against.
+    async fn learn_versions(&mut self) {
+        let req = kafka_protocol::messages::ApiVersionsRequest::default();
+        let resp: kafka_protocol::messages::ApiVersionsResponse =
+            exchange(&mut self.stream, &mut self.conn, ApiKey::ApiVersions, 3, &req).await;
+        for api in &resp.api_keys {
+            self.versions
+                .insert(api.api_key, (api.min_version, api.max_version));
+        }
+    }
+
+    fn negotiated(&self, api_key: ApiKey, preferred: i16) -> i16 {
+        match self.versions.get(&(api_key as i16)) {
+            Some((min, max)) => preferred.clamp(*min, *max),
+            None => preferred,
         }
     }
 
@@ -105,6 +132,7 @@ impl TestProducer {
         Req: kafka_protocol::protocol::Encodable,
         Resp: kafka_protocol::protocol::Decodable,
     {
+        let version = self.negotiated(api_key, version);
         exchange(&mut self.stream, &mut self.conn, api_key, version, req).await
     }
 
@@ -127,6 +155,7 @@ impl TestProducer {
         Req: kafka_protocol::protocol::Encodable,
         Resp: kafka_protocol::protocol::Decodable,
     {
+        let version = self.negotiated(api_key, version);
         let (stream, conn) = self
             .coordinator
             .as_mut()

@@ -141,3 +141,21 @@ they do:
 - **Error codes are states, not failures.** A cold cluster answers 15, then 14, then 16 — the last
   *after* a successful `FindCoordinator`. `CONCURRENT_TRANSACTIONS` (51) appears whenever a
   transaction starts right after one ends. See `ErrorCode::disposition`.
+
+## Brokers
+
+`./cluster.sh up` brings up three Apache Kafka brokers (KRaft, no ZooKeeper);
+`./cluster.sh up redpanda` brings up three Redpanda brokers on the same ports,
+so `KAFKA_BOOTSTRAP` does not change. `./cluster.sh down` removes either.
+
+**Redpanda is worth running.** It is an independent implementation of the same
+wire protocol, so it catches assumptions about *Apache Kafka's behaviour* that a
+second Kafka never would. It found one immediately: this client performed the
+`ApiVersions` handshake at connect and then ignored the answer, sending every
+request at a hardcoded version. That works against Kafka, whose versions those
+are. Redpanda answers a version it does not know by **closing the connection**,
+so the symptom was an unexplained EOF at connect rather than an error code.
+
+Requests now go out at the newest version the broker admits to supporting,
+clamped to what this client knows how to read. The full suite passes against
+both.

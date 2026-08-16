@@ -8,9 +8,16 @@
 # make this a real deployment — still one machine, still loopback — but they do
 # spread partition leadership, which is the specific thing that was missing.
 #
-#   ./cluster.sh up      3 brokers, KRaft, no ZooKeeper
-#   ./cluster.sh down    remove them and the network
-#   ./cluster.sh ports   print the bootstrap string
+#   ./cluster.sh up            3 Kafka brokers, KRaft, no ZooKeeper
+#   ./cluster.sh up redpanda   3 Redpanda brokers instead
+#   ./cluster.sh down          remove them and the network
+#   ./cluster.sh ports         print the bootstrap string
+#
+# **Redpanda is a second implementation of the same wire protocol**, which makes
+# it a far better compatibility test than a second Kafka would be: it catches
+# places where this client has quietly encoded an assumption about Apache
+# Kafka's behaviour rather than about the protocol. Same host ports either way,
+# so `KAFKA_BOOTSTRAP` does not change.
 #
 # Replication factor stays 1 for topics the bench creates (see kestrel-bench):
 # the question is whether the client scales across cores, and RF=3 would add
@@ -18,6 +25,7 @@
 set -euo pipefail
 
 IMAGE="${KAFKA_IMAGE:-docker.io/apache/kafka:3.9.0}"
+REDPANDA_IMAGE="${REDPANDA_IMAGE:-docker.io/redpandadata/redpanda:v24.2.7}"
 NET=kestrel-net
 # Fixed, so a rerun is reproducible and a stale volume is obviously stale.
 CLUSTER_ID="${KAFKA_CLUSTER_ID:-5L6g3nShT-eMCtK--X86sw}"
@@ -35,6 +43,56 @@ voters() {
     out="$out$i@kafka$i:9093"
   done
   echo "$out"
+}
+
+# Every container this script might have made, whichever flavour.
+all_names() {
+  for i in $(seq 1 $NODES); do echo "kafka$i"; echo "redpanda$i"; done
+}
+
+up_redpanda() {
+  podman network exists "$NET" || podman network create "$NET" >/dev/null
+  local seeds=""
+  for i in $(seq 1 $NODES); do
+    [ -n "$seeds" ] && seeds="$seeds,"
+    seeds="${seeds}redpanda$i:33145"
+  done
+
+  for i in $(seq 1 $NODES); do
+    local port
+    port=$(host_port "$i")
+    podman rm -f "redpanda$i" >/dev/null 2>&1 || true
+    # Node ids are 0-based here, unlike Kafka's.
+    podman run -d --name "redpanda$i" --network "$NET" \
+      -p "$port:19092" \
+      "$REDPANDA_IMAGE" \
+      redpanda start \
+        --node-id "$((i - 1))" \
+        --mode dev-container \
+        --smp 1 \
+        --default-log-level=warn \
+        --kafka-addr "INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:19092" \
+        --advertise-kafka-addr "INTERNAL://redpanda$i:9092,EXTERNAL://127.0.0.1:$port" \
+        --rpc-addr "redpanda$i:33145" \
+        --advertise-rpc-addr "redpanda$i:33145" \
+        --seeds "$seeds" >/dev/null
+    echo "redpanda$i on 127.0.0.1:$port"
+  done
+
+  echo -n "waiting for quorum"
+  for _ in $(seq 1 90); do
+    if [ "$(podman exec redpanda1 rpk cluster info --brokers redpanda1:9092 2>/dev/null \
+        | grep -cE '^[0-9]+\*?[[:space:]]')" = "$NODES" ]; then
+      echo " ok"
+      ports
+      return 0
+    fi
+    echo -n .
+    sleep 1
+  done
+  echo " timed out"
+  podman logs --tail 40 redpanda1
+  return 1
 }
 
 up() {
@@ -85,7 +143,7 @@ up() {
 }
 
 down() {
-  for i in $(seq 1 $NODES); do podman rm -f "kafka$i" >/dev/null 2>&1 || true; done
+  for name in $(all_names); do podman rm -f "$name" >/dev/null 2>&1 || true; done
   podman network rm "$NET" >/dev/null 2>&1 || true
   echo "removed"
 }
@@ -100,8 +158,14 @@ ports() {
 }
 
 case "${1:-up}" in
-  up) up ;;
+  up)
+    case "${2:-kafka}" in
+      kafka) up ;;
+      redpanda) up_redpanda ;;
+      *) echo "usage: $0 up {kafka|redpanda}" >&2; exit 2 ;;
+    esac
+    ;;
   down) down ;;
   ports) ports ;;
-  *) echo "usage: $0 {up|down|ports}" >&2; exit 2 ;;
+  *) echo "usage: $0 {up [kafka|redpanda]|down|ports}" >&2; exit 2 ;;
 esac

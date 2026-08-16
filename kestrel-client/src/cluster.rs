@@ -20,7 +20,7 @@
 //! one request — which is strictly better than a client per *partition*, the
 //! shape a wrapper around a threaded C client forces.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use kafka_protocol::messages::{
@@ -48,6 +48,16 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) struct Broker<T: Transport> {
     stream: T::Stream,
     conn: Connection,
+    /// What this broker said it speaks, per API key: `(min, max)`.
+    ///
+    /// **The point of the `ApiVersions` handshake, which this client used to
+    /// perform and then ignore.** Every request went out at a hardcoded
+    /// version, which works against Apache Kafka because those versions happen
+    /// to be the ones it supports — and fails immediately against anything
+    /// else. Redpanda, for one, answers a version it does not know by *closing
+    /// the connection*, so the symptom is an unexplained EOF at connect rather
+    /// than an error code.
+    versions: BTreeMap<i16, (i16, i16)>,
 }
 
 impl<T: Transport> Broker<T> {
@@ -67,6 +77,7 @@ impl<T: Transport> Broker<T> {
         let mut me = Self {
             stream,
             conn: Connection::new(StrBytes::from_string(client_id.to_owned())),
+            versions: BTreeMap::new(),
         };
 
         // `ApiVersions` first, as every client does: an unsupported version
@@ -76,6 +87,10 @@ impl<T: Transport> Broker<T> {
         req.client_software_version = StrBytes::from_static_str("0.0.1");
         let resp: ApiVersionsResponse = me.call(ApiKey::ApiVersions, 3, &req).await?;
         check("ApiVersions", resp.error_code)?;
+        for api in &resp.api_keys {
+            me.versions
+                .insert(api.api_key, (api.min_version, api.max_version));
+        }
 
         // Authentication comes after `ApiVersions` and before anything else: a
         // broker on a SASL listener rejects every other request until it has
@@ -185,6 +200,20 @@ impl<T: Transport> Broker<T> {
         self.recv().await
     }
 
+    /// The version to actually send, given what this broker supports.
+    ///
+    /// Callers name the version they *prefer* — the newest this client knows
+    /// how to read. If the broker caps lower, the request goes out at its
+    /// maximum; if the broker requires newer, at its minimum. An API the broker
+    /// did not mention is sent as asked, which keeps behaviour unchanged
+    /// against a broker whose `ApiVersions` says nothing useful.
+    fn negotiated(&self, api_key: ApiKey, preferred: i16) -> i16 {
+        match self.versions.get(&(api_key as i16)) {
+            Some((min, max)) => preferred.clamp(*min, *max),
+            None => preferred,
+        }
+    }
+
     /// Write a request and **do not wait for it**.
     ///
     /// The half of `call` that makes a request outstanding. Kafka answers a
@@ -198,6 +227,7 @@ impl<T: Transport> Broker<T> {
         version: i16,
         req: &Req,
     ) -> Result<()> {
+        let version = self.negotiated(api_key, version);
         let wire = self.conn.request(api_key, version, req)?;
         T::write_all(&mut self.stream, &wire).await?;
         Ok(())
