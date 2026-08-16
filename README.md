@@ -68,10 +68,21 @@ Both properties were mutation-proved: resetting sequences per transaction fails
 
 ## Performance
 
-Measured, not asserted — `PERF.md` has the numbers, the machine, and what they do not say. On one
-local broker, 256 B records, `acks=all`: **~2.2M records/s produced** and **~5.3M consumed**,
-against **~350k** each for `rdkafka` given its best configuration. The consume comparison is partly
-an API difference (batch-at-a-time versus message-at-a-time) and is labelled as such.
+Measured across a matrix, not a headline — `PERF.md` has every cell, the machine, the variance, and
+what is still unmeasured. Against `rdkafka` on one local broker, using **its best observed number**
+for every ratio:
+
+| | kestrel | rdkafka |
+|---|---:|---:|
+| produce, batch 1 000 × 128 B | 3.3–3.8 M rec/s | 313–338 k rec/s |
+| produce, batch 1 × 128 B | 10–33 k rec/s | ~9.8 k rec/s |
+| produce latency p50 / p99 | 0.04 / 0.07 ms | 0.05 / 0.09 ms |
+| produce latency **max** | **1.7–2.0 ms** | **502–504 ms** |
+| consume, 128 B | 5.9–7.1 M rec/s | 123–327 k rec/s |
+
+The consume gap is partly an API difference (batch-at-a-time versus message-at-a-time) and is
+labelled as such in `PERF.md`, along with two fairness mistakes that were found and corrected while
+writing it.
 
 ```sh
 cargo run -p kestrel-bench --release        # needs a broker

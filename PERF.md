@@ -1,62 +1,86 @@
 # Measurements
 
-Numbers from `cargo run -p kestrel-bench --release`, 2026-08-16. Reproduce them before believing
-them; the harness is 350 lines and prints its own parameters.
+`cargo run -p kestrel-bench --release`, 2026-08-16. Reproduce before believing; the harness prints
+its own parameters and asserts that every run handled every record before dividing.
 
 **Machine:** AMD Ryzen Threadripper PRO 9975WX (32 cores / 64 threads), Linux 7.1.8, one local
 `apache/kafka:3.9.0` broker over loopback.
-**Workload:** 200 000 records × 256 B, batches of 1 000, 8 partitions, `acks=all`, idempotent
-producer, no compression.
+**Common to every cell:** 8 partitions, `acks=all`, idempotent producer, no compression.
+**Ranges are across 3–5 runs. Every ratio uses `rdkafka`'s *best* observed number**, so the
+comparison errs against us.
 
-| | records/s | MiB/s |
+## Produce throughput
+
+| batch | record | kestrel rec/s | rdkafka rec/s | ratio |
+|---:|---:|---:|---:|---:|
+| 1 | 128 B | 10 400 – 32 900 | 9 830 – 9 860 | 1.1× – 3.3× |
+| 10 | 128 B | 98 700 – 156 000 | 39 100 – 39 200 | 2.5× – 4.0× |
+| 100 | 128 B | 968 000 – 1 251 000 | 176 000 – 183 000 | 5.3× – 6.8× |
+| 1 000 | 128 B | 3 343 000 – 3 806 000 | 313 000 – 338 000 | 9.9× – 11.3× |
+| 1 000 | 1 KiB | 1 056 000 – 1 150 000 | 314 000 – 329 000 | 3.2× – 3.5× |
+| 1 000 | 8 KiB | 168 000 – 245 000 | 62 000 – 81 000 | 2.1× – 3.0× |
+
+The batch-1 row has the widest spread and the first run of a process is always its slowest — that
+cell is dominated by warm-up, not by steady state.
+
+## Produce latency, one record at a time
+
+| | kestrel | rdkafka |
 |---|---:|---:|
-| kestrel produce (glommio) | 2 190 000 – 2 350 000 | 536 – 573 |
-| kestrel produce (tokio) | 2 170 000 – 2 280 000 | 529 – 556 |
-| rdkafka produce (tokio) | 341 000 – 352 000 | 83 – 86 |
-| kestrel consume (glommio) | 5 330 000 – 5 650 000 | 1 301 – 1 379 |
-| rdkafka consume (tokio) | 311 000 – 349 000 | 76 – 85 |
+| p50 | 0.041 – 0.045 ms | 0.051 – 0.053 ms |
+| p99 | 0.065 – 0.082 ms | 0.084 – 0.096 ms |
+| max | 1.7 – 2.0 ms | **502 – 504 ms** |
 
-Three consecutive runs; the ranges are the spread. One rdkafka consume run came in at 124 000
-rec/s — a 3× outlier with no obvious cause, which is itself worth knowing.
+The maximum is the interesting column. A half-second worst case in librdkafka is reproducible
+across every run; ours is under 2 ms. For anything user-facing, the tail is the number that
+matters, and this is a three-orders-of-magnitude difference in it.
 
-## How the comparison was made fair
+## Consume throughput
 
-**librdkafka is configured for its best case, not its defaults.** With defaults it produced
-116 000 rec/s, and the first draft of this file would have claimed 16×. That number was its 5 ms
-linger interacting with the harness awaiting each batch, not its speed. It now runs with
-`linger.ms=0`, a 1 MiB batch size, 10 000-message batches and a large output queue, **and every
-record is enqueued before anything is awaited**, so its accumulator chooses its own batch
-boundaries rather than being flushed by us. That tripled it.
+| record | kestrel rec/s | rdkafka rec/s | ratio |
+|---:|---:|---:|---:|
+| 128 B | 5 919 000 – 7 129 000 | 123 000 – 327 000 | **21.7×** (against its best) |
 
-If there is a further configuration that closes the gap, this file is wrong and should be corrected rather
+**`rdkafka`'s consumer is bimodal here** — roughly 125k or roughly 330k, with no configuration
+change between runs. The ratio above uses the fast mode; against the slow mode it would read 55×,
+which is why the range is printed rather than a single figure.
+
+Part of this gap is an API difference and should be read as such: `kestrel` returns a whole batch
+per `fetch()`, `rdkafka`'s `StreamConsumer` returns one message per `await`. That per-message
+wakeup is a real cost of that API, not evidence about librdkafka's decoder.
+
+## Two fairness mistakes, both mine, both corrected
+
+Recorded because a benchmark's credibility is mostly its author's willingness to write these down.
+
+1. **librdkafka's producer ran on defaults.** Its 5 ms linger interacted with the harness awaiting
+   each batch and produced 116 000 rec/s — a number that would have supported a "16×" headline.
+   Configured properly (`linger.ms=0`, 1 MiB batches, large queue) and with every record enqueued
+   before anything is awaited, it tripled to ~340 000.
+2. **Then I "tuned" its consumer and made it worse.** Setting `fetch.min.bytes=1 MiB` and
+   `fetch.wait.max.ms=100` cut it from ~330k to ~125k — a 2.6× handicap I had introduced while
+   trying to help it. It now runs on librdkafka's own defaults.
+
+If a further configuration closes any gap here, this file is wrong and should be corrected rather
 than defended.
 
-## What these numbers do not say
+## What is still unmeasured
 
-- **The consume comparison is partly an API difference.** `kestrel`'s consumer returns a whole
-  batch per `fetch()`; `rdkafka`'s `StreamConsumer` returns one message per `await`, and that
-  per-message wakeup is a real cost of that API rather than of librdkafka's decoding. Read the
-  consume row as "batch-at-a-time beats message-at-a-time", which is a design claim, not a
-  decoder claim.
-- **One process, one broker, loopback.** No network, no replication beyond one node, no
-  contention. This excludes the case a per-core client is built for — many cores each owning
-  partitions — so it is a floor rather than a ceiling.
-- **No latency numbers at all.** Throughput with `acks=all` at batch 1 000 says nothing about
-  p99 for a single record, which is the number a request/response service cares about.
-- **The consumer is still one connection and one `Fetch` per partition.** Multi-partition fetch
-  and fetch sessions (KIP-227) are unbuilt, so the consume figure should improve — and the
-  connection count should fall — when they land.
+- **No multi-broker cluster**, no replication beyond one node, no real network. Loopback removes
+  the variable that usually dominates.
+- **No many-core run.** Everything above is one process; the case a per-core client is built for —
+  each core owning partitions — is not represented at all.
+- **No consume latency**, only throughput.
+- **No compression cells**, though all four codecs round-trip correctly in the test suite.
+- **No sustained run.** These are seconds-long bursts; nothing here says what happens after an hour,
+  or how memory behaves under backpressure.
 
-## Why the produce numbers are what they are
+## Why produce is fast
 
-Both clients do the same protocol work; the difference is round trips and copies.
-
-- **One `Produce` per broker, not per partition.** Eight partitions on one broker travel in one
-  request. This landed in `perf(kestrel): one request per broker, not per partition` and is the
-  single largest structural difference.
-- **Batches are encoded once** and re-sent byte-identically on retry, so a retry costs a write,
-  not a re-encode.
-- **Zero-copy on the read path**: record values are `Bytes` slices into the fetch buffer rather
-  than per-record allocations.
-- No C library, no thread hop: on the glommio arm every request is io_uring on the core that owns
-  the partition.
+- **One `Produce` per broker, not per partition** — eight partitions on one broker travel in one
+  request.
+- **Batches are encoded once** and re-sent byte-identically on retry, so a retry costs a write, not
+  a re-encode.
+- **Zero-copy reads**: record values are `Bytes` slices into the fetch buffer.
+- No C library and no thread hop; on glommio every request is io_uring on the core that owns the
+  partition.
