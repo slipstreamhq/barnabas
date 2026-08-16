@@ -771,8 +771,12 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "crc32c",
+ "flate2",
  "kafka-protocol",
+ "lz4",
+ "snap",
  "thiserror 2.0.20",
+ "zstd",
 ]
 
 [[package]]

@@ -857,15 +857,15 @@ pub struct LeanFetched {
 impl<T: Transport> Consumer<T> {
     /// As [`Self::fetch`], without building a record per record.
     ///
-    /// **Experimental, and deliberately a second method rather than a change to
-    /// the first.** Two things differ for a caller: records carry no headers,
-    /// and a key or value is materialised by asking the batch for it
-    /// ([`LeanBatch::value`]) rather than being built up front.
+    /// **Deliberately a second method rather than a change to the first**, for
+    /// now: it returns batches rather than a flat list of records, so adopting
+    /// it is a caller-visible change. A key, value or header list is
+    /// materialised by asking the batch for it ([`LeanBatch::value`]) rather
+    /// than being built up front.
     ///
-    /// Falls back to the ordinary decoder for anything
-    /// [`kestrel_core::records::decode_lean`] hands back — a compressed batch,
-    /// or one carrying headers — so the result is correct either way, at the
-    /// old cost for those.
+    /// All four compression codecs and record headers are handled; only a
+    /// pre-magic-2 batch falls back to the ordinary decoder, and then only that
+    /// partition pays the old cost.
     ///
     /// Filtering happens **per batch** here rather than per record, which it
     /// can because `transactional`, `control` and `producer_id` are batch-level
@@ -931,8 +931,10 @@ impl<T: Transport> Consumer<T> {
                     };
 
                     let Some(decoded) = kestrel_core::records::decode_lean(&bytes)? else {
-                        // Compressed, or carrying headers: the ordinary decoder
-                        // handles it, and this partition pays the old price.
+                        // Only a pre-magic-2 batch reaches this now: compression
+                        // and headers are both handled. Kept because a broker
+                        // holding very old data can still serve it, and being
+                        // wrong here means bad records rather than an error.
                         let records = decode_records(bytes)?;
                         let aborted = aborted_of(part);
                         let Fetched {

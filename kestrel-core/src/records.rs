@@ -23,10 +23,10 @@
 //!
 //! # What it does not do
 //!
-//! Falls back — returns `None` — for anything but an uncompressed magic-2
-//! batch, and **does not expose headers**. Both are deliberate for now: this is
-//! the fast path for the common case, with `kafka_protocol` still handling
-//! everything else, rather than a full reimplementation of the format.
+//! Falls back — returns `None` — only for a batch that is not magic 2. All four
+//! compression codecs and record headers are handled: compressed records are
+//! decompressed into a buffer the batch then owns, and headers are recorded as
+//! a byte range and parsed on demand.
 
 use bytes::Bytes;
 
@@ -55,6 +55,14 @@ pub struct LeanRecord {
     pub timestamp: i64,
     key: (u32, u32),
     value: (u32, u32),
+    /// The header block: where it is, how many, and *not* what it contains.
+    ///
+    /// Headers are variable in number, so holding them inline would put a
+    /// `Vec` in every record and undo the point of this type. Holding the
+    /// region and its count costs eight bytes and nothing at all unless a
+    /// caller asks for them.
+    headers: (u32, u32),
+    header_count: u32,
 }
 
 /// One batch, with the facts that belong to the batch held once.
@@ -91,12 +99,55 @@ impl LeanBatch {
         self.slice(record.value)
     }
 
+    /// `u32::MAX` marks absent, which is how the format distinguishes a null
+    /// key from an empty one.
     fn slice(&self, (at, len): (u32, u32)) -> Option<Bytes> {
-        if len == 0 && at == 0 {
+        if at == u32::MAX {
             return None;
         }
         let at = at as usize;
         Some(self.buffer.slice(at..at + len as usize))
+    }
+
+    /// This record's headers, parsed on demand.
+    ///
+    /// Returns an empty vector when there are none, which is the common case
+    /// and costs nothing — the region was never touched at decode time.
+    ///
+    /// # Errors
+    /// [`Error::Codec`] if the header block is malformed.
+    pub fn headers(&self, record: &LeanRecord) -> Result<Vec<(Bytes, Option<Bytes>)>> {
+        if record.header_count == 0 {
+            return Ok(Vec::new());
+        }
+        let at = record.headers.0 as usize;
+        let end = at + record.headers.1 as usize;
+        let block = self
+            .buffer
+            .get(at..end)
+            .ok_or_else(|| Error::Codec("header block".to_owned()))?;
+
+        let mut out = Vec::with_capacity(record.header_count as usize);
+        let mut pos = 0usize;
+        for _ in 0..record.header_count {
+            let key_len = varint(block, &mut pos)
+                .ok_or_else(|| Error::Codec("header key length".to_owned()))?;
+            let key_at = at + pos;
+            let key_len = key_len.max(0) as usize;
+            pos += key_len;
+
+            let value_len = varint(block, &mut pos)
+                .ok_or_else(|| Error::Codec("header value length".to_owned()))?;
+            let value = if value_len >= 0 {
+                let value_at = at + pos;
+                pos += value_len as usize;
+                Some(self.buffer.slice(value_at..value_at + value_len as usize))
+            } else {
+                None
+            };
+            out.push((self.buffer.slice(key_at..key_at + key_len), value));
+        }
+        Ok(out)
     }
 
     /// The control-marker type, for a control batch. 0 is abort.
@@ -181,14 +232,9 @@ pub fn decode_lean(buffer: &Bytes) -> Result<Option<Vec<LeanBatch>>> {
         }
         let attributes = i16_at(batch, field::ATTRIBUTES)
             .ok_or_else(|| Error::Codec("batch attributes".to_owned()))?;
-        if attributes & 0x07 != 0 {
-            // Compressed: the records are behind a codec, and decompression is
-            // exactly the case this reader hands back.
-            return Ok(None);
-        }
 
-        let expected = i32_at(batch, field::CRC)
-            .ok_or_else(|| Error::Codec("batch crc".to_owned()))? as u32;
+        let expected =
+            i32_at(batch, field::CRC).ok_or_else(|| Error::Codec("batch crc".to_owned()))? as u32;
         let actual = crc32c::crc32c(&batch[field::CRC_FROM..]);
         if expected != actual {
             return Err(Error::Codec(format!(
@@ -206,63 +252,74 @@ pub fn decode_lean(buffer: &Bytes) -> Result<Option<Vec<LeanBatch>>> {
             .ok_or_else(|| Error::Codec("record count".to_owned()))?
             .max(0) as usize;
 
+        // **The records section, however it arrived.** Uncompressed, it is a
+        // slice of the response buffer and nothing is copied. Compressed, it is
+        // the decompressed bytes — one allocation per batch, which the codec
+        // requires and which `kafka_protocol` pays too. Everything below parses
+        // the same way either way, because ranges are relative to this and the
+        // batch holds it.
+        let body: Bytes = match attributes & 0x07 {
+            0 => buffer.slice(at + field::HEADER_LEN..end),
+            codec => decompress(codec, &batch[field::HEADER_LEN..])?,
+        };
+
         let mut records = Vec::with_capacity(count);
-        let mut pos = field::HEADER_LEN;
+        let mut pos = 0usize;
         for _ in 0..count {
-            let record_start = pos;
-            let Some(len) = varint(batch, &mut pos) else {
+            let Some(len) = varint(&body, &mut pos) else {
                 return Err(Error::Codec("record length".to_owned()));
             };
             let record_end = pos + len.max(0) as usize;
-            if record_end > batch.len() {
+            if record_end > body.len() {
                 return Err(Error::Codec("record overruns its batch".to_owned()));
             }
-            let _ = record_start;
 
             pos += 1; // per-record attributes, unused in the format
             let timestamp_delta =
-                varint(batch, &mut pos).ok_or_else(|| Error::Codec("timestamp delta".to_owned()))?;
+                varint(&body, &mut pos).ok_or_else(|| Error::Codec("timestamp delta".to_owned()))?;
             let offset_delta =
-                varint(batch, &mut pos).ok_or_else(|| Error::Codec("offset delta".to_owned()))?;
+                varint(&body, &mut pos).ok_or_else(|| Error::Codec("offset delta".to_owned()))?;
 
             let key_len =
-                varint(batch, &mut pos).ok_or_else(|| Error::Codec("key length".to_owned()))?;
-            let key = if key_len > 0 {
-                let range = ((at + pos) as u32, key_len as u32);
+                varint(&body, &mut pos).ok_or_else(|| Error::Codec("key length".to_owned()))?;
+            let key = if key_len >= 0 {
+                let range = (pos as u32, key_len as u32);
                 pos += key_len as usize;
                 range
             } else {
-                (0, 0)
+                (u32::MAX, 0)
             };
 
             let value_len =
-                varint(batch, &mut pos).ok_or_else(|| Error::Codec("value length".to_owned()))?;
-            let value = if value_len > 0 {
-                let range = ((at + pos) as u32, value_len as u32);
+                varint(&body, &mut pos).ok_or_else(|| Error::Codec("value length".to_owned()))?;
+            let value = if value_len >= 0 {
+                let range = (pos as u32, value_len as u32);
                 pos += value_len as usize;
                 range
             } else {
-                (0, 0)
+                (u32::MAX, 0)
             };
 
-            // Headers are the one thing this reader will not silently drop.
-            let headers =
-                varint(batch, &mut pos).ok_or_else(|| Error::Codec("header count".to_owned()))?;
-            if headers > 0 {
-                return Ok(None);
-            }
+            // The header block is recorded, not parsed. See
+            // [`LeanBatch::headers`].
+            let header_count = varint(&body, &mut pos)
+                .ok_or_else(|| Error::Codec("header count".to_owned()))?
+                .max(0) as u32;
+            let headers = (pos as u32, record_end.saturating_sub(pos) as u32);
 
             records.push(LeanRecord {
                 offset: base_offset + offset_delta,
                 timestamp: base_timestamp + timestamp_delta,
                 key,
                 value,
+                headers,
+                header_count,
             });
             pos = record_end;
         }
 
         batches.push(LeanBatch {
-            buffer: buffer.clone(),
+            buffer: body,
             base_offset,
             producer_id,
             transactional: attributes & 0x10 != 0,
@@ -273,6 +330,72 @@ pub fn decode_lean(buffer: &Bytes) -> Result<Option<Vec<LeanBatch>>> {
     }
 
     Ok(Some(batches))
+}
+
+/// Kafka's snappy is **xerial-framed**, not raw: a 16-byte magic header, then
+/// `[u32 length][block]` repeated. Java's reader falls back to raw snappy when
+/// the header is absent, and so does this — some producers write it that way.
+const SNAPPY_MAGIC: &[u8; 16] = b"\x82SNAPPY\x00\x00\x00\x00\x01\x00\x00\x00\x01";
+
+fn snappy(compressed: &[u8]) -> Result<Vec<u8>> {
+    let raw = |bytes: &[u8]| {
+        snap::raw::Decoder::new()
+            .decompress_vec(bytes)
+            .map_err(|e| Error::Codec(format!("snappy: {e}")))
+    };
+
+    if compressed.len() < SNAPPY_MAGIC.len() || &compressed[..SNAPPY_MAGIC.len()] != SNAPPY_MAGIC {
+        return raw(compressed);
+    }
+
+    let mut out = Vec::new();
+    let mut at = SNAPPY_MAGIC.len();
+    while at < compressed.len() {
+        let len = compressed
+            .get(at..at + 4)
+            .and_then(|b| b.try_into().ok())
+            .map(u32::from_be_bytes)
+            .ok_or_else(|| Error::Codec("snappy block length".to_owned()))?
+            as usize;
+        at += 4;
+        let block = compressed
+            .get(at..at + len)
+            .ok_or_else(|| Error::Codec("snappy block overruns".to_owned()))?;
+        out.extend_from_slice(&raw(block)?);
+        at += len;
+    }
+    Ok(out)
+}
+
+/// Decompress a batch's records section.
+///
+/// The four codecs Kafka defines. Each is already in the dependency tree via
+/// `kafka_protocol`, so supporting them here adds no crates — only the code to
+/// call them.
+fn decompress(codec: i16, compressed: &[u8]) -> Result<Bytes> {
+    use std::io::Read;
+
+    let mut out = Vec::new();
+    match codec {
+        1 => {
+            flate2::read::GzDecoder::new(compressed)
+                .read_to_end(&mut out)
+                .map_err(|e| Error::Codec(format!("gzip: {e}")))?;
+        }
+        2 => out = snappy(compressed)?,
+        3 => {
+            lz4::Decoder::new(compressed)
+                .map_err(|e| Error::Codec(format!("lz4: {e}")))?
+                .read_to_end(&mut out)
+                .map_err(|e| Error::Codec(format!("lz4: {e}")))?;
+        }
+        4 => {
+            zstd::stream::copy_decode(compressed, &mut out)
+                .map_err(|e| Error::Codec(format!("zstd: {e}")))?;
+        }
+        other => return Err(Error::Codec(format!("unknown compression codec {other}"))),
+    }
+    Ok(Bytes::from(out))
 }
 
 /// Apply the READ_COMMITTED rules **per batch**.
@@ -439,24 +562,72 @@ mod tests {
         assert_eq!(batch.value(&batch.records[0]), Some(Bytes::from_static(b"v")));
     }
 
-    /// Compressed batches are handed back, not guessed at.
+    /// Every codec round-trips, and against the reference decoder's output.
     #[test]
-    fn compression_falls_back() {
-        let encoded = encode(&[record(0, None, Some(b"v"))], Compression::Gzip);
-        assert!(decode_lean(&encoded).expect("decode").is_none());
+    fn every_compression_codec_round_trips() {
+        for compression in [
+            Compression::Gzip,
+            Compression::Snappy,
+            Compression::Lz4,
+            Compression::Zstd,
+        ] {
+            let records: Vec<Record> = (0..32)
+                .map(|i| {
+                    record(
+                        i,
+                        Some(format!("k{i}").as_bytes()),
+                        Some(format!("value-{i}").as_bytes()),
+                    )
+                })
+                .collect();
+            let encoded = encode(&records, compression);
+
+            let lean = decode_lean(&encoded)
+                .unwrap_or_else(|e| panic!("{compression:?}: {e}"))
+                .unwrap_or_else(|| panic!("{compression:?} was handed back"));
+            let flat: Vec<_> = lean
+                .iter()
+                .flat_map(|b| b.records.iter().map(move |r| (b, r)))
+                .collect();
+            assert_eq!(flat.len(), records.len(), "{compression:?}");
+            for ((batch, lean), reference) in flat.iter().zip(&records) {
+                assert_eq!(lean.offset, reference.offset, "{compression:?} offset");
+                assert_eq!(batch.value(lean), reference.value, "{compression:?} value");
+            }
+        }
     }
 
-    /// So are records with headers, since this reader does not carry them and
-    /// dropping them silently would lose caller data.
+    /// Headers survive, and are read from the region rather than at decode time.
     #[test]
-    fn headers_fall_back() {
-        let mut with_headers = record(0, None, Some(b"v"));
+    fn headers_are_read_on_demand() {
+        let mut with_headers = record(0, Some(b"k"), Some(b"v"));
         with_headers.headers.insert(
-            kafka_protocol::protocol::StrBytes::from_static_str("h"),
-            Some(Bytes::from_static(b"1")),
+            kafka_protocol::protocol::StrBytes::from_static_str("trace"),
+            Some(Bytes::from_static(b"abc")),
+        );
+        with_headers.headers.insert(
+            kafka_protocol::protocol::StrBytes::from_static_str("empty"),
+            None,
         );
         let encoded = encode(&[with_headers], Compression::None);
-        assert!(decode_lean(&encoded).expect("decode").is_none());
+
+        let lean = decode_lean(&encoded).expect("decode").expect("handled");
+        let batch = &lean[0];
+        let headers = batch.headers(&batch.records[0]).expect("headers");
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].0, Bytes::from_static(b"trace"));
+        assert_eq!(headers[0].1, Some(Bytes::from_static(b"abc")));
+        assert_eq!(headers[1].0, Bytes::from_static(b"empty"));
+        assert_eq!(headers[1].1, None);
+    }
+
+    /// A record with no headers costs nothing and reports nothing.
+    #[test]
+    fn no_headers_is_empty() {
+        let encoded = encode(&[record(0, None, Some(b"v"))], Compression::None);
+        let lean = decode_lean(&encoded).expect("decode").expect("handled");
+        let batch = &lean[0];
+        assert!(batch.headers(&batch.records[0]).expect("headers").is_empty());
     }
 
     /// A response cut off at `max_bytes` ends mid-batch. That fragment is not

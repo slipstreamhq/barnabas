@@ -270,7 +270,7 @@ two ranges into the retained batch buffer. `Consumer::fetch_lean` is the path th
 | consume, 1 M records | rec/s |
 |---|---:|
 | ordinary path (`fetch`) | 7 848 000 – 8 296 000 |
-| **lean path (`fetch_lean`)** | **14 118 000 – 14 541 000** |
+| **lean path (`fetch_lean`)** | **14 996 000 – 15 389 000** |
 | rskafka | 4 838 000 – 5 065 000 |
 
 **1.75× end to end**, and ~2.9× rskafka. The bench reads every value through `LeanBatch::value`, so
@@ -287,16 +287,24 @@ handing the caller bad data rather than failing. Guarded three ways: it validate
 paths return identical records on a topic containing plain records, an aborted transaction and a
 committed one.
 
-**What it does not handle**, each falling back at the old speed:
+**Headers and compression are handled**, which the first version of this did not do.
 
-- **compressed batches** — the codec would have to be run first;
-- **records with headers** — the lean record does not carry them, and dropping them silently would
-  lose caller data, so a batch containing any is handed back;
-- **anything but magic 2**.
+- **Headers** were never the difficulty they looked like. The record keeps the header block's byte
+  range and count — eight bytes — and parses it only when a caller asks. A record without headers
+  costs nothing.
+- **Compression** needs the codec run before anything can be parsed, so the records section is
+  decompressed into a buffer the batch then owns and slices from. One allocation per batch, which
+  `kafka_protocol` also pays. All four codecs are checked against the reference decoder.
+- **Kafka's snappy is xerial-framed** — a 16-byte magic header then `[u32 length][block]` repeated —
+  not raw snappy. Reading it as raw snappy fails immediately, which is how the test caught it. Java
+  falls back to raw when the header is absent, and so does this.
 
-Those two gaps are also why this is a second method rather than a change to `fetch`. Closing them —
-header ranges, and decompressing into an owned buffer that is then parsed the same way — would let
-`fetch` use it and remove the dual API. That is the decision this measurement was for.
+Only a **pre-magic-2 batch** now falls back, and then only that partition pays the old cost.
+
+What remains is consolidation: `fetch` returns a flat `Vec<Record>` and `fetch_lean` returns
+batches, so adopting the fast path is a caller-visible change. Keeping both permanently would be the
+worst of the two — one job, two APIs — so the next step is to make the lean shape the only one and
+update the call sites.
 
 ### Would SIMD help the decoder? No — measured
 
