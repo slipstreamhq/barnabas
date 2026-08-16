@@ -969,6 +969,19 @@ fn main() {
 
     if want("pipeline") {
         println!("\nin-flight per connection            rec/s      vs 1 in flight");
+        // **One record per enqueue**, deeply queued. This is the analogue of a
+        // Java producer with batching on and no linger: the caller hands over
+        // records one at a time and the client decides what travels together.
+        // Comparing that against our *synchronous* one-record `send` would be
+        // comparing a queue with a round trip.
+        let one = Cell { batch: 1, value_bytes: 128, records: 200_000 };
+        for window in [1usize, 100, 1_000] {
+            let topic = topic("p1");
+            create_topic(&topic);
+            let rate = one.rate(kestrel_produce_pipelined(&topic, &one, window));
+            println!("1 record/enqueue, window {window:>5}   {rate:>12.0}");
+        }
+
         let cell = Cell { batch: 100, value_bytes: 128, records: 200_000 };
         let mut single = 0.0;
         for in_flight in [1usize, 2, 5, 10] {

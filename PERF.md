@@ -12,7 +12,8 @@ Still one machine and still no network, but partition leadership is spread acros
 **Common to every cell:** 8 partitions, replication factor 1, `acks=all`, idempotent producer, no
 compression unless the cell says otherwise.
 **Ranges are across 2–6 runs. Every ratio uses `rdkafka`'s *best* observed number**, so the
-comparison errs against us.
+comparison errs against us — but see the Java section: `rdkafka` is **not** the fastest mainstream
+client, so a ratio against it flatters us regardless.
 
 ## Many cores — the claim the design rests on
 
@@ -212,6 +213,46 @@ partition busy — so until now it shipped unmeasured.
 **The first version of this cell could not have shown a difference.** It used `max_wait` of 1 ms,
 which floors every poll at ~1.2 ms, and duly reported 839 vs 851 polls/s — a 1% "result" that was
 entirely the broker's wait timer.
+
+## Against the Java client — the comparison that matters
+
+`./java-bench.sh`, which runs Apache's own `kafka-producer-perf-test` and
+`kafka-consumer-perf-test` in a container on the cluster network. Apache's tools rather than
+benchmark code of mine, because these are the numbers anyone would quote back at us. The Java
+producer gets its best configuration (`linger.ms=0`, 1 MiB batches, five in flight, `acks=all`,
+idempotent) and **far more records than our own cells use**, so its JIT is warm before the number is
+taken.
+
+| cell | kestrel | Java | librdkafka |
+|---|---:|---:|---:|
+| batched, 128 B | 3 745 000 – 4 505 000 | **1 622 000** | 316 000 – 343 000 |
+| batched, 1 KiB | 1 415 000 – 1 946 000 | **426 000** | 316 000 – 333 000 |
+| batched, 8 KiB | 189 000 – 259 000 | **72 000** | 83 000 – 91 000 |
+| one record at a time, queued | 199 000 – 229 000 | **153 000** | — |
+| consume, 128 B | 2 944 000 – 3 080 000 | **172 000** (241 000 excluding rebalance) | 132 000 – 152 000 |
+
+**The Java client is much faster than librdkafka**, by roughly 5× on batched 128 B — so every ratio
+elsewhere in this file is measured against the weaker of the two mainstream clients. Read the
+headline as **2.3× – 4.6× against the best available client**, not the 11× – 14× the librdkafka
+column suggests. That is the single most important correction in this document, and it exists
+because the comparison was asked for rather than because it was volunteered.
+
+librdkafka does beat Java at 8 KiB records (83–91 k against 72 k), the one cell where it wins.
+
+### The one-record row is not the one it looks like
+
+`kafka-producer-perf-test` with `batch.size=0` reaches 153 000 records/s — six times our *synchronous*
+`send`, which is one round trip per record. That is not a like-for-like comparison: Java is queueing
+deeply, and its own output says so, reporting **829 ms average and 1 137 ms 99th-percentile latency**
+for that run. The fair analogue is `enqueue` one record at a time with a deep window, which reaches
+199 000 – 229 000. Compared that way we are ahead; compared the other way we would have been
+reporting a loss that is really an API difference.
+
+### What this table does not say
+
+Java's producer latency figures (0.22 ms average, 2 ms 99th, 133 ms max on the batched 128 B run)
+are measured **under full-throttle load**, while our produce-latency cell sends one record at a time
+into an idle cluster. They are not comparable and are deliberately not placed side by side.
 
 ## Against Redpanda
 
