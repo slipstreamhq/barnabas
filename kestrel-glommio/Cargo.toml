@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# TLS is opt-in: it pulls rustls and a certificate store, which a client on a
+# trusted network has no reason to compile.
+tls = ["dep:futures-rustls", "dep:rustls", "dep:webpki-roots"]
+
 [dependencies]
 kestrel-core   = { path = "../kestrel-core" }
 kestrel-client = { path = "../kestrel-client" }
@@ -13,3 +18,6 @@ bytes          = { workspace = true }
 thiserror      = { workspace = true }
 futures-lite   = "2"
 glommio        = { git = "https://github.com/dahankzter/glommio", rev = "2acb59d1" }
+futures-rustls = { version = "0.26", optional = true }
+rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots   = { version = "0.26", optional = true }

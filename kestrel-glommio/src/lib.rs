@@ -20,6 +20,9 @@ use std::time::Duration;
 use futures_lite::{AsyncReadExt as _, AsyncWriteExt as _};
 use glommio::net::TcpStream;
 
+#[cfg(feature = "tls")]
+pub mod tls;
+
 pub use kestrel_client::{Error, ProducerRecord, Result, EARLIEST, LATEST};
 pub use kestrel_core::{Disposition, ErrorCode, IsolationLevel, Partitioner};
 
@@ -30,7 +33,7 @@ pub struct Glommio;
 impl kestrel_client::Transport for Glommio {
     type Stream = TcpStream;
 
-    async fn connect(addr: &str) -> io::Result<Self::Stream> {
+    async fn connect(&self, addr: &str) -> io::Result<Self::Stream> {
         // glommio's error type is its own; the seam speaks `io::Error`, which
         // every runtime can produce.
         TcpStream::connect(addr)

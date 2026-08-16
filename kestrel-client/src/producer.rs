@@ -91,12 +91,13 @@ impl<T: Transport> Producer<T> {
     /// # Errors
     /// If no broker answers, or the coordinator never becomes available.
     pub async fn transactional(
+        transport: T,
         bootstrap: &[String],
         client_id: &str,
         transactional_id: &str,
     ) -> Result<Self> {
         let mut me = Self {
-            cluster: Cluster::connect(bootstrap, client_id).await?,
+            cluster: Cluster::connect(transport, bootstrap, client_id).await?,
             state: ProducerState::transactional(),
             transactional_id: Some(transactional_id.to_owned()),
             coordinator: None,
@@ -114,9 +115,9 @@ impl<T: Transport> Producer<T> {
     ///
     /// # Errors
     /// If no broker answers.
-    pub async fn idempotent(bootstrap: &[String], client_id: &str) -> Result<Self> {
+    pub async fn idempotent(transport: T, bootstrap: &[String], client_id: &str) -> Result<Self> {
         let mut me = Self {
-            cluster: Cluster::connect(bootstrap, client_id).await?,
+            cluster: Cluster::connect(transport, bootstrap, client_id).await?,
             state: ProducerState::idempotent(),
             transactional_id: None,
             coordinator: None,

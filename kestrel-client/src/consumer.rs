@@ -52,6 +52,7 @@ impl<T: Transport> Consumer<T> {
     /// If no bootstrap address answers, the topic does not exist, or the broker
     /// answers with an error code.
     pub async fn assign(
+        transport: T,
         bootstrap: &[String],
         client_id: &str,
         topic: &str,
@@ -59,7 +60,7 @@ impl<T: Transport> Consumer<T> {
         offset: i64,
         isolation: IsolationLevel,
     ) -> Result<Self> {
-        let mut cluster = Cluster::connect(bootstrap, client_id).await?;
+        let mut cluster = Cluster::connect(transport, bootstrap, client_id).await?;
         // Up front so a missing topic fails here rather than as a fetch loop
         // that never returns anything.
         cluster.refresh_metadata(topic).await?;

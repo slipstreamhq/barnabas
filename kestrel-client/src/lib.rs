@@ -37,11 +37,13 @@ use std::io;
 use std::time::Duration;
 
 pub mod cluster;
+pub mod sasl;
 mod timeout;
 pub mod consumer;
 pub mod producer;
 
 pub use cluster::Cluster;
+pub use sasl::{Credentials, SaslMechanism};
 pub use consumer::{Consumer, EARLIEST, LATEST};
 pub use producer::{Producer, ProducerRecord};
 
@@ -49,15 +51,21 @@ use kestrel_core::{Disposition, ErrorCode};
 
 /// What a runtime must provide: a socket and a timer.
 ///
-/// Implemented on a marker type rather than on the stream, so the binding can
-/// name its own connect. The methods are associated functions for the same
-/// reason — there is no transport *value*, only a choice of runtime.
+/// **`connect` takes `&self`** so a transport can carry configuration —
+/// a TLS client config, a root store, a server-name policy. That is what makes
+/// encryption a binding-level concern rather than something this crate has to
+/// know about: `Consumer<GlommioTls>` and `Consumer<Glommio>` are the same
+/// client over different sockets.
+///
+/// The rest are associated functions: reading, writing and sleeping need no
+/// configuration, and requiring `&self` for them would mean borrowing the
+/// transport across every request for nothing.
 pub trait Transport: 'static {
-    /// The runtime's TCP stream.
+    /// The runtime's stream — a TCP socket, or a TLS session over one.
     type Stream: 'static;
 
     /// Open a connection to `host:port`.
-    fn connect(addr: &str) -> impl Future<Output = io::Result<Self::Stream>>;
+    fn connect(&self, addr: &str) -> impl Future<Output = io::Result<Self::Stream>>;
 
     /// Read into `buf`, returning the byte count. Zero means the peer closed.
     fn read(stream: &mut Self::Stream, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>>;
@@ -113,6 +121,10 @@ pub enum Error {
         op: kafka_protocol::messages::ApiKey,
         addr: String,
     },
+
+    /// Authentication failed, or the broker does not offer the mechanism.
+    #[error("sasl: {0}")]
+    Sasl(String),
 
     #[error("the broker's response contained no {0}")]
     Missing(&'static str),

@@ -64,6 +64,7 @@ async fn make_topic_with_partitions(topic: &str, partitions: i32) {
 
 async fn read_all(topic: &str, want: usize, isolation: IsolationLevel) -> Vec<String> {
     let mut consumer = Consumer::assign(
+        kestrel_glommio::Glommio,
         &bootstrap(),
         "kestrel-producer-test",
         topic,
@@ -100,7 +101,7 @@ fn an_idempotent_producer_round_trips() {
         let topic = unique("idem");
         make_topic(&topic).await;
 
-        let mut producer = Producer::idempotent(&bootstrap(), "kestrel-test")
+        let mut producer = Producer::idempotent(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test")
             .await
             .expect("idempotent producer");
         producer
@@ -123,7 +124,7 @@ fn a_committed_transaction_is_visible() {
         let topic = unique("txn-commit");
         make_topic(&topic).await;
 
-        let mut producer = Producer::transactional(&bootstrap(), "kestrel-test", &unique("tid"))
+        let mut producer = Producer::transactional(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test", &unique("tid"))
             .await
             .expect("transactional producer");
 
@@ -149,7 +150,7 @@ fn an_aborted_transaction_is_invisible() {
         let topic = unique("txn-abort");
         make_topic(&topic).await;
 
-        let mut producer = Producer::transactional(&bootstrap(), "kestrel-test", &unique("tid"))
+        let mut producer = Producer::transactional(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test", &unique("tid"))
             .await
             .expect("transactional producer");
 
@@ -179,7 +180,7 @@ fn a_second_transaction_is_not_deduplicated() {
         let topic = unique("txn-sequence");
         make_topic(&topic).await;
 
-        let mut producer = Producer::transactional(&bootstrap(), "kestrel-test", &unique("tid"))
+        let mut producer = Producer::transactional(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test", &unique("tid"))
             .await
             .expect("transactional producer");
 
@@ -219,7 +220,7 @@ fn a_commit_after_an_abort_writes_only_the_commit() {
         let topic = unique("txn-abort-commit");
         make_topic(&topic).await;
 
-        let mut producer = Producer::transactional(&bootstrap(), "kestrel-test", &unique("tid"))
+        let mut producer = Producer::transactional(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test", &unique("tid"))
             .await
             .expect("transactional producer");
 
@@ -258,7 +259,7 @@ fn a_new_producer_fences_the_old_one() {
         make_topic(&topic).await;
         let txn_id = unique("tid");
 
-        let mut old = Producer::transactional(&bootstrap(), "kestrel-test", &txn_id)
+        let mut old = Producer::transactional(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test", &txn_id)
             .await
             .expect("old producer");
         old.begin_transaction().expect("begin");
@@ -267,7 +268,7 @@ fn a_new_producer_fences_the_old_one() {
             .expect("send");
 
         // A restarted instance takes the same transactional id.
-        let new = Producer::transactional(&bootstrap(), "kestrel-test", &txn_id)
+        let new = Producer::transactional(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test", &txn_id)
             .await
             .expect("new producer");
         assert!(
@@ -306,7 +307,7 @@ fn keyed_records_land_on_the_partition_their_key_names() {
         let topic = unique("keyed");
         make_topic_with_partitions(&topic, 4).await;
 
-        let mut producer = Producer::idempotent(&bootstrap(), "kestrel-test")
+        let mut producer = Producer::idempotent(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test")
             .await
             .expect("producer");
 
@@ -348,6 +349,7 @@ fn keyed_records_land_on_the_partition_their_key_names() {
                 .collect();
 
             let mut consumer = Consumer::assign(
+                kestrel_glommio::Glommio,
                 &bootstrap(),
                 "kestrel-producer-test",
                 &topic,
@@ -392,7 +394,7 @@ fn producing_outside_a_transaction_is_refused() {
         let topic = unique("txn-misuse");
         make_topic(&topic).await;
 
-        let mut producer = Producer::transactional(&bootstrap(), "kestrel-test", &unique("tid"))
+        let mut producer = Producer::transactional(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test", &unique("tid"))
             .await
             .expect("transactional producer");
 

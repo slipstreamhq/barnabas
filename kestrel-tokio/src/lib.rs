@@ -26,6 +26,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
+#[cfg(feature = "tls")]
+pub mod tls;
+
 pub use kestrel_client::{Error, ProducerRecord, Result, EARLIEST, LATEST};
 pub use kestrel_core::{Disposition, ErrorCode, IsolationLevel, Partitioner};
 
@@ -36,7 +39,7 @@ pub struct Tokio;
 impl kestrel_client::Transport for Tokio {
     type Stream = TcpStream;
 
-    async fn connect(addr: &str) -> io::Result<Self::Stream> {
+    async fn connect(&self, addr: &str) -> io::Result<Self::Stream> {
         TcpStream::connect(addr).await
     }
 

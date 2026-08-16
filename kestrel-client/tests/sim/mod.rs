@@ -141,7 +141,7 @@ pub struct Sim;
 impl Transport for Sim {
     type Stream = SimStream;
 
-    async fn connect(_addr: &str) -> io::Result<Self::Stream> {
+    async fn connect(&self, _addr: &str) -> io::Result<Self::Stream> {
         Ok(SimStream {
             inbox: VecDeque::new(),
             closed: false,

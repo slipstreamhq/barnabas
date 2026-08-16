@@ -71,6 +71,7 @@ fn plain_records_round_trip() {
         prod.produce_plain(3).await;
 
         let mut consumer = Consumer::assign(
+            kestrel_tokio::Tokio,
             &bootstrap(),
             "kestrel-test",
             &topic,
@@ -107,6 +108,7 @@ fn an_aborted_transaction_is_invisible() {
         prod.end(false).await;
 
         let mut consumer = Consumer::assign(
+            kestrel_tokio::Tokio,
             &bootstrap(),
             "kestrel-test",
             &topic,
@@ -156,6 +158,7 @@ fn a_commit_after_an_abort_survives() {
         prod.end(true).await;
 
         let mut consumer = Consumer::assign(
+            kestrel_tokio::Tokio,
             &bootstrap(),
             "kestrel-test",
             &topic,
@@ -190,6 +193,7 @@ fn read_uncommitted_sees_aborted_records() {
         prod.end(false).await;
 
         let mut consumer = Consumer::assign(
+            kestrel_tokio::Tokio,
             &bootstrap(),
             "kestrel-test",
             &topic,
@@ -217,6 +221,7 @@ fn seek_positions_the_next_fetch() {
         prod.produce_plain(5).await;
 
         let mut consumer = Consumer::assign(
+            kestrel_tokio::Tokio,
             &bootstrap(),
             "kestrel-test",
             &topic,
@@ -256,6 +261,7 @@ fn fetches_are_routed_to_the_partition_leader() {
         prod.produce_plain(1).await;
 
         let mut consumer = Consumer::assign(
+            kestrel_tokio::Tokio,
             &bootstrap(),
             "kestrel-test",
             &topic,

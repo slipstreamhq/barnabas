@@ -29,7 +29,7 @@ fn records(n: usize) -> Vec<ProducerRecord> {
 }
 
 async fn transactional() -> Producer<Sim> {
-    Producer::<Sim>::transactional(&bootstrap(), "sim", "txn-1")
+    Producer::<Sim>::transactional(Sim, &bootstrap(), "sim", "txn-1")
         .await
         .expect("producer")
 }

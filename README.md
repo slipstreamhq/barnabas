@@ -61,13 +61,14 @@ Both properties were mutation-proved: resetting sequences per transaction fails
 | **Leader routing, metadata cache** | works — fetches go to the leader from the cluster map, `NOT_LEADER_OR_FOLLOWER` invalidates that partition and retries |
 | **Runtimes** | glommio and tokio, from one client. Adding a third is a `Transport` impl |
 | **Connection recovery** | a closed connection is evicted and redialled once; a request that outlives its deadline drops its connection, because the late response would desynchronise the stream |
-| **TLS, SASL** | not started. `Transport::Stream` is where TLS goes — `futures-rustls` for glommio, `tokio-rustls` for tokio |
+| **TLS** | opt-in `tls` feature on either binding. A second `Transport`, so `Consumer<GlommioTls>` is the same client over a different socket — the shared code needed no change at all |
+| **SASL** | PLAIN and SCRAM-SHA-256/512. Shared, since the handshake is protocol |
 | **Consumer groups** | **out of scope** — callers assign partitions themselves |
 
 ## Tests
 
 ```sh
-cargo test                                        # 77 tests, no broker, no runtime
+cargo test                                        # 86 tests, no broker, no runtime
 cargo test -p kestrel-glommio -- --ignored --test-threads=1   # needs a broker
 cargo test -p kestrel-tokio   -- --ignored --test-threads=1   # the same suite, other runtime
 ```
@@ -75,6 +76,16 @@ cargo test -p kestrel-tokio   -- --ignored --test-threads=1   # the same suite, 
 The broker tests need a single-node Kafka; the invocation is at the top of
 `kestrel-glommio/tests/real_broker.rs`. Note that `__transaction_state` defaults to replication
 factor 3, so a single-node broker needs it overridden or every transaction fails with error 15.
+
+## Security defaults
+
+- **Certificate verification is on and there is no switch to turn it off.** A private CA goes in
+  through `with_roots`, a pinned certificate or client auth through `from_config`.
+- **`Credentials`' `Debug` prints `<redacted>`.** A password in a log is a security bug wearing a
+  convenience's clothes.
+- **SCRAM verifies the server's final signature.** Skipping it is the classic implementation
+  shortcut, and it means authenticating to anyone who can complete a handshake.
+- `SaslMechanism::requires_encryption()` is true for PLAIN, which sends the password in the clear.
 
 ## What using a real broker taught us
 
