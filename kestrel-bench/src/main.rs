@@ -1243,11 +1243,146 @@ fn decode_cell() {
         sink
     });
 
+    // Where the decode time actually goes.
+    time("lean: parse only, keep nothing", ITERATIONS, COUNT, || {
+        lean::parse_only(&batch)
+    });
+    time("lean: + 24-byte record (offsets)", ITERATIONS, COUNT, || {
+        lean::lean_offsets(&batch)
+    });
+    time("lean: + Bytes slices", ITERATIONS, COUNT, || {
+        lean::lean_bytes(&batch)
+    });
+
     // Suspect 2, isolated: moving the decoded records once, which is what the
     // filter used to do unconditionally and what any extra pass costs.
     time("  move Vec<Record> once", ITERATIONS, COUNT, || {
         decoded.clone().into_iter().collect::<Vec<_>>()
     });
+}
+
+/// A hand-written record-batch v2 reader, to find out **where the 66 ns go**.
+///
+/// Three variants of the same parse, so parsing can be separated from what is
+/// built out of it:
+///
+/// - `parse only` walks the records and keeps nothing. This is the floor SIMD
+///   would attack: varint decoding and pointer arithmetic.
+/// - `lean (offsets)` stores 24 bytes per record — offset, and the key/value
+///   positions within the batch.
+/// - `lean (Bytes)` stores refcounted slices, like `kafka_protocol` does.
+///
+/// The gap between them is materialisation cost, which no amount of SIMD in
+/// the parser can remove.
+mod lean {
+    use bytes::Bytes;
+
+    /// Zigzag LEB128, the encoding Kafka uses inside a record batch.
+    #[inline]
+    fn varint(buf: &[u8], pos: &mut usize) -> i64 {
+        let mut raw: u64 = 0;
+        let mut shift = 0;
+        loop {
+            let byte = buf[*pos];
+            *pos += 1;
+            raw |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        ((raw >> 1) as i64) ^ -((raw & 1) as i64)
+    }
+
+    /// Records start after the fixed 61-byte batch header.
+    const HEADER: usize = 61;
+
+    fn record_count(buf: &[u8]) -> usize {
+        let bytes = [buf[57], buf[58], buf[59], buf[60]];
+        i32::from_be_bytes(bytes).max(0) as usize
+    }
+
+    /// Walk every record, keep nothing.
+    pub fn parse_only(buf: &[u8]) -> usize {
+        let count = record_count(buf);
+        let mut pos = HEADER;
+        for _ in 0..count {
+            let len = varint(buf, &mut pos) as usize;
+            let end = pos + len;
+            pos += 1; // attributes
+            varint(buf, &mut pos); // timestamp delta
+            varint(buf, &mut pos); // offset delta
+            let key_len = varint(buf, &mut pos);
+            if key_len > 0 {
+                pos += key_len as usize;
+            }
+            let value_len = varint(buf, &mut pos);
+            if value_len > 0 {
+                pos += value_len as usize;
+            }
+            pos = end;
+        }
+        count
+    }
+
+    /// 24 bytes per record: no refcounts, no copies, no fat struct.
+    #[derive(Clone, Copy)]
+    pub struct Slim {
+        pub offset: i64,
+        pub key: (u32, u32),
+        pub value: (u32, u32),
+    }
+
+    pub fn lean_offsets(buf: &[u8]) -> Vec<Slim> {
+        let count = record_count(buf);
+        let base_offset = i64::from_be_bytes(buf[0..8].try_into().expect("8 bytes"));
+        let mut out = Vec::with_capacity(count);
+        let mut pos = HEADER;
+        for _ in 0..count {
+            let len = varint(buf, &mut pos) as usize;
+            let end = pos + len;
+            pos += 1;
+            varint(buf, &mut pos);
+            let offset_delta = varint(buf, &mut pos);
+            let key_len = varint(buf, &mut pos);
+            let key = if key_len > 0 {
+                let at = (pos as u32, key_len as u32);
+                pos += key_len as usize;
+                at
+            } else {
+                (0, 0)
+            };
+            let value_len = varint(buf, &mut pos);
+            let value = if value_len > 0 {
+                let at = (pos as u32, value_len as u32);
+                pos += value_len as usize;
+                at
+            } else {
+                (0, 0)
+            };
+            out.push(Slim {
+                offset: base_offset + offset_delta,
+                key,
+                value,
+            });
+            pos = end;
+        }
+        out
+    }
+
+    /// The same, but building refcounted slices as `kafka_protocol` does.
+    pub fn lean_bytes(batch: &Bytes) -> Vec<(i64, Bytes, Bytes)> {
+        let slim = lean_offsets(batch);
+        slim.into_iter()
+            .map(|r| {
+                (
+                    r.offset,
+                    batch.slice(r.key.0 as usize..(r.key.0 + r.key.1) as usize),
+                    batch.slice(r.value.0 as usize..(r.value.0 + r.value.1) as usize),
+                )
+            })
+            .collect()
+    }
 }
 
 fn main() {

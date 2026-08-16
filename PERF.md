@@ -261,6 +261,46 @@ It also binds a client to **one partition**, so eight partitions are eight clien
 connections, and a write spanning them is eight requests. Ours is one request per *broker*. That is
 the trade this client was designed around, and at batch 1 000 it shows.
 
+### Would SIMD help the decoder? No — measured
+
+Decode is now the largest single item in a consume: ~70 ns of a ~120 ns/record budget, where before
+the `max_bytes` fix it was a fifth of it. So it is worth attacking. SIMD is not how.
+
+| stage | ns/record |
+|---|---:|
+| **parse only** — walk every record, keep nothing | **3.0** |
+| crc32c over the batch | 13.7 – 14.3 |
+| parse + 24-byte record (offsets into the batch) | 5.5 |
+| parse + `Bytes` slices | 27.9 – 29.4 |
+| **`kafka_protocol` → `Vec<Record>` (what we do today)** | **69 – 73** |
+| `rskafka` → `RecordBatch` | 121 – 123 |
+
+**The parsing SIMD would target is 3 ns of 70 — four percent.** Varint decoding and pointer
+arithmetic are not the cost, and could not be: records are variable-length and each one's position
+depends on the previous one's length, so there is little for wide lanes to do. The one place SIMD
+already applies is the CRC, and `crc32c` is using the hardware instruction — it shows up in profiles
+as `crc_u64_parallel3`.
+
+**Three quarters of the time is materialisation.** Parsing into a 24-byte record costs 5.5 ns;
+producing `Bytes` slices instead costs 28–29; producing `kafka_protocol`'s `Record` costs 69–73.
+That last struct carries producer id, epoch, sequence, partition leader epoch, timestamp type and
+two flags — **all of which are batch-level fields being copied into every record** — plus an
+`IndexMap` for headers.
+
+The `Bytes` step is worth understanding before optimising it. Every record's key and value is a slice
+of the *same* buffer, so every slice increments the *same* atomic refcount — a million records is two
+million read-modify-writes on one cache line, self-contended. That is why refcounting measures the
+same as copying 128 bytes: it is not the atomic being expensive, it is the sharing.
+
+**So the lever is representation, not instructions.** A record that holds offsets into a retained
+buffer and materialises a `Bytes` only when the caller asks for one decodes at 5.5 ns against 69 —
+about twelve times faster — and would take decode from ~58% of the consume budget to under 10%.
+Sketching what that is worth: consume might go from 8.4 M to somewhere above 12 M records/s.
+
+Not attempted here. It means owning the record-batch decoder rather than using `kafka_protocol`'s,
+including compression, control records, headers and every batch version — a much larger commitment
+than a benchmark cell, and one to make deliberately.
+
 ### The small-batch rows were comparing different work
 
 An earlier revision recorded a 15–27% loss at batch 10. It was the harness.
@@ -428,6 +468,8 @@ than defended.
   causing.
 - **Whether 25–29 M records/s is our ceiling or the cluster's** is unknown; the other clients are far
   enough below it that only our own number is in question.
+- **A lean record representation** is the largest identified win left (see the SIMD section):
+  ~12× on decode, which is ~58% of the consume budget.
 - **Whether 64 MiB is the right response budget.** It was chosen to be clearly larger than the
   per-partition budget, not tuned; the memory a fetch may hold scales with it.
 - **rskafka has no many-core row.** Its per-partition client shape makes the comparison less direct,
