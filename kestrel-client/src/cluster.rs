@@ -316,6 +316,96 @@ impl<T: Transport> Cluster<T> {
         unreachable!("the loop returns on its last attempt")
     }
 
+    /// Send one request to each of several brokers **at the same time**.
+    ///
+    /// A core that holds partitions on three brokers has three independent
+    /// requests, and sending them one after another makes its poll cost the sum
+    /// of three round trips instead of the longest of them. Against a
+    /// single-broker cluster the two are identical, which is exactly why this
+    /// went unnoticed for so long.
+    ///
+    /// Connections are **taken out of the pool** for the duration rather than
+    /// borrowed: several `&mut Broker` from one `HashMap` is not something the
+    /// borrow checker will allow, and a `RefCell` would only move that check to
+    /// runtime. A broker whose request succeeded goes back; one whose
+    /// connection failed or timed out does not, which is the same rule
+    /// [`Self::call_at`] follows and for the same reason — a late response would
+    /// desynchronise the stream.
+    ///
+    /// Results come back in the order the requests were given. Each carries its
+    /// own `Result`, because one broker failing says nothing about the others.
+    pub(crate) async fn call_many<Req, Resp>(
+        &mut self,
+        api_key: ApiKey,
+        version: i16,
+        requests: &[(String, Req)],
+    ) -> Vec<Result<Resp>>
+    where
+        Req: Encodable,
+        Resp: Decodable,
+    {
+        let timeout = self.request_timeout;
+        let mut taken = Vec::with_capacity(requests.len());
+        let mut outcomes: Vec<Option<Result<Resp>>> = (0..requests.len()).map(|_| None).collect();
+
+        // Connecting is sequential, and stays that way: it happens once per
+        // broker per client, and doing it concurrently would complicate the
+        // pool for no measurable gain.
+        for (index, (addr, _)) in requests.iter().enumerate() {
+            match self.broker_at(addr).await {
+                Ok(_) => taken.push((index, addr.clone(), self.conns.remove(addr).expect("just connected"))),
+                Err(e) => outcomes[index] = Some(Err(e)),
+            }
+        }
+
+        let calls: Vec<_> = taken
+            .into_iter()
+            .map(|(index, addr, mut broker)| {
+                let req = &requests[index].1;
+                async move {
+                    let outcome =
+                        with_timeout::<T, _>(timeout, broker.call(api_key, version, req)).await;
+                    (index, addr, broker, outcome)
+                }
+            })
+            .collect();
+
+        for (index, addr, broker, outcome) in crate::join::join_all(calls).await {
+            let result = match outcome {
+                Some(Ok(resp)) => {
+                    self.conns.insert(addr, broker);
+                    Ok(resp)
+                }
+                // A protocol-level error leaves the stream in a good state: the
+                // response was read in full, so the connection is still usable.
+                Some(Err(e @ Error::Io(_))) => Err(e),
+                Some(Err(e)) => {
+                    self.conns.insert(addr, broker);
+                    Err(e)
+                }
+                None => Err(Error::Timeout { op: api_key, addr }),
+            };
+            outcomes[index] = Some(result);
+        }
+
+        // Reconnect-once, the same guarantee [`Self::call_at`] gives. A pooled
+        // connection can be closed at any time and the client only finds out by
+        // writing to it, so a rolling upgrade must not turn into a hard error.
+        // Sequential on purpose: this is the rare path, and the concurrency
+        // above exists for the common one.
+        for (index, outcome) in outcomes.iter_mut().enumerate() {
+            if matches!(outcome, Some(Err(Error::Io(_)))) {
+                let (addr, req) = &requests[index];
+                *outcome = Some(self.call_at(addr, api_key, version, req).await);
+            }
+        }
+
+        outcomes
+            .into_iter()
+            .map(|o| o.expect("every request produced an outcome"))
+            .collect()
+    }
+
     /// As [`Self::call_at`], for requests any broker can serve.
     pub(crate) async fn call_any<Req, Resp>(
         &mut self,

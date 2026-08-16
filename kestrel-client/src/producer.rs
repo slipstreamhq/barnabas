@@ -506,10 +506,23 @@ impl<T: Transport> Producer<T> {
             }
 
             let mut retry_after_refresh = Vec::new();
-            for (addr, partitions) in by_broker {
-                let req = self.produce_request(topic, &partitions, &pending);
-                let resp: ProduceResponse =
-                    self.cluster.call_at(&addr, ApiKey::Produce, 9, &req).await?;
+            // **One request per broker, all in flight together.** Batching by
+            // broker already turned eight partition writes into one request per
+            // broker; awaiting those requests in turn put the round trips back
+            // as soon as there was more than one broker to write to.
+            let requests: Vec<(String, ProduceRequest)> = by_broker
+                .iter()
+                .map(|(addr, partitions)| {
+                    (addr.clone(), self.produce_request(topic, partitions, &pending))
+                })
+                .collect();
+            let responses = self
+                .cluster
+                .call_many::<_, ProduceResponse>(ApiKey::Produce, 9, &requests)
+                .await;
+
+            for resp in responses {
+                let resp = resp?;
 
                 for part in resp
                     .responses

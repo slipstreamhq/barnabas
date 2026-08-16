@@ -30,8 +30,28 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 
 const PARTITIONS: i32 = 8;
 
+/// Records in the consume cell. Overridable because a fetch loop pays a fixed
+/// cost at the end — the last poll of each broker waits out `max_wait` with
+/// nothing left to return — and only varying the record count says whether a
+/// given rate is steady state or that tail.
+fn consume_records() -> usize {
+    std::env::var("KESTREL_CONSUME_RECORDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000)
+}
+
 fn broker() -> String {
     std::env::var("KAFKA_BOOTSTRAP").unwrap_or_else(|_| "127.0.0.1:9092".to_owned())
+}
+
+/// The bootstrap list as kestrel wants it: one address per element.
+///
+/// `KAFKA_BOOTSTRAP` is a comma-separated string because that is what
+/// librdkafka takes; handing the whole string to kestrel as a single address
+/// would produce one unresolvable host.
+fn brokers() -> Vec<String> {
+    broker().split(',').map(|s| s.trim().to_owned()).collect()
 }
 
 fn topic(prefix: &str) -> String {
@@ -107,7 +127,7 @@ fn kestrel_produce(topic: &str, cell: &Cell) -> Duration {
 
     runtime.block_on(async {
         let mut producer =
-            kestrel_tokio::Producer::idempotent(kestrel_tokio::Tokio, &[broker()], "bench")
+            kestrel_tokio::Producer::idempotent(kestrel_tokio::Tokio, &brokers(), "bench")
                 .await
                 .expect("producer");
 
@@ -132,7 +152,7 @@ fn kestrel_latency(topic: &str, samples: usize, value_bytes: usize) -> Latency {
 
     runtime.block_on(async {
         let mut producer =
-            kestrel_tokio::Producer::idempotent(kestrel_tokio::Tokio, &[broker()], "bench")
+            kestrel_tokio::Producer::idempotent(kestrel_tokio::Tokio, &brokers(), "bench")
                 .await
                 .expect("producer");
 
@@ -161,7 +181,7 @@ fn kestrel_consume(topic: &str, expect: usize) -> Duration {
             // Fetch to the broker that leads them, over one connection.
             let mut consumer = kestrel_glommio::Consumer::new(
                 kestrel_glommio::Glommio,
-                &[broker()],
+                &brokers(),
                 "bench",
                 kestrel_core::IsolationLevel::ReadCommitted,
             )
@@ -313,6 +333,10 @@ fn rdkafka_consume(topic: &str, expect: usize) -> Duration {
 /// wakeups — which is the claim the whole design rests on and which every
 /// number above this point failed to exercise.
 fn kestrel_produce_many_cores(topic: &str, cores: usize, cell: &Cell) -> Duration {
+    assert!(
+        cores <= PARTITIONS as usize,
+        "a core with no partition of its own would sit idle and flatter the average"
+    );
     let per_core = cell.records / cores;
     let partitions_per_core = (PARTITIONS as usize).div_ceil(cores);
 
@@ -329,7 +353,7 @@ fn kestrel_produce_many_cores(topic: &str, cores: usize, cell: &Cell) -> Duratio
                     .run(async move {
                         let mut producer = kestrel_glommio::Producer::idempotent(
                             kestrel_glommio::Glommio,
-                            &[broker()],
+                            &brokers(),
                             "bench",
                         )
                         .await
@@ -347,9 +371,19 @@ fn kestrel_produce_many_cores(topic: &str, cores: usize, cell: &Cell) -> Duratio
 
                         // Each core writes to its own partitions, so nothing
                         // contends — on the client or on the broker's log.
-                        let first = (core * partitions_per_core) as i32;
-                        let partition = first.min(PARTITIONS - 1);
-                        for _ in 0..(per_core / batch_size) {
+                        //
+                        // **Every core count writes to all eight partitions**,
+                        // just split differently. An earlier version had each
+                        // core write to the first partition it owned and no
+                        // others, which meant the 1-core baseline drove a
+                        // single log while the 8-core run drove eight: part of
+                        // what it called client scaling was the broker's
+                        // partition parallelism.
+                        let owned: Vec<i32> = (0..PARTITIONS)
+                            .filter(|p| *p as usize / partitions_per_core == core)
+                            .collect();
+                        for round in 0..(per_core / batch_size) {
+                            let partition = owned[round % owned.len()];
                             producer.send(&topic, partition, &batch).await.expect("send");
                         }
                     });
@@ -363,7 +397,10 @@ fn kestrel_produce_many_cores(topic: &str, cores: usize, cell: &Cell) -> Duratio
 }
 
 fn main() {
-    println!("{PARTITIONS} partitions, acks=all, idempotent, one local broker\n");
+    println!(
+        "{PARTITIONS} partitions, acks=all, idempotent, RF 1, {} broker(s)\n",
+        brokers().len()
+    );
 
     println!("produce throughput            kestrel rec/s   rdkafka rec/s     ratio");
     let cells = [
@@ -434,7 +471,7 @@ fn main() {
     }
 
     println!("\nconsume throughput            kestrel rec/s   rdkafka rec/s     ratio");
-    let cell = Cell { batch: 1_000, value_bytes: 128, records: 200_000 };
+    let cell = Cell { batch: 1_000, value_bytes: 128, records: consume_records() };
 
     let kestrel_topic = topic("kc");
     create_topic(&kestrel_topic);

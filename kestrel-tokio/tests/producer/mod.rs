@@ -1,9 +1,5 @@
 //! A minimal producer, for putting data in front of the consumer under test.
 //!
-//! The tokio copy of `kestrel-glommio`'s scaffolding — same protocol steps,
-//! tokio's sockets. Duplicated deliberately: it is a *test fixture*, and one
-//! that used the client under test would not be able to fail honestly.
-//!
 //! **Test scaffolding, not library code.** It drives `kafka-protocol` directly,
 //! panics on everything, and implements only what the tests need. `kestrel`'s
 //! own producer is deliberately not used here: a test whose fixture is the code
@@ -11,6 +7,10 @@
 //!
 //! Its one non-obvious behaviour is the one P0 found: transaction sequence
 //! numbers continue across transactions.
+//!
+//! The tokio copy of `kestrel-glommio`'s scaffolding — same protocol steps,
+//! tokio's sockets. Duplicated deliberately: it is a *test fixture*, and one
+//! that used the client under test would not be able to fail honestly.
 
 // The producer tests use only `create_topic`; the rest is what the consumer
 // tests need. Shared rather than split so there is one scaffolding producer to
@@ -40,6 +40,12 @@ use kestrel_core::Connection;
 pub struct TestProducer {
     stream: TcpStream,
     conn: Connection,
+    /// Where `stream` is pointed. Tracked so [`Self::await_leader`] can notice
+    /// the topic is led by someone else and move — see there.
+    addr: String,
+    /// The transaction coordinator's own connection. See
+    /// [`Self::call_coordinator`].
+    coordinator: Option<(TcpStream, Connection)>,
     topic: String,
     txn_id: String,
     producer_id: ProducerId,
@@ -51,6 +57,32 @@ pub struct TestProducer {
     next_sequence: i32,
 }
 
+/// One request and its response on a given connection.
+async fn exchange<Req, Resp>(
+    stream: &mut TcpStream,
+    conn: &mut Connection,
+    api_key: ApiKey,
+    version: i16,
+    req: &Req,
+) -> Resp
+where
+    Req: kafka_protocol::protocol::Encodable,
+    Resp: kafka_protocol::protocol::Decodable,
+{
+    let wire = conn.request(api_key, version, req).expect("encode");
+    stream.write_all(&wire).await.expect("write");
+    stream.flush().await.expect("flush");
+    loop {
+        if let Some(resp) = conn.next_response().expect("frame") {
+            return Connection::decode(&resp).expect("decode");
+        }
+        let mut buf = [0u8; 16 * 1024];
+        let n = stream.read(&mut buf).await.expect("read");
+        assert!(n > 0, "broker closed the connection");
+        conn.push_bytes(&buf[..n]);
+    }
+}
+
 impl TestProducer {
     pub async fn connect(addr: &str, topic: &str) -> Self {
         let stream = TcpStream::connect(addr).await.expect("connect");
@@ -58,6 +90,8 @@ impl TestProducer {
         Self {
             stream,
             conn: Connection::new(StrBytes::from_static_str("kestrel-test-producer")),
+            addr: addr.to_owned(),
+            coordinator: None,
             topic: topic.to_owned(),
             txn_id,
             producer_id: ProducerId(-1),
@@ -71,18 +105,33 @@ impl TestProducer {
         Req: kafka_protocol::protocol::Encodable,
         Resp: kafka_protocol::protocol::Decodable,
     {
-        let wire = self.conn.request(api_key, version, req).expect("encode");
-        self.stream.write_all(&wire).await.expect("write");
-        self.stream.flush().await.expect("flush");
-        loop {
-            if let Some(resp) = self.conn.next_response().expect("frame") {
-                return Connection::decode(&resp).expect("decode");
-            }
-            let mut buf = [0u8; 16 * 1024];
-            let n = self.stream.read(&mut buf).await.expect("read");
-            assert!(n > 0, "broker closed the connection");
-            self.conn.push_bytes(&buf[..n]);
-        }
+        exchange(&mut self.stream, &mut self.conn, api_key, version, req).await
+    }
+
+    /// A request that only the **transaction coordinator** will answer.
+    ///
+    /// Kept on its own connection because the coordinator and the partition
+    /// leader are two different brokers in general, and this scaffolding now
+    /// moves its main connection to whichever broker leads the topic. Sending
+    /// `EndTxn` there would get `NOT_COORDINATOR` forever.
+    ///
+    /// On a one-broker cluster both connections point at the same place, which
+    /// is why the single-connection version worked for as long as it did.
+    async fn call_coordinator<Req, Resp>(
+        &mut self,
+        api_key: ApiKey,
+        version: i16,
+        req: &Req,
+    ) -> Resp
+    where
+        Req: kafka_protocol::protocol::Encodable,
+        Resp: kafka_protocol::protocol::Decodable,
+    {
+        let (stream, conn) = self
+            .coordinator
+            .as_mut()
+            .expect("init_transactions must run before any coordinator request");
+        exchange(stream, conn, api_key, version, req).await
     }
 
     /// Create the topic **and wait for a leader**.
@@ -127,13 +176,35 @@ impl TestProducer {
             req.topics = Some(vec![topic]);
 
             let resp: MetadataResponse = self.call(ApiKey::Metadata, 12, &req).await;
-            let ready = resp.topics.iter().any(|t| {
-                t.error_code == 0
-                    && t.partitions
-                        .iter()
-                        .any(|p| p.error_code == 0 && p.leader_id.0 >= 0)
+            let leader = resp.topics.iter().find_map(|t| {
+                (t.error_code == 0)
+                    .then(|| {
+                        t.partitions
+                            .iter()
+                            .find(|p| p.partition_index == 0 && p.error_code == 0 && p.leader_id.0 >= 0)
+                    })
+                    .flatten()
+                    .map(|p| p.leader_id)
             });
-            if ready {
+            if let Some(leader_id) = leader {
+                // **Follow the leader.** This scaffolding writes to partition 0
+                // over a single connection, and a broker that does not lead a
+                // partition answers error 6 forever. Against a one-broker
+                // cluster the bootstrap always led everything, so this never
+                // came up; against three it is right two times in three that it
+                // is wrong.
+                if let Some(broker) = resp.brokers.iter().find(|b| b.node_id == leader_id) {
+                    let addr = format!("{}:{}", broker.host.as_str(), broker.port);
+                    if addr != self.addr {
+                        self.stream = TcpStream::connect(&*addr).await.expect("connect to leader");
+                        // A fresh connection means fresh correlation ids; the
+                        // producer id, epoch and sequence are producer state and
+                        // deliberately survive.
+                        self.conn =
+                            Connection::new(StrBytes::from_static_str("kestrel-test-producer"));
+                        self.addr = addr;
+                    }
+                }
                 return;
             }
             Self::backoff(attempt).await;
@@ -154,7 +225,18 @@ impl TestProducer {
             let resp: FindCoordinatorResponse =
                 self.call(ApiKey::FindCoordinator, 3, &find).await;
             match resp.error_code {
-                0 => break,
+                0 => {
+                    // **Connect to the answer.** An earlier version asked and
+                    // then threw the address away, which is only harmless when
+                    // there is one broker and it is therefore the coordinator.
+                    let addr = format!("{}:{}", resp.host.as_str(), resp.port);
+                    let stream = TcpStream::connect(&*addr).await.expect("connect coordinator");
+                    self.coordinator = Some((
+                        stream,
+                        Connection::new(StrBytes::from_static_str("kestrel-test-producer")),
+                    ));
+                    break;
+                }
                 14..=16 => Self::backoff(attempt).await,
                 code => panic!("FindCoordinator error {code}: {:?}", resp.error_message),
             }
@@ -167,7 +249,7 @@ impl TestProducer {
         init.producer_epoch = -1;
 
         for attempt in 0..40 {
-            let resp: InitProducerIdResponse = self.call(ApiKey::InitProducerId, 4, &init).await;
+            let resp: InitProducerIdResponse = self.call_coordinator(ApiKey::InitProducerId, 4, &init).await;
             match resp.error_code {
                 0 => {
                     self.producer_id = resp.producer_id;
@@ -208,7 +290,7 @@ impl TestProducer {
         // another entry for the taxonomy P2 inherits.
         for attempt in 0..40 {
             let resp: AddPartitionsToTxnResponse =
-                self.call(ApiKey::AddPartitionsToTxn, 3, &req).await;
+                self.call_coordinator(ApiKey::AddPartitionsToTxn, 3, &req).await;
             let code = resp
                 .results_by_topic_v3_and_below
                 .iter()
@@ -232,7 +314,7 @@ impl TestProducer {
         req.producer_epoch = self.producer_epoch;
         req.committed = committed;
 
-        let resp: EndTxnResponse = self.call(ApiKey::EndTxn, 3, &req).await;
+        let resp: EndTxnResponse = self.call_coordinator(ApiKey::EndTxn, 3, &req).await;
         assert_eq!(resp.error_code, 0, "EndTxn error {}", resp.error_code);
     }
 

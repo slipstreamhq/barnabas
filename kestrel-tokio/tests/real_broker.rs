@@ -36,11 +36,20 @@ use kestrel_tokio::{Consumer, IsolationLevel, EARLIEST};
 
 use producer::TestProducer;
 
+/// `KAFKA_BOOTSTRAP` so these can run against the three-broker cluster in
+/// `cluster.sh` as well as a single broker.
 fn bootstrap() -> Vec<String> {
-    vec!["127.0.0.1:9092".to_owned()]
+    std::env::var("KAFKA_BOOTSTRAP")
+        .unwrap_or_else(|_| "127.0.0.1:9092".to_owned())
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .collect()
 }
 
-const BROKER: &str = "127.0.0.1:9092";
+fn broker() -> String {
+    bootstrap().first().expect("a bootstrap address").clone()
+}
+
 
 /// A topic per test, so tests neither see each other's records nor depend on
 /// run order.
@@ -66,7 +75,7 @@ fn run<F: std::future::Future<Output = ()>>(fut: impl FnOnce() -> F + 'static) {
 fn plain_records_round_trip() {
     run(|| async {
         let topic = unique_topic("plain");
-        let mut prod = TestProducer::connect(BROKER, &topic).await;
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
         prod.create_topic().await;
         prod.produce_plain(3).await;
 
@@ -99,7 +108,7 @@ fn plain_records_round_trip() {
 fn an_aborted_transaction_is_invisible() {
     run(|| async {
         let topic = unique_topic("aborted");
-        let mut prod = TestProducer::connect(BROKER, &topic).await;
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
         prod.create_topic().await;
         prod.init_transactions().await;
 
@@ -152,7 +161,7 @@ fn an_aborted_transaction_is_invisible() {
 fn a_commit_after_an_abort_survives() {
     run(|| async {
         let topic = unique_topic("abort-then-commit");
-        let mut prod = TestProducer::connect(BROKER, &topic).await;
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
         prod.create_topic().await;
         prod.init_transactions().await;
 
@@ -191,7 +200,7 @@ fn a_commit_after_an_abort_survives() {
 fn read_uncommitted_sees_aborted_records() {
     run(|| async {
         let topic = unique_topic("uncommitted");
-        let mut prod = TestProducer::connect(BROKER, &topic).await;
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
         prod.create_topic().await;
         prod.init_transactions().await;
 
@@ -223,7 +232,7 @@ fn read_uncommitted_sees_aborted_records() {
 fn seek_positions_the_next_fetch() {
     run(|| async {
         let topic = unique_topic("seek");
-        let mut prod = TestProducer::connect(BROKER, &topic).await;
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
         prod.create_topic().await;
         prod.produce_plain(5).await;
 
@@ -255,16 +264,17 @@ fn seek_positions_the_next_fetch() {
 /// A single-node cluster cannot prove routing chose the right broker — there is
 /// only one — but it does prove the path is taken: the consumer resolves a
 /// leader address from metadata, connects to it, and fetches over that
-/// connection. On this cluster the leader advertises `localhost:9092` while the
-/// bootstrap address is `127.0.0.1:9092`, so the two are distinct strings and a
-/// consumer that skipped routing would hold one connection instead of two.
+/// connection.
+///
+/// Pointed at `cluster.sh`'s three brokers it proves the stronger thing, that
+/// the topic's partitions resolve to more than one leader.
 #[test]
 #[ignore = "needs a Kafka broker on localhost:9092"]
 fn fetches_are_routed_to_the_partition_leader() {
     run(|| async {
         let topic = unique_topic("routing");
-        let mut prod = TestProducer::connect(BROKER, &topic).await;
-        prod.create_topic().await;
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
+        prod.create_topic_with_partitions(8).await;
         prod.produce_plain(1).await;
 
         let mut consumer = Consumer::assign(
@@ -283,9 +293,27 @@ fn fetches_are_routed_to_the_partition_leader() {
             .metadata_leader(&topic, 0)
             .expect("a leader in the cluster map");
         assert!(
-            leader.ends_with(":9092"),
+            leader.contains(':') && leader.rsplit(':').next().unwrap().parse::<u16>().is_ok(),
             "leader address came from metadata: {leader}"
         );
+
+        // **On a real cluster, prove routing rather than assume it.** With more
+        // than one broker the topic's partitions are led by more than one of
+        // them, so the cluster map must hold more than one distinct address —
+        // something a consumer that just reused its bootstrap connection could
+        // never produce. Against a single broker there is nothing to prove and
+        // the check is skipped.
+        if bootstrap().len() > 1 {
+            let mut leaders: Vec<String> = (0..8)
+                .filter_map(|p| consumer.metadata_leader(&topic, p))
+                .collect();
+            leaders.sort_unstable();
+            leaders.dedup();
+            assert!(
+                leaders.len() > 1,
+                "partitions on a multi-broker cluster resolved to one leader: {leaders:?}"
+            );
+        }
 
         let records = fetch_until(&mut consumer, 1).await;
         assert_eq!(records.len(), 1);

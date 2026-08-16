@@ -38,6 +38,7 @@ use std::time::Duration;
 
 pub mod cluster;
 pub mod sasl;
+mod join;
 mod timeout;
 pub mod consumer;
 pub mod producer;

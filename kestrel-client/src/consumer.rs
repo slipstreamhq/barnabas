@@ -346,10 +346,21 @@ impl<T: Transport> Consumer<T> {
             let mut out = Vec::new();
             let mut needs_refresh: Vec<(String, i32)> = Vec::new();
 
-            for (addr, partitions) in by_broker {
-                let req = self.fetch_request(&addr, &partitions);
-                let resp: FetchResponse =
-                    self.cluster.call_at(&addr, ApiKey::Fetch, 12, &req).await?;
+            // **Every broker's fetch goes out before any of them is awaited.**
+            // A core holding partitions on three brokers otherwise pays three
+            // round trips per poll where one would do; see
+            // [`Cluster::call_many`].
+            let requests: Vec<(String, FetchRequest)> = by_broker
+                .iter()
+                .map(|(addr, partitions)| (addr.clone(), self.fetch_request(addr, partitions)))
+                .collect();
+            let responses = self
+                .cluster
+                .call_many::<_, FetchResponse>(ApiKey::Fetch, 12, &requests)
+                .await;
+
+            for ((addr, partitions), response) in by_broker.into_iter().zip(responses) {
+                let resp = response?;
 
                 // A session the broker has forgotten is not a failure: drop it
                 // and the next fetch is a full one.

@@ -18,10 +18,19 @@ use kestrel_glommio::{Consumer, Producer, ProducerRecord, EARLIEST};
 mod producer;
 use producer::TestProducer;
 
-const BROKER: &str = "127.0.0.1:9092";
 
+/// `KAFKA_BOOTSTRAP` so these can run against the three-broker cluster in
+/// `cluster.sh` as well as a single broker.
 fn bootstrap() -> Vec<String> {
-    vec![BROKER.to_owned()]
+    std::env::var("KAFKA_BOOTSTRAP")
+        .unwrap_or_else(|_| "127.0.0.1:9092".to_owned())
+        .split(',')
+        .map(|s| s.trim().to_owned())
+        .collect()
+}
+
+fn broker() -> String {
+    bootstrap().first().expect("a bootstrap address").clone()
 }
 
 fn unique(prefix: &str) -> String {
@@ -58,7 +67,7 @@ async fn make_topic(topic: &str) {
 }
 
 async fn make_topic_with_partitions(topic: &str, partitions: i32) {
-    let mut admin = TestProducer::connect(BROKER, topic).await;
+    let mut admin = TestProducer::connect(&broker(), topic).await;
     admin.create_topic_with_partitions(partitions).await;
 }
 
