@@ -868,6 +868,121 @@ fn rdkafka_produce_many_clients(topic: &str, clients: usize, cell: &Cell) -> Dur
     start.elapsed()
 }
 
+// ── rskafka ──────────────────────────────────────────────────────────────────
+//
+// The other pure-Rust client, and the closest peer to this one: async, no C
+// library, no background thread pool. Two differences shape every number below
+// and neither is a criticism — they are design choices.
+//
+// - **A client is bound to one partition.** `partition_client(topic, p)` is the
+//   unit, so eight partitions mean eight clients and eight connections, and a
+//   write to eight partitions is eight requests. This client's whole produce
+//   path is built the other way round: one request per *broker*, carrying every
+//   partition it leads.
+// - **No idempotent producer.** `acks` is -1 as ours is, but there are no
+//   sequence numbers, so rskafka does less work per batch than we do. That
+//   favours rskafka here.
+
+fn rskafka_client(runtime: &tokio::runtime::Runtime) -> rskafka::client::Client {
+    runtime.block_on(async {
+        rskafka::client::ClientBuilder::new(brokers())
+            .build()
+            .await
+            .expect("rskafka client")
+    })
+}
+
+fn rskafka_record(value: &[u8], key: &str) -> rskafka::record::Record {
+    rskafka::record::Record {
+        key: Some(key.as_bytes().to_vec()),
+        value: Some(value.to_vec()),
+        headers: std::collections::BTreeMap::new(),
+        timestamp: chrono::DateTime::from_timestamp_millis(0).expect("epoch"),
+    }
+}
+
+fn rskafka_produce(topic: &str, cell: &Cell) -> Duration {
+    use rskafka::client::partition::{Compression, UnknownTopicHandling};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let client = rskafka_client(&runtime);
+
+    runtime.block_on(async {
+        let mut partitions = Vec::new();
+        for partition in 0..PARTITIONS {
+            partitions.push(
+                client
+                    .partition_client(topic.to_owned(), partition, UnknownTopicHandling::Retry)
+                    .await
+                    .expect("partition client"),
+            );
+        }
+
+        let value = payload(cell.value_bytes);
+        let batch: Vec<rskafka::record::Record> = (0..cell.batch)
+            .map(|i| rskafka_record(&value, &format!("k{i}")))
+            .collect();
+
+        let start = Instant::now();
+        for round in 0..(cell.records / cell.batch) {
+            let partition = &partitions[round % partitions.len()];
+            partition
+                .produce(batch.clone(), Compression::NoCompression)
+                .await
+                .expect("produce");
+        }
+        start.elapsed()
+    })
+}
+
+fn rskafka_consume(topic: &str, expect: usize) -> Duration {
+    use rskafka::client::partition::UnknownTopicHandling;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let client = rskafka_client(&runtime);
+
+    runtime.block_on(async {
+        let mut partitions = Vec::new();
+        for partition in 0..PARTITIONS {
+            partitions.push(
+                client
+                    .partition_client(topic.to_owned(), partition, UnknownTopicHandling::Retry)
+                    .await
+                    .expect("partition client"),
+            );
+        }
+
+        let start = Instant::now();
+        let mut offsets = vec![0i64; partitions.len()];
+        let mut seen = 0;
+        while seen < expect {
+            let mut got = 0;
+            for (i, partition) in partitions.iter().enumerate() {
+                let (records, _high) = partition
+                    .fetch_records(offsets[i], 1..10_485_760, 100)
+                    .await
+                    .expect("fetch");
+                if let Some(last) = records.last() {
+                    offsets[i] = last.offset + 1;
+                }
+                got += records.len();
+            }
+            if got == 0 {
+                break;
+            }
+            seen += got;
+        }
+        assert_eq!(seen, expect, "rskafka consumed {seen} of {expect}");
+        start.elapsed()
+    })
+}
+
 fn main() {
     println!(
         "{PARTITIONS} partitions, acks=all, idempotent, RF 1, {} broker(s)\n",
@@ -875,7 +990,9 @@ fn main() {
     );
 
     if want("produce") {
-        println!("produce throughput            kestrel rec/s   rdkafka rec/s     ratio");
+        println!(
+            "produce throughput    kestrel rec/s   rdkafka rec/s   rskafka rec/s   vs rsk"
+        );
         let cells = [
             // Small batches first, because that is where an internal accumulator
             // earns its keep and where this client has none.
@@ -895,11 +1012,19 @@ fn main() {
             create_topic(&rd_topic);
             let rdkafka = cell.rate(rdkafka_produce(&rd_topic, cell));
 
-            let ratio = kestrel / rdkafka;
-            let marker = if ratio < 1.0 { "  <-- slower" } else { "" };
+            let rs_topic = topic("s");
+            create_topic(&rs_topic);
+            let rskafka = cell.rate(rskafka_produce(&rs_topic, cell));
+
+            let ratio = kestrel / rskafka;
+            let marker = if kestrel < rdkafka || kestrel < rskafka {
+                "  <-- slower"
+            } else {
+                ""
+            };
             println!(
-                "batch {:>5}, {:>5} B      {:>12.0}   {:>12.0}   {:>6.2}x{marker}",
-                cell.batch, cell.value_bytes, kestrel, rdkafka, ratio
+                "batch {:>5}, {:>5} B  {:>12.0}   {:>12.0}   {:>12.0}   {:>5.2}x{marker}",
+                cell.batch, cell.value_bytes, kestrel, rdkafka, rskafka, ratio
             );
         }
     }
@@ -962,7 +1087,9 @@ fn main() {
     }
 
     if want("consume") {
-        println!("\nconsume throughput            kestrel rec/s   rdkafka rec/s     ratio");
+        println!(
+            "\nconsume throughput    kestrel rec/s   rdkafka rec/s   rskafka rec/s   vs rsk"
+        );
         let cell = Cell { batch: 1_000, value_bytes: 128, records: consume_records() };
 
         let kestrel_topic = topic("kc");
@@ -975,11 +1102,20 @@ fn main() {
         rdkafka_produce(&rd_topic, &cell);
         let rdkafka_rate = cell.rate(rdkafka_consume(&rd_topic, cell.records));
 
-        let ratio = kestrel_rate / rdkafka_rate;
-        let marker = if ratio < 1.0 { "  <-- slower" } else { "" };
+        let rs_topic = topic("sc");
+        create_topic(&rs_topic);
+        kestrel_produce(&rs_topic, &cell);
+        let rskafka_rate = cell.rate(rskafka_consume(&rs_topic, cell.records));
+
+        let ratio = kestrel_rate / rskafka_rate;
+        let marker = if kestrel_rate < rdkafka_rate || kestrel_rate < rskafka_rate {
+            "  <-- slower"
+        } else {
+            ""
+        };
         println!(
-            "{:>5} B                    {:>12.0}   {:>12.0}   {:>6.2}x{marker}",
-            cell.value_bytes, kestrel_rate, rdkafka_rate, ratio
+            "{:>5} B              {:>12.0}   {:>12.0}   {:>12.0}   {:>5.2}x{marker}",
+            cell.value_bytes, kestrel_rate, rdkafka_rate, rskafka_rate, ratio
         );
 
         // ── compression ─────────────────────────────────────────────────────────

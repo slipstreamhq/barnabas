@@ -37,9 +37,21 @@ impl kestrel_client::Transport for Glommio {
     async fn connect(&self, addr: &str) -> io::Result<Self::Stream> {
         // glommio's error type is its own; the seam speaks `io::Error`, which
         // every runtime can produce.
-        TcpStream::connect(addr)
+        let stream = TcpStream::connect(addr)
             .await
-            .map_err(|e| io::Error::other(e.to_string()))
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        // **TCP_NODELAY.** Kafka is request/response over a long-lived
+        // connection, which is the exact shape Nagle's algorithm penalises: a
+        // request whose last segment is partial waits for the peer's ACK, and
+        // the peer's delayed-ACK timer holds that for tens of milliseconds. The
+        // Java client and librdkafka both set this. Measuring rskafka, which
+        // does not, showed the cost precisely — a reproducible ~41 ms per
+        // request at one payload size, and 24 requests/s where neighbouring
+        // sizes managed 20 000.
+        stream
+            .set_nodelay(true)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(stream)
     }
 
     async fn read(stream: &mut Self::Stream, buf: &mut [u8]) -> io::Result<usize> {

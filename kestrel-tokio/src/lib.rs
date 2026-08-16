@@ -40,7 +40,17 @@ impl kestrel_client::Transport for Tokio {
     type Stream = TcpStream;
 
     async fn connect(&self, addr: &str) -> io::Result<Self::Stream> {
-        TcpStream::connect(addr).await
+        let stream = TcpStream::connect(addr).await?;
+        // **TCP_NODELAY.** Kafka is request/response over a long-lived
+        // connection, which is the exact shape Nagle's algorithm penalises: a
+        // request whose last segment is partial waits for the peer's ACK, and
+        // the peer's delayed-ACK timer holds that for tens of milliseconds. The
+        // Java client and librdkafka both set this. Measuring rskafka, which
+        // does not, showed the cost precisely — a reproducible ~41 ms per
+        // request at one payload size, and 24 requests/s where neighbouring
+        // sizes managed 20 000.
+        stream.set_nodelay(true)?;
+        Ok(stream)
     }
 
     async fn read(stream: &mut Self::Stream, buf: &mut [u8]) -> io::Result<usize> {

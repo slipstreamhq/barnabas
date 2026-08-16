@@ -230,6 +230,53 @@ partition busy — so until now it shipped unmeasured.
 which floors every poll at ~1.2 ms, and duly reported 839 vs 851 polls/s — a 1% "result" that was
 entirely the broker's wait timer.
 
+## Against rskafka — the other pure-Rust client
+
+`rskafka` 0.6, from InfluxData's IOx: async, no C library, no background thread pool. Architecturally
+the closest thing to this client, and therefore the most informative comparison in this file.
+
+| cell | kestrel | rskafka | verdict |
+|---|---:|---:|---|
+| batch 1, 128 B | 24 100 – 25 200 | 21 100 – 25 600 | tie |
+| batch 10, 128 B | 156 000 – 163 000 | 192 000 – 215 000 | **rskafka, by 15–27%** |
+| batch 100, 128 B | 1 094 000 – 1 170 000 | 2 435 | see below — not a real comparison |
+| batch 1 000, 128 B | 3 972 000 – 4 569 000 | 1 176 000 – 3 139 000 | kestrel, 1.3× – 3.9× |
+| batch 1 000, 1 KiB | 1 685 000 – 1 954 000 | 1 292 000 – 1 364 000 | kestrel, 1.2× – 1.5× |
+| consume, 128 B | 2 950 000 – 3 007 000 | **4 334 000 – 4 387 000** | **rskafka, by ~45%** |
+
+**We are not fastest on every dimension.** rskafka beats us at small batches and, more importantly,
+**beats us on consume by about 45%**. The ~20× consume advantage over librdkafka elsewhere in this
+file says more about librdkafka's per-message `StreamConsumer` API than about our decoder, and this
+row is the evidence.
+
+Two differences do real work for us and should be weighed against those losses, but they do not
+explain them away:
+
+- **rskafka has no idempotent producer.** No sequence numbers to allocate or track, so it does less
+  per batch than we do.
+- **rskafka has no transactions**, so its consumer does no READ_COMMITTED filtering. Ours reads
+  `aborted_transactions` and filters every batch.
+
+It also binds a client to **one partition**, so eight partitions are eight clients and eight
+connections, and a write spanning them is eight requests. Ours is one request per *broker*. That is
+the trade this client was designed around, and at batch 1 000 it shows.
+
+### The batch-100 figure is not a comparison
+
+2 435 records/s, reproducible to four significant figures across runs, while the neighbouring cells
+manage 20 000 requests/s. Per request that is ~41 ms, against ~0.05 ms at batch 10 — a fixed delay,
+not a size law.
+
+**`rskafka` does not set `TCP_NODELAY`** (no `set_nodelay` anywhere in its source), and ~40 ms is the
+classic delayed-ACK timer. That is consistent with Nagle holding a partial final segment until the
+peer's delayed ACK arrives, at one payload size and not its neighbours. Stated as the likely cause,
+not a proven one — no packet capture was taken. **Do not read 449× from that row.**
+
+**We were not setting it either.** Every serious Kafka client does — Java and librdkafka both — and
+this client now does too, on both runtimes. It changed none of the numbers above, because none of
+our payload sizes were landing in that trap, but it is a latent hazard removed on a client that is
+supposed to be about tail latency.
+
 ## Against the Java client — the comparison that matters
 
 `./java-bench.sh`, which runs Apache's own `kafka-producer-perf-test` and
@@ -319,8 +366,13 @@ than defended.
   disk; RF is 1. A cluster on separate hosts could move every row here.
 - **The occasional 2-core dips** are unexplained, though far milder than what the retry backoff was
   causing.
-- **Whether 25–29 M records/s is our ceiling or the cluster's** is unknown; the other two clients are
-  far enough below it that only our own number is in question.
+- **Whether 25–29 M records/s is our ceiling or the cluster's** is unknown; the other clients are far
+  enough below it that only our own number is in question.
+- **Why rskafka consumes ~45% faster than we do** is not understood, and it is the most useful open
+  question in this file. Our READ_COMMITTED filtering is extra work it does not do, but that is an
+  explanation to test rather than a conclusion.
+- **rskafka has no many-core row.** Its per-partition client shape makes the comparison less direct,
+  and it has not been run.
 - **lz4's slowness** is unexplained.
 - **No sustained run in this file.** `KESTREL_SOAK_SECONDS` produces continuously and prints per-10s
   rates and RSS, but no long run has been recorded here yet.
