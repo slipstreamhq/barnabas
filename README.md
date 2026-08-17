@@ -5,10 +5,14 @@ including thread-per-core ones, which is what it was built for.
 
 **Working name, and early.** Nothing here is published and the API will change.
 
-> **No consumer groups yet.** You choose the partitions and store the offsets. If you want
-> `subscribe("topic")` with rebalancing and committed offsets — which is what most projects
-> want — this client cannot do it today; use [`rdkafka`](https://crates.io/crates/rdkafka) or
-> the Java client. Groups are the next major piece: see [`docs/consumer-groups.md`](docs/consumer-groups.md).
+> **No consumer groups yet, and no reaction to topic expansion.** You choose the partitions
+> and store the offsets. If you want `subscribe("topic")` with rebalancing and committed
+> offsets — which is what most projects want — this client cannot do it today; use
+> [`rdkafka`](https://crates.io/crates/rdkafka) or the Java client.
+>
+> The sharper edge: a topic you do not own can gain partitions at any time, and this client
+> will not notice. `assign_all` means *all of them as of process start*, so new partitions go
+> unread with no error. Both are scoped in [`docs/consumer-groups.md`](docs/consumer-groups.md).
 
 Design and sequencing:
 `../docs/superpowers/specs/2026-08-15-native-kafka-client-design.md`.

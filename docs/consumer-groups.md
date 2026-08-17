@@ -21,6 +21,37 @@ routing, fetch batching, the lean decoder, the filtering — is shared and does
 not change. If groups were to require reworking that, the design would be
 wrong.
 
+## The part that bites Slipstream too: topics it does not own
+
+A topic is usually created and produced by another team. You do not choose its
+partition count, you are not told when it changes, and **expansion is routine** —
+adding partitions is how a topic is scaled.
+
+This is a correctness gap, not an ergonomic one, and it is separate from
+groups:
+
+- `assign_all` resolves the count **once, at build**. A topic expanded from 8
+  to 16 partitions afterwards leaves partitions 8–15 unread indefinitely.
+  Nothing errors. The job looks healthy and is silently missing a share of its
+  input.
+- Kafka's group protocol handles this incidentally: the coordinator reassigns
+  on a metadata change, so a `subscribe` consumer picks up new partitions.
+  That is a real advantage of groups that has nothing to do with coordination.
+
+**Slipstream needs an answer to this even though it does not want groups.** Its
+control plane can decide *who* owns a partition, but it cannot know a partition
+exists until Kafka says so. So something must watch metadata for the count
+changing and tell the control plane to re-assign. That is a smaller piece of
+work than the group protocol and is independently valuable:
+
+- a metadata watch, or a cheap `partition_count` poll the caller drives
+- an explicit signal when the count changes, rather than a silent difference
+- for the assign-only path, a documented "you must handle expansion" rather
+  than an `assign_all` that quietly means "all of them as of process start"
+
+Until that exists, `assign_all` is honest only for a topic whose partition
+count is fixed by someone who tells you when it is not.
+
 ## What "parity" should and should not mean
 
 Parity with librdkafka in full includes Kerberos/GSSAPI, interceptors,

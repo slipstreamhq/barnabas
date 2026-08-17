@@ -179,8 +179,18 @@ impl<T: Transport> ConsumerReady<T> {
     /// there is no consumer group here, so a process that wants a share of a
     /// topic rather than all of it assigns that share itself.
     ///
-    /// Resolved once, at [`build`](Self::build). A topic expanded afterwards is
-    /// not picked up until the consumer is rebuilt.
+    /// **Resolved once, at [`build`](Self::build), and that is a real hazard for
+    /// a topic you do not own.** Adding partitions is how a topic is scaled,
+    /// and it is usually done by whoever produces to it. A topic expanded from
+    /// 8 to 16 partitions after this call leaves partitions 8–15 unread
+    /// indefinitely: nothing errors, and the consumer looks healthy while
+    /// missing a share of its input.
+    ///
+    /// Until this client can watch for that — see `docs/consumer-groups.md`,
+    /// which is where the fix is scoped — `assign_all` means *all of them as of
+    /// now*, and a caller reading a topic owned by someone else should poll
+    /// [`Consumer::partition_count`](crate::Consumer::partition_count) and
+    /// rebuild when it grows.
     #[must_use]
     pub fn assign_all(mut self, topic: impl Into<String>, start: StartOffset) -> Self {
         self.every_partition.push((topic.into(), start));
