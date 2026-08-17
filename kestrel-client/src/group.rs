@@ -128,9 +128,13 @@ pub enum Membership {
     InProgress,
     /// Assigned and stable. The partitions are this member's to fetch.
     Assigned(Vec<TopicPartition>),
-    /// Everything was revoked. The caller must stop fetching **before** the
-    /// next call, because another member is about to be given these.
-    Revoked,
+    /// These partitions were given up. The caller must stop fetching them
+    /// **before** the next call, because another member is about to be given
+    /// them.
+    ///
+    /// Under the eager protocol that is everything this member held; under the
+    /// cooperative one it is only what moved, and the rest keeps being read.
+    Revoked(Vec<TopicPartition>),
 }
 
 /// The classic protocol: `JoinGroup`, `SyncGroup`, `Heartbeat`.
@@ -151,8 +155,17 @@ pub struct ClassicProtocol {
 impl ClassicProtocol {
     #[must_use]
     pub fn new(group_id: impl Into<String>, topics: Vec<String>, assignor: Box<dyn Assignor>) -> Self {
+        // **The assignor decides the protocol**, because they are the same
+        // choice: `cooperative-sticky` is a name the group agrees on *and* a
+        // different revocation flow. Letting them be set separately is letting
+        // them disagree.
+        let protocol = if assignor.name() == "cooperative-sticky" {
+            kestrel_core::member::RebalanceProtocol::Cooperative
+        } else {
+            kestrel_core::member::RebalanceProtocol::Eager
+        };
         Self {
-            member: GroupMember::new(group_id, topics),
+            member: GroupMember::new(group_id, topics).with_protocol(protocol),
             assignor,
             coordinator: None,
             session_timeout_ms: 45_000,
@@ -358,7 +371,7 @@ impl<T: Transport> GroupProtocol<T> for ClassicProtocol {
         // be told it owns them.
         if self.ever_assigned && !self.announced_revoked {
             self.announced_revoked = true;
-            return Ok(Membership::Revoked);
+            return Ok(Membership::Revoked(self.member.lost().to_vec()));
         }
         Ok(Membership::InProgress)
     }

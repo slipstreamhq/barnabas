@@ -42,6 +42,24 @@ pub mod codes {
 /// No generation yet, which is what the protocol calls -1.
 pub const NO_GENERATION: i32 = -1;
 
+/// How partitions change hands during a rebalance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RebalanceProtocol {
+    /// Everyone gives up everything, then the new assignment arrives.
+    ///
+    /// Simple, and a stop-the-world pause proportional to the slowest member:
+    /// nobody consumes anything between revocation and reassignment.
+    #[default]
+    Eager,
+    /// Keep what you are not losing (KIP-429).
+    ///
+    /// A rebalance revokes only the partitions that must move, and a member
+    /// that loses one gives it up and **rejoins immediately** to trigger the
+    /// round that hands it over. Two rounds instead of one, and no pause on
+    /// the partitions nobody is taking.
+    Cooperative,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberState {
     /// Not a member: no id, or ours was rejected.
@@ -81,6 +99,10 @@ pub struct GroupMember {
     topics: Vec<String>,
     assignment: Vec<TopicPartition>,
     leader: bool,
+    protocol: RebalanceProtocol,
+    /// Partitions this member lost in the last sync and must give up before
+    /// rejoining. Cooperative only.
+    lost: Vec<TopicPartition>,
     /// The membership the coordinator handed us as leader, kept until the
     /// assignment is computed.
     ///
@@ -103,8 +125,30 @@ impl GroupMember {
             topics,
             assignment: Vec::new(),
             leader: false,
+            protocol: RebalanceProtocol::Eager,
+            lost: Vec::new(),
             pending_members: Vec::new(),
         }
+    }
+
+    /// Use the cooperative protocol (KIP-429) rather than the eager one.
+    #[must_use]
+    pub fn with_protocol(mut self, protocol: RebalanceProtocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    #[must_use]
+    pub fn protocol(&self) -> RebalanceProtocol {
+        self.protocol
+    }
+
+    /// What the last sync took away, for the caller to stop reading before it
+    /// rejoins. Cooperative only; empty under the eager protocol, which revokes
+    /// everything instead.
+    #[must_use]
+    pub fn lost(&self) -> &[TopicPartition] {
+        &self.lost
     }
 
     #[must_use]
@@ -246,9 +290,36 @@ impl GroupMember {
     pub fn on_sync(&mut self, error: i16, assigned: Vec<TopicPartition>) -> Step {
         match error {
             codes::NONE => {
+                self.lost.clear();
+                if self.protocol == RebalanceProtocol::Cooperative {
+                    // **What is missing from the assignment is what moved.**
+                    // The leader withheld it from its new owner too, so it
+                    // belongs to nobody until this member gives it up and the
+                    // next round hands it over.
+                    let mut assigned_sorted = assigned.clone();
+                    assigned_sorted.sort();
+                    self.lost = self
+                        .assignment
+                        .iter()
+                        .filter(|tp| !assigned_sorted.contains(tp))
+                        .cloned()
+                        .collect();
+                }
                 self.assignment = assigned;
                 self.assignment.sort();
                 self.state = MemberState::Stable;
+
+                if !self.lost.is_empty() {
+                    // Rejoin at once: the partitions this member released are
+                    // assigned to nobody until it does.
+                    self.state = MemberState::Unjoined;
+                    self.generation = NO_GENERATION;
+                    self.leader = false;
+                    self.pending_members.clear();
+                    return Step::Join {
+                        member_id: self.member_id.clone(),
+                    };
+                }
                 Step::Heartbeat
             }
             // The group moved on while we were syncing.
@@ -329,7 +400,18 @@ impl GroupMember {
     /// partitions across a rebalance keeps fetching them while their new owner
     /// does too, which is duplicate consumption that no error reports.
     fn revoke_and_rejoin(&mut self) {
-        self.assignment.clear();
+        // **Cooperative members keep reading while the group rebalances.** The
+        // assignment that comes back says what they lost; giving everything up
+        // here would reintroduce exactly the pause KIP-429 removes.
+        if self.protocol == RebalanceProtocol::Eager {
+            // Eager gives up everything, so everything is what was lost. Saying
+            // so here means a caller can act on one list whichever protocol is
+            // in use, instead of inferring "all of them" from the absence of
+            // one.
+            self.lost = std::mem::take(&mut self.assignment);
+        } else {
+            self.lost.clear();
+        }
         self.pending_members.clear();
         self.generation = NO_GENERATION;
         self.leader = false;
@@ -547,6 +629,73 @@ mod tests {
         assert!(!m.can_commit());
     }
 
+    fn cooperative() -> GroupMember {
+        GroupMember::new("g", vec!["t".to_owned()])
+            .with_protocol(RebalanceProtocol::Cooperative)
+    }
+
+    /// **A cooperative member keeps reading while the group rebalances.**
+    /// Giving everything up here is the stop-the-world pause KIP-429 exists to
+    /// remove.
+    #[test]
+    fn a_cooperative_rebalance_keeps_the_partitions() {
+        let mut m = cooperative();
+        m.on_join(codes::NONE, 1, "m-1", "m-2", vec![]);
+        m.on_sync(codes::NONE, vec![tp(0), tp(1)]);
+
+        m.on_heartbeat(codes::REBALANCE_IN_PROGRESS);
+        assert_eq!(
+            m.assignment(),
+            &[tp(0), tp(1)],
+            "cooperative members keep what nobody has taken yet"
+        );
+        assert!(!m.can_commit(), "but they are not stable, so they do not commit");
+    }
+
+    /// The eager protocol does the opposite, and that is the difference.
+    #[test]
+    fn an_eager_rebalance_gives_everything_up() {
+        let mut m = member();
+        m.on_join(codes::NONE, 1, "m-1", "m-2", vec![]);
+        m.on_sync(codes::NONE, vec![tp(0), tp(1)]);
+
+        m.on_heartbeat(codes::REBALANCE_IN_PROGRESS);
+        assert!(m.assignment().is_empty());
+    }
+
+    /// **What the assignment leaves out is what moved.** The member reports it
+    /// as lost and rejoins at once, because until it does the partition belongs
+    /// to nobody.
+    #[test]
+    fn a_smaller_assignment_is_a_handover() {
+        let mut m = cooperative();
+        m.on_join(codes::NONE, 1, "m-1", "m-2", vec![]);
+        m.on_sync(codes::NONE, vec![tp(0), tp(1), tp(2)]);
+        assert!(m.lost().is_empty());
+
+        m.on_heartbeat(codes::REBALANCE_IN_PROGRESS);
+        m.on_join(codes::NONE, 2, "m-1", "m-2", vec![]);
+        let step = m.on_sync(codes::NONE, vec![tp(0)]);
+
+        assert_eq!(m.lost(), &[tp(1), tp(2)], "the two that moved");
+        assert_eq!(m.assignment(), &[tp(0)], "and the one that did not");
+        assert_eq!(
+            step,
+            Step::Join { member_id: "m-1".to_owned() },
+            "rejoin at once: the released partitions have no owner until we do"
+        );
+    }
+
+    /// Losing nothing is the steady state, and must not trigger a second round.
+    #[test]
+    fn an_unchanged_assignment_does_not_rejoin() {
+        let mut m = cooperative();
+        m.on_join(codes::NONE, 1, "m-1", "m-2", vec![]);
+        assert_eq!(m.on_sync(codes::NONE, vec![tp(0)]), Step::Heartbeat);
+        assert!(m.lost().is_empty());
+        assert_eq!(m.state(), MemberState::Stable);
+    }
+
     /// **The invariant behind all of it**: whenever this member is not stable,
     /// it owns nothing and may not commit. Checked over every error code the
     /// machine reacts to, from every state that can receive one.
@@ -564,6 +713,7 @@ mod tests {
 
         for error in errors {
             let mut m = member();
+            let _ = RebalanceProtocol::default();
             m.on_join(codes::NONE, 1, "m-1", "m-2", vec![]);
             m.on_sync(codes::NONE, vec![tp(0), tp(1)]);
             assert!(m.can_commit());

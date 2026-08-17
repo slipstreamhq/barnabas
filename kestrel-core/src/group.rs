@@ -224,6 +224,12 @@ impl Assignor for StickyAssignor {
         let mut assignment: Assignment =
             members.iter().map(|m| (m.member_id.clone(), Vec::new())).collect();
 
+        let mut sorted: Vec<&Subscription> = members.iter().collect();
+        sorted.sort_unstable_by(|a, b| a.member_id.cmp(&b.member_id));
+        if sorted.is_empty() {
+            return assignment;
+        }
+
         let valid: BTreeSet<TopicPartition> = partitions_per_topic
             .iter()
             .flat_map(|(topic, &count)| {
@@ -231,17 +237,33 @@ impl Assignor for StickyAssignor {
             })
             .collect();
 
-        // Keep what is still real, still subscribed, and not claimed twice.
-        let mut taken: BTreeSet<TopicPartition> = BTreeSet::new();
-        let mut sorted: Vec<&Subscription> = members.iter().collect();
-        sorted.sort_unstable_by(|a, b| a.member_id.cmp(&b.member_id));
+        // **Balance first, stickiness second.** Keeping every partition a member
+        // already holds is not sticky, it is inert: a member that joins an
+        // established group would never be given anything, because nothing is
+        // ever taken from anyone. So each member keeps at most its fair share,
+        // and the surplus is redealt.
+        let subscribers: Vec<&&Subscription> = sorted.iter().collect();
+        let quota_of = |member: &Subscription| -> usize {
+            let wanted: usize = valid
+                .iter()
+                .filter(|tp| member.topics.contains(&tp.topic))
+                .count();
+            let sharers = subscribers
+                .iter()
+                .filter(|m| m.topics.iter().any(|t| member.topics.contains(t)))
+                .count()
+                .max(1);
+            wanted.div_ceil(sharers)
+        };
 
+        let mut taken: BTreeSet<TopicPartition> = BTreeSet::new();
         for member in &sorted {
+            let quota = quota_of(member);
             for tp in &member.owned {
-                if valid.contains(tp)
-                    && !taken.contains(tp)
-                    && member.topics.contains(&tp.topic)
-                {
+                if assignment[&member.member_id].len() >= quota {
+                    break;
+                }
+                if valid.contains(tp) && !taken.contains(tp) && member.topics.contains(&tp.topic) {
                     taken.insert(tp.clone());
                     assignment
                         .get_mut(&member.member_id)
@@ -251,9 +273,10 @@ impl Assignor for StickyAssignor {
             }
         }
 
-        // Deal the rest to whoever holds fewest, breaking ties by member id so
-        // the outcome does not depend on map iteration order.
-        for tp in valid.difference(&taken.clone()) {
+        // Whatever is left — never owned, owned by a member over quota, or
+        // owned by nobody subscribed — goes to whoever holds fewest.
+        let remaining: Vec<TopicPartition> = valid.difference(&taken).cloned().collect();
+        for tp in remaining {
             let candidate = sorted
                 .iter()
                 .filter(|m| m.topics.contains(&tp.topic))
@@ -275,6 +298,67 @@ impl Assignor for StickyAssignor {
             partitions.sort();
         }
         assignment
+    }
+}
+
+/// Sticky, but handing partitions over **one rebalance at a time**.
+///
+/// Java's `CooperativeStickyAssignor`, and the protocol change in KIP-429. The
+/// difference from every assignor above is not how the target is computed but
+/// what is *published*: a partition that must move from one member to another
+/// is given to **neither** in this round. Its current owner sees it missing
+/// from its assignment, revokes it, and rejoins; the next round hands it to its
+/// new owner.
+///
+/// That is what makes the rebalance incremental. Under the eager protocol every
+/// member gives up everything and stops consuming until the new assignment
+/// arrives — a stop-the-world pause proportional to the slowest member. Under
+/// this one a member keeps everything it is not losing and never stops reading
+/// it.
+///
+/// The cost is an extra rebalance round, which is why the assignment this
+/// returns is deliberately *incomplete* and must not be mistaken for a bug.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CooperativeStickyAssignor;
+
+impl Assignor for CooperativeStickyAssignor {
+    fn name(&self) -> &'static str {
+        "cooperative-sticky"
+    }
+
+    fn assign(
+        &self,
+        members: &[Subscription],
+        partitions_per_topic: &BTreeMap<String, i32>,
+    ) -> Assignment {
+        // The target: where each partition should end up.
+        let target = StickyAssignor.assign(members, partitions_per_topic);
+
+        // Who holds what right now, so a move can be spotted.
+        let mut owner: BTreeMap<&TopicPartition, &str> = BTreeMap::new();
+        for member in members {
+            for tp in &member.owned {
+                owner.insert(tp, member.member_id.as_str());
+            }
+        }
+
+        // Publish only what is not being taken from someone else.
+        target
+            .into_iter()
+            .map(|(member_id, partitions)| {
+                let kept = partitions
+                    .into_iter()
+                    .filter(|tp| match owner.get(tp) {
+                        // Held by another member: it must revoke first, so this
+                        // round assigns it to nobody.
+                        Some(current) => *current == member_id,
+                        // Unowned — free to hand out now.
+                        None => true,
+                    })
+                    .collect();
+                (member_id, kept)
+            })
+            .collect()
     }
 }
 
@@ -486,6 +570,24 @@ mod tests {
         assert!(assignment["c1"].contains(&TopicPartition::new("t", 3)));
     }
 
+    /// **Sticky must balance, not merely preserve.** A member joining an
+    /// established group has to be given something, which means taking it from
+    /// someone. An earlier version kept every owned partition and only dealt
+    /// out unowned ones, so a new member sat idle forever and
+    /// `cooperative-sticky` had nothing to hand over.
+    #[test]
+    fn sticky_takes_from_the_over_provisioned_to_feed_a_new_member() {
+        let assignment = StickyAssignor.assign(
+            &[
+                holding("c0", &["t"], &[("t", 0), ("t", 1), ("t", 2), ("t", 3)]),
+                holding("c1", &["t"], &[]),
+            ],
+            &topics(&[("t", 4)]),
+        );
+        assert_eq!(assignment["c0"].len(), 2, "the incumbent gives up half");
+        assert_eq!(assignment["c1"].len(), 2, "the newcomer is fed");
+    }
+
     /// A partition two members both claim to own is given to exactly one.
     /// After a rebalance both may believe they hold it, and handing it to both
     /// is duplicate consumption.
@@ -515,6 +617,43 @@ mod tests {
             &topics(&[("t", 1)]),
         );
         assert_eq!(assignment["c0"], vec![TopicPartition::new("t", 0)]);
+    }
+
+    /// **A partition moving between members is assigned to neither**, this
+    /// round. Its owner will revoke it and the next round hands it over — which
+    /// is the whole of KIP-429.
+    #[test]
+    fn cooperative_withholds_a_partition_that_must_move() {
+        // c0 holds both; c1 is new, so one has to move.
+        let members = [
+            holding("c0", &["t"], &[("t", 0), ("t", 1)]),
+            holding("c1", &["t"], &[]),
+        ];
+        let assignment = CooperativeStickyAssignor.assign(&members, &topics(&[("t", 2)]));
+
+        let total: usize = assignment.values().map(Vec::len).sum();
+        assert_eq!(
+            total, 1,
+            "the moving partition must be withheld: {assignment:?}"
+        );
+        assert_eq!(assignment["c0"].len(), 1, "c0 keeps the one it is not losing");
+        assert!(assignment["c1"].is_empty(), "c1 waits a round for its share");
+    }
+
+    /// Nothing is moving, so nothing is withheld and the round is complete.
+    #[test]
+    fn cooperative_publishes_everything_when_nothing_moves() {
+        let members = [holding("c0", &["t"], &[("t", 0), ("t", 1)])];
+        let assignment = CooperativeStickyAssignor.assign(&members, &topics(&[("t", 2)]));
+        assert_eq!(assignment["c0"].len(), 2);
+    }
+
+    /// An unowned partition needs no handover, so it is granted immediately.
+    #[test]
+    fn cooperative_grants_unowned_partitions_at_once() {
+        let members = [holding("c0", &["t"], &[("t", 0)])];
+        let assignment = CooperativeStickyAssignor.assign(&members, &topics(&[("t", 2)]));
+        assert_eq!(assignment["c0"].len(), 2, "the new partition needs no handover");
     }
 
     /// Every strategy must place every partition of a subscribed topic exactly

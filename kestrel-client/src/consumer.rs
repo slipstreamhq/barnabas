@@ -268,6 +268,8 @@ pub struct Consumer<T: Transport> {
     last_auto_commit: Option<std::time::Instant>,
     /// Told when partitions arrive and before they are taken away.
     listener: Option<Box<dyn RebalanceListener>>,
+    /// `(session, rebalance)`, applied when a group is joined.
+    group_timeouts: Option<(Duration, Duration)>,
     /// Bumped whenever the assignment or a position changes for a reason other
     /// than consuming records. An outstanding fetch from an older generation
     /// asked a question that is no longer the one being asked.
@@ -310,6 +312,7 @@ impl<T: Transport> Consumer<T> {
             auto_commit: None,
             last_auto_commit: None,
             listener: None,
+            group_timeouts: None,
             generation: 0,
         }
     }
@@ -340,6 +343,7 @@ impl<T: Transport> Consumer<T> {
             auto_commit: None,
             last_auto_commit: None,
             listener: None,
+            group_timeouts: None,
             generation: 0,
         })
     }
@@ -431,11 +435,14 @@ impl<T: Transport> Consumer<T> {
         self.discard_outstanding().await;
         self.positions.clear();
         self.reset = reset;
-        self.group = Some(crate::group::ClassicProtocol::new(
-            group_id.to_owned(),
-            topics,
-            assignor,
-        ));
+        let mut protocol =
+            crate::group::ClassicProtocol::new(group_id.to_owned(), topics, assignor);
+        if let Some((session, rebalance)) = self.group_timeouts {
+            protocol.set_session_timeout(i32::try_from(session.as_millis()).unwrap_or(i32::MAX));
+            protocol
+                .set_rebalance_timeout(i32::try_from(rebalance.as_millis()).unwrap_or(i32::MAX));
+        }
+        self.group = Some(protocol);
         self.generation += 1;
         Ok(())
     }
@@ -463,6 +470,20 @@ impl<T: Transport> Consumer<T> {
     /// [`RebalanceListener`] for why these are synchronous.
     pub fn set_rebalance_listener(&mut self, listener: Box<dyn RebalanceListener>) {
         self.listener = Some(listener);
+    }
+
+    /// How long the coordinator waits for a heartbeat before removing this
+    /// member, and how long it waits for the group to rejoin a rebalance.
+    ///
+    /// Kafka's `session.timeout.ms` and `max.poll.interval.ms`. The rebalance
+    /// timeout also bounds how long a `JoinGroup` may be held: the coordinator
+    /// keeps it until every member has rejoined, so a small value fails a stuck
+    /// rebalance quickly and a large one waits patiently for slow members.
+    ///
+    /// Must be set before [`Self::subscribe`]; changing it afterwards would
+    /// disagree with what the group was told.
+    pub fn set_group_timeouts(&mut self, session: Duration, rebalance: Duration) {
+        self.group_timeouts = Some((session, rebalance));
     }
 
     /// Tell the coordinator this member is alive, without polling.
@@ -611,19 +632,19 @@ impl<T: Transport> Consumer<T> {
             }
             // Everything was revoked: stop fetching before the next request,
             // because another member is about to be given these.
-            Ok(crate::group::Membership::Revoked) => {
+            Ok(crate::group::Membership::Revoked(lost)) => {
+                // **Only what was actually lost.** Clearing everything here is
+                // right for the eager protocol and wrong for the cooperative
+                // one, which keeps reading the partitions nobody is taking —
+                // and re-adding them on the next assignment restarts the very
+                // rebalance that just finished.
                 if let Some(listener) = self.listener.as_mut() {
-                    let held: Vec<kestrel_core::group::TopicPartition> = self
-                        .positions
-                        .keys()
-                        .map(|(topic, partition)| {
-                            kestrel_core::group::TopicPartition::new(topic.clone(), *partition)
-                        })
-                        .collect();
-                    listener.on_revoked(&held);
+                    listener.on_revoked(lost);
                 }
-                self.positions.clear();
-                true
+                for tp in lost {
+                    self.positions.remove(&(tp.topic.clone(), tp.partition));
+                }
+                !lost.is_empty()
             }
             Ok(crate::group::Membership::InProgress) | Err(_) => false,
         };

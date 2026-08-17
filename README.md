@@ -8,7 +8,8 @@ including thread-per-core ones, which is what it was built for.
 > **Consumer groups work**: `subscribe`, rebalancing, committed offsets, auto-commit and
 > rebalance callbacks. Two gaps to know about before choosing this client:
 > **heartbeats only go out when you `poll`** (see below), and **only eager rebalancing** —
-> `cooperative-sticky` is not implemented yet. Remaining work is scoped in
+> the `cooperative-sticky` assignor exists and is unit-tested, but the handover it drives does
+> not converge yet, so do not use it. Remaining work is scoped in
 > [`docs/completing-the-client.md`](docs/completing-the-client.md).
 
 Design and sequencing:
