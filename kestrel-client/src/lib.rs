@@ -133,6 +133,22 @@ pub enum Error {
 
     #[error("the broker's response contained no {0}")]
     Missing(&'static str),
+
+    /// A request/response call was attempted on a connection that already has
+    /// requests in flight.
+    ///
+    /// **This is a bug in this client, surfaced rather than suffered.** Kafka
+    /// answers a connection's requests in order, so a `call` on a busy
+    /// connection reads the *previous* request's response — a fetch decoded as
+    /// an offset commit, or worse, a response that happens to parse. Anything
+    /// pipelining deliberately uses `send`/`recv` and manages the order itself;
+    /// anything else must leave the connection idle first.
+    #[error("{op:?} on {addr}: {in_flight} request(s) already in flight on this connection")]
+    ConnectionBusy {
+        op: kafka_protocol::messages::ApiKey,
+        addr: String,
+        in_flight: usize,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

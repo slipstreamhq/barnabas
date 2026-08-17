@@ -679,3 +679,54 @@ fn a_success_after_a_failure_is_not_retired() {
         );
     });
 }
+
+/// **A `call` on a busy connection is refused, not guessed at.**
+///
+/// Kafka answers a connection's requests in order, so a request/response call
+/// issued while something else is outstanding reads that something else's
+/// answer. Three bugs in this client were exactly that, each fixed by draining
+/// at one more call site — which is remembering, not preventing. The last one
+/// only surfaced because a `Fetch` response failed to parse as an
+/// `OffsetCommit`; a response that happened to parse would have been silent,
+/// and silence here means committed offsets for records nobody read.
+///
+/// So the connection refuses. Anything that pipelines on purpose uses
+/// `send`/`recv` and owns the ordering itself.
+#[test]
+fn a_call_on_a_busy_connection_is_refused() {
+    sim::start(Vec::new());
+
+    drive(async {
+        let mut cluster = kestrel_client::Cluster::connect(Sim, &bootstrap(), "sim")
+            .await
+            .expect("cluster");
+
+        // Leave a request outstanding, as a prefetching consumer does.
+        cluster
+            .send_at_for_test(ApiKey::Metadata, 12, BOOTSTRAP, &metadata_request())
+            .await
+            .expect("send");
+
+        // Now do what a forgetful call site does.
+        let err = cluster
+            .call_at_for_test::<_, kafka_protocol::messages::MetadataResponse>(
+                BOOTSTRAP,
+                ApiKey::Metadata,
+                12,
+                &metadata_request(),
+            )
+            .await
+            .expect_err("a busy connection must refuse");
+
+        assert!(
+            matches!(err, kestrel_client::Error::ConnectionBusy { in_flight: 1, .. }),
+            "expected ConnectionBusy, got: {err}"
+        );
+    });
+}
+
+fn metadata_request() -> kafka_protocol::messages::MetadataRequest {
+    let mut req = kafka_protocol::messages::MetadataRequest::default();
+    req.topics = Some(vec![]);
+    req
+}

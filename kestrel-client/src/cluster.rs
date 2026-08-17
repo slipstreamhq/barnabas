@@ -194,6 +194,17 @@ impl<T: Transport> Broker<T> {
     }
 
     /// Send one request and read its response.
+    ///
+    /// **Requires an idle connection, and says so rather than guessing.** Kafka
+    /// answers in order, so calling this while something else is in flight
+    /// reads that something else's response. Three separate bugs in this client
+    /// were exactly that — a prefetched `Fetch` decoded as a `Metadata`, a
+    /// `ListOffsets`, and finally an `OffsetCommit`, the last of which only
+    /// surfaced because it failed to parse. A response that *did* parse would
+    /// have been silent.
+    ///
+    /// Callers that pipeline on purpose use [`Self::send`] and [`Self::recv`]
+    /// and own the ordering themselves.
     pub(crate) async fn call<Req, Resp>(
         &mut self,
         api_key: ApiKey,
@@ -204,6 +215,13 @@ impl<T: Transport> Broker<T> {
         Req: Encodable,
         Resp: Decodable,
     {
+        if self.conn.in_flight() != 0 {
+            return Err(Error::ConnectionBusy {
+                op: api_key,
+                addr: String::new(),
+                in_flight: self.conn.in_flight(),
+            });
+        }
         self.send(api_key, version, req).await?;
         self.recv().await
     }
@@ -278,10 +296,6 @@ impl<T: Transport> Broker<T> {
     }
 
     /// How many requests are awaiting an answer.
-    ///
-    /// Not used yet — it is the check producer pipelining will need before
-    /// putting a second request on a connection.
-    #[allow(dead_code)]
     pub(crate) fn in_flight(&self) -> usize {
         self.conn.in_flight()
     }
@@ -397,6 +411,13 @@ impl<T: Transport> Cluster<T> {
     {
         for attempt in 0..2 {
             let broker = self.broker_at(addr).await?;
+            if broker.in_flight() != 0 {
+                return Err(Error::ConnectionBusy {
+                    op: api_key,
+                    addr: addr.to_owned(),
+                    in_flight: broker.in_flight(),
+                });
+            }
             let outcome = with_timeout::<T, _>(timeout, broker.call(api_key, version, req)).await;
 
             match outcome {
@@ -518,6 +539,30 @@ impl<T: Transport> Cluster<T> {
     /// that cannot be drained is dropped instead.
     pub(crate) async fn discard_many<Resp: Decodable>(&mut self, op: ApiKey, addrs: &[String]) {
         let _ = self.recv_many::<Resp>(op, addrs).await;
+    }
+
+    /// Test-only doors onto the pipelining primitives, so the invariant above
+    /// can be checked without a broker.
+    #[doc(hidden)]
+    pub async fn send_at_for_test<Req: Encodable>(
+        &mut self,
+        api_key: ApiKey,
+        version: i16,
+        addr: &str,
+        req: &Req,
+    ) -> Result<()> {
+        self.send_at(api_key, version, addr, req).await
+    }
+
+    #[doc(hidden)]
+    pub async fn call_at_for_test<Req: Encodable, Resp: Decodable>(
+        &mut self,
+        addr: &str,
+        api_key: ApiKey,
+        version: i16,
+        req: &Req,
+    ) -> Result<Resp> {
+        self.call_at(addr, api_key, version, req).await
     }
 
     /// As [`Self::call_at`], for requests any broker can serve.
