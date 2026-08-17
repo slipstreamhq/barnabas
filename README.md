@@ -99,7 +99,7 @@ use kestrel_tokio::{Consumer, Tokio, EARLIEST};
 ```
 
 Each binding re-exports everything shared — `Error`, `Result`, `RecordRef`,
-`FetchedRecords`, `ProducerRecord`, `IsolationLevel`, `Partitioner`,
+`ConsumerRecords`, `ProducerRecord`, `IsolationLevel`, `Partitioner`,
 `CompressionCodec`, `EARLIEST`, `LATEST` — so **only those two lines differ**
 between the two programs below.
 
@@ -173,7 +173,7 @@ optional is wanted:
 ```rust
 let mut consumer =
     Consumer::new(Glommio, &brokers, "my-app", IsolationLevel::ReadCommitted).await?;
-consumer.add("events", 0, EARLIEST).await?;
+consumer.assign("events", 0, EARLIEST).await?;
 ```
 
 Worth knowing what you are choosing: `Consumer::assign` takes seven positional
@@ -242,13 +242,13 @@ let mut consumer = Consumer::new(
 ).await?;
 
 for partition in 0..8 {
-    consumer.add("events", partition, EARLIEST).await?;
+    consumer.assign("events", partition, EARLIEST).await?;
 }
 
 loop {
     // One `Fetch` per *broker*, carrying every partition it leads — not one
     // per partition. All of them are in flight at once.
-    for group in consumer.fetch().await? {
+    for group in consumer.poll().await? {
         for record in group.iter() {
             // Key, value and headers are built when you ask for them, not at
             // decode time. Skipping a record costs nothing.

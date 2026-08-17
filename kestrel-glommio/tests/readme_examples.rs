@@ -31,10 +31,10 @@ fn readme_consume() {
                     .expect("consumer");
 
             for partition in 0..8 {
-                consumer.add("events", partition, EARLIEST).await.expect("assign");
+                consumer.assign("events", partition, EARLIEST).await.expect("assign");
             }
 
-            for group in consumer.fetch().await.expect("fetch") {
+            for group in consumer.poll().await.expect("fetch") {
                 for record in group.iter() {
                     let value = record.value();
                     println!(

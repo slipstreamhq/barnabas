@@ -79,7 +79,7 @@ fn plain_records_round_trip() {
         prod.create_topic().await;
         prod.produce_plain(3).await;
 
-        let mut consumer = Consumer::assign(
+        let mut consumer = Consumer::for_partition(
             kestrel_glommio::Glommio,
             &bootstrap(),
             "kestrel-test",
@@ -116,7 +116,7 @@ fn an_aborted_transaction_is_invisible() {
         prod.produce_txn(3).await;
         prod.end(false).await;
 
-        let mut consumer = Consumer::assign(
+        let mut consumer = Consumer::for_partition(
             kestrel_glommio::Glommio,
             &bootstrap(),
             "kestrel-test",
@@ -135,7 +135,7 @@ fn an_aborted_transaction_is_invisible() {
         for _ in 0..3 {
             seen.extend(
             consumer
-                .fetch()
+                .poll()
                 .await
                 .expect("fetch")
                 .into_iter()
@@ -173,7 +173,7 @@ fn a_commit_after_an_abort_survives() {
         prod.produce_txn(2).await; // committed
         prod.end(true).await;
 
-        let mut consumer = Consumer::assign(
+        let mut consumer = Consumer::for_partition(
             kestrel_glommio::Glommio,
             &bootstrap(),
             "kestrel-test",
@@ -208,7 +208,7 @@ fn read_uncommitted_sees_aborted_records() {
         prod.produce_txn(3).await;
         prod.end(false).await;
 
-        let mut consumer = Consumer::assign(
+        let mut consumer = Consumer::for_partition(
             kestrel_glommio::Glommio,
             &bootstrap(),
             "kestrel-test",
@@ -236,7 +236,7 @@ fn seek_positions_the_next_fetch() {
         prod.create_topic().await;
         prod.produce_plain(5).await;
 
-        let mut consumer = Consumer::assign(
+        let mut consumer = Consumer::for_partition(
             kestrel_glommio::Glommio,
             &bootstrap(),
             "kestrel-test",
@@ -277,7 +277,7 @@ fn fetches_are_routed_to_the_partition_leader() {
         prod.create_topic_with_partitions(8).await;
         prod.produce_plain(1).await;
 
-        let mut consumer = Consumer::assign(
+        let mut consumer = Consumer::for_partition(
             kestrel_glommio::Glommio,
             &bootstrap(),
             "kestrel-test",
@@ -337,7 +337,7 @@ fn prefetch_returns_the_same_records() {
 
         let mut values = Vec::new();
         for prefetch in [true, false] {
-            let mut consumer = Consumer::assign(
+            let mut consumer = Consumer::for_partition(
                 kestrel_glommio::Glommio,
                 &bootstrap(),
                 "kestrel-test",
@@ -378,7 +378,7 @@ fn a_seek_discards_the_fetch_already_in_flight() {
         prod.create_topic().await;
         prod.produce_plain(10).await;
 
-        let mut consumer = Consumer::assign(
+        let mut consumer = Consumer::for_partition(
             kestrel_glommio::Glommio,
             &bootstrap(),
             "kestrel-test",
@@ -421,7 +421,7 @@ async fn fetch_until(consumer: &mut Consumer, want: usize) -> Vec<bytes::Bytes> 
     for _ in 0..25 {
         out.extend(
             consumer
-                .fetch()
+                .poll()
                 .await
                 .expect("fetch")
                 .into_iter()
@@ -458,7 +458,7 @@ fn batch_filtering_drops_only_the_aborted_transaction() {
         prod.produce_txn(2).await; // committed
         prod.end(true).await;
 
-        let mut consumer = Consumer::assign(
+        let mut consumer = Consumer::for_partition(
             kestrel_glommio::Glommio,
             &bootstrap(),
             "kestrel-test",

@@ -257,11 +257,11 @@ impl<T: Transport> ConsumerReady<T> {
         for (topic, start) in self.every_partition {
             let count = consumer.partition_count(&topic).await?;
             for partition in 0..count {
-                consumer.add(&topic, partition, start.as_i64()).await?;
+                consumer.assign(&topic, partition, start.as_i64()).await?;
             }
         }
         for (topic, partition, start) in self.assignments {
-            consumer.add(&topic, partition, start.as_i64()).await?;
+            consumer.assign(&topic, partition, start.as_i64()).await?;
         }
         Ok(consumer)
     }

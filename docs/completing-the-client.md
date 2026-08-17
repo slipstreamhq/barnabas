@@ -17,11 +17,11 @@ use a different word for the same idea we cost them a lookup and gain nothing.
 This should be settled **before** the group work, not after, because groups
 double the surface it would have to be applied to.
 
-| what a Kafka user calls it | kestrel today | verdict |
+| what a Kafka user calls it | kestrel | state |
 |---|---|---|
-| `poll` | `fetch` | rename — `poll` is the word in every client |
-| `assign` | `add` | rename; keep the range/all conveniences alongside |
-| `ConsumerRecords` | `FetchedRecords` | rename |
+| `poll` | `poll` | ✅ renamed from `fetch` |
+| `assign` | `assign` | ✅ renamed from `add`; the old `Consumer::assign` constructor is now `for_partition` |
+| `ConsumerRecords` | `ConsumerRecords` | ✅ renamed from `FetchedRecords` |
 | `subscribe` | *absent* | Phase 1 |
 | `commitSync` / `commitAsync` | *absent* | Phase 1 |
 | `auto.offset.reset` | `StartOffset` | keep — typed, and the mapping is obvious |
@@ -119,8 +119,8 @@ of the producer window. Groups should arrive with the same three.
 
 ## Sequencing
 
-1. **Naming and API alignment** — cheap now, expensive once groups double the
-   surface.
+1. ~~**Naming and API alignment**~~ — done for the three that existed. The rest
+   arrive with the features that need them.
 2. **Phase 1, the group protocol** — the piece that makes this usable by
    ordinary applications.
 3. **Topic expansion** — groups solve it partly; the assign-only path still

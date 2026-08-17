@@ -3,7 +3,7 @@
 //! # There is no consumer group, and that is a scope decision
 //!
 //! No `subscribe`, no JoinGroup/SyncGroup, no heartbeats, no rebalance, no
-//! offset commit. **You choose the partitions** — see [`Consumer::add`] and the
+//! offset commit. **You choose the partitions** — see [`Consumer::assign`] and the
 //! builder's `assign_all` — and you store the offsets.
 //!
 //! That suits a system whose own control plane places partitions and whose
@@ -100,7 +100,7 @@ impl Session {
 
 /// What one partition yielded.
 #[derive(Debug)]
-pub struct FetchedRecords {
+pub struct ConsumerRecords {
     pub topic: String,
     pub partition: i32,
     /// The batches as [`kestrel_core::records`] read them.
@@ -112,7 +112,7 @@ pub struct FetchedRecords {
     pub fallback: Vec<Record>,
 }
 
-impl FetchedRecords {
+impl ConsumerRecords {
     /// Every record, whichever path decoded it.
     ///
     /// **This is what callers should use.** Records live in batches because
@@ -234,7 +234,7 @@ pub struct Consumer<T: Transport> {
     /// broker that mishandles sessions can turn it off without changing code.
     incremental: bool,
     /// A fetch already in flight, waiting to be collected. See
-    /// [`Self::fetch`].
+    /// [`Self::poll`].
     outstanding: Option<Outstanding>,
     /// Whether to keep a fetch permanently in flight. On by default.
     prefetch: bool,
@@ -279,7 +279,7 @@ impl<T: Transport> Consumer<T> {
         }
     }
 
-    /// Connect with no assignments. Add them with [`Self::add`].
+    /// Connect with no assignments. Add them with [`Self::assign`].
     ///
     /// # Errors
     /// If no bootstrap address answers.
@@ -309,7 +309,7 @@ impl<T: Transport> Consumer<T> {
     ///
     /// # Errors
     /// As [`Self::new`], plus a missing topic or partition.
-    pub async fn assign(
+    pub async fn for_partition(
         transport: T,
         bootstrap: &[String],
         client_id: &str,
@@ -319,7 +319,7 @@ impl<T: Transport> Consumer<T> {
         isolation: IsolationLevel,
     ) -> Result<Self> {
         let mut me = Self::new(transport, bootstrap, client_id, isolation).await?;
-        me.add(topic, partition, offset).await?;
+        me.assign(topic, partition, offset).await?;
         Ok(me)
     }
 
@@ -330,7 +330,7 @@ impl<T: Transport> Consumer<T> {
     ///
     /// # Errors
     /// If the topic does not exist, or the broker answers with an error code.
-    pub async fn add(&mut self, topic: &str, partition: i32, offset: i64) -> Result<()> {
+    pub async fn assign(&mut self, topic: &str, partition: i32, offset: i64) -> Result<()> {
         // **Before anything else touches a connection.** A prefetched `Fetch`
         // may be sitting unread on one of them, and a `Metadata` sent past it
         // would be answered by that fetch — responses come back in order, so
@@ -449,7 +449,7 @@ impl<T: Transport> Consumer<T> {
     /// Keep a fetch permanently in flight. On by default.
     ///
     /// **This is what overlaps the network with the caller's work.** Without
-    /// it a fetch is issued only when [`Self::fetch`] is called, so every poll
+    /// it a fetch is issued only when [`Self::poll`] is called, so every poll
     /// pays a full round trip before it can return anything; with it the
     /// request for the next poll goes out as soon as the current one is
     /// decoded, and the caller's processing happens while the broker is
@@ -497,7 +497,7 @@ impl<T: Transport> Consumer<T> {
         timestamp: i64,
     ) -> Result<i64> {
         // Public, so it can be called with a prefetch in flight. See
-        // [`Self::add`].
+        // [`Self::assign`].
         self.discard_outstanding().await;
 
         let mut req_partition = ListOffsetsPartition::default();
@@ -608,7 +608,7 @@ impl<T: Transport> Consumer<T> {
     /// Put the next round's fetch in flight, if prefetch is on.
     ///
     /// A failure here is deliberately not surfaced: nothing is outstanding
-    /// afterwards, so the next [`Self::fetch`] issues the request itself and
+    /// afterwards, so the next [`Self::poll`] issues the request itself and
     /// reports whatever goes wrong then. Returning it from *this* call would
     /// fail a poll that had already succeeded.
     async fn start_prefetch(&mut self) {
@@ -752,7 +752,7 @@ impl<T: Transport> Consumer<T> {
     ///
     /// Records come back grouped in the batches the broker sent, because that
     /// is how the format stores them and how the filtering works. Use
-    /// [`FetchedRecords::iter`] to walk them without caring; a key, value or
+    /// [`ConsumerRecords::iter`] to walk them without caring; a key, value or
     /// header list is materialised when asked for rather than at decode time.
     ///
     /// An empty result is normal: a fetch that waits out `max_wait` with no new
@@ -769,8 +769,8 @@ impl<T: Transport> Consumer<T> {
     /// in the format. That is most of why this path is cheaper.
     ///
     /// # Errors
-    /// As [`Self::fetch`].
-    pub async fn fetch(&mut self) -> Result<Vec<FetchedRecords>> {
+    /// As [`Self::poll`].
+    pub async fn poll(&mut self) -> Result<Vec<ConsumerRecords>> {
         if self.positions.is_empty() {
             return Ok(Vec::new());
         }
@@ -846,7 +846,7 @@ impl<T: Transport> Consumer<T> {
                         );
                         self.positions.insert(key, next_offset);
                         if !records.is_empty() {
-                            out.push(FetchedRecords {
+                            out.push(ConsumerRecords {
                                 topic: topic.clone(),
                                 partition: part.partition_index,
                                 batches: Vec::new(),
@@ -866,7 +866,7 @@ impl<T: Transport> Consumer<T> {
                     );
                     self.positions.insert(key, next_offset);
                     if !batches.is_empty() {
-                        out.push(FetchedRecords {
+                        out.push(ConsumerRecords {
                             topic: topic.clone(),
                             partition: part.partition_index,
                             batches,

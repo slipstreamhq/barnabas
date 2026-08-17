@@ -25,7 +25,7 @@ pub mod tls;
 
 pub use kestrel_client::producer::CompressionCodec;
 pub use kestrel_client::{
-    Error, FetchedRecords, ProducerRecord, RecordRef, Result, EARLIEST, LATEST,
+    Error, ConsumerRecords, ProducerRecord, RecordRef, Result, EARLIEST, LATEST,
 };
 pub use kestrel_core::{Disposition, ErrorCode, IsolationLevel, Partitioner};
 /// SASL works on either runtime — it is the client's business, not the

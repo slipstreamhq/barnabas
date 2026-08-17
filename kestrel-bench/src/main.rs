@@ -24,7 +24,7 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use kestrel_client::{FetchedRecords, ProducerRecord};
+use kestrel_client::{ConsumerRecords, ProducerRecord};
 use kestrel_glommio::CompressionCodec;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -243,7 +243,7 @@ fn kestrel_consume(topic: &str, expect: usize) -> Duration {
             .expect("consumer");
             for partition in 0..PARTITIONS {
                 consumer
-                    .add(&topic, partition, kestrel_glommio::EARLIEST)
+                    .assign(&topic, partition, kestrel_glommio::EARLIEST)
                     .await
                     .expect("assign");
             }
@@ -253,8 +253,8 @@ fn kestrel_consume(topic: &str, expect: usize) -> Duration {
             let mut seen = 0;
             let mut polls = 0u64;
             while seen < expect {
-                let groups = consumer.fetch().await.expect("fetch");
-                let got: usize = groups.iter().map(FetchedRecords::len).sum();
+                let groups = consumer.poll().await.expect("fetch");
+                let got: usize = groups.iter().map(ConsumerRecords::len).sum();
                 if got == 0 {
                     break;
                 }
@@ -634,7 +634,7 @@ fn kestrel_end_to_end(
             .await
             .expect("producer");
 
-            let mut consumer = kestrel_glommio::Consumer::assign(
+            let mut consumer = kestrel_glommio::Consumer::for_partition(
                 kestrel_glommio::Glommio,
                 &brokers(),
                 "bench-e2e-consumer",
@@ -661,7 +661,7 @@ fn kestrel_end_to_end(
                 // than a process that sits there forever.
                 let mut polls = 0;
                 loop {
-                    let groups = consumer.fetch().await.expect("fetch");
+                    let groups = consumer.poll().await.expect("fetch");
                     if groups.iter().any(|g| !g.is_empty()) {
                         break;
                     }
@@ -753,7 +753,7 @@ fn kestrel_idle_polls(topic: &str, partitions: i32, polls: usize, incremental: b
             .expect("consumer");
             for partition in 0..partitions {
                 consumer
-                    .add(&topic, partition, kestrel_glommio::EARLIEST)
+                    .assign(&topic, partition, kestrel_glommio::EARLIEST)
                     .await
                     .expect("assign");
             }
@@ -766,11 +766,11 @@ fn kestrel_idle_polls(topic: &str, partitions: i32, polls: usize, incremental: b
             consumer.set_max_wait(Duration::ZERO);
 
             // One poll to establish the session before timing starts.
-            consumer.fetch().await.expect("warm-up fetch");
+            consumer.poll().await.expect("warm-up fetch");
 
             let start = Instant::now();
             for _ in 0..polls {
-                consumer.fetch().await.expect("fetch");
+                consumer.poll().await.expect("fetch");
             }
             start.elapsed()
         })
@@ -931,7 +931,7 @@ fn kestrel_consume_tokio(topic: &str, expect: usize) -> Duration {
         .expect("consumer");
         for partition in 0..PARTITIONS {
             consumer
-                .add(topic, partition, kestrel_tokio::EARLIEST)
+                .assign(topic, partition, kestrel_tokio::EARLIEST)
                 .await
                 .expect("assign");
         }
@@ -940,8 +940,8 @@ fn kestrel_consume_tokio(topic: &str, expect: usize) -> Duration {
         let start = Instant::now();
         let mut seen = 0;
         while seen < expect {
-            let groups = consumer.fetch().await.expect("fetch");
-            let got: usize = groups.iter().map(FetchedRecords::len).sum();
+            let groups = consumer.poll().await.expect("fetch");
+            let got: usize = groups.iter().map(ConsumerRecords::len).sum();
             if got == 0 {
                 break;
             }
@@ -967,7 +967,7 @@ fn kestrel_consume_per_partition(topic: &str, expect: usize) -> Duration {
         .run(async move {
             let mut consumers = Vec::new();
             for partition in 0..PARTITIONS {
-                let mut consumer = kestrel_glommio::Consumer::assign(
+                let mut consumer = kestrel_glommio::Consumer::for_partition(
                     kestrel_glommio::Glommio,
                     &brokers(),
                     "bench",
@@ -987,8 +987,8 @@ fn kestrel_consume_per_partition(topic: &str, expect: usize) -> Duration {
             while seen < expect {
                 let mut got = 0;
                 for consumer in &mut consumers {
-                    let groups = consumer.fetch().await.expect("fetch");
-                    got += groups.iter().map(FetchedRecords::len).sum::<usize>();
+                    let groups = consumer.poll().await.expect("fetch");
+                    got += groups.iter().map(ConsumerRecords::len).sum::<usize>();
                 }
                 if got == 0 {
                     break;

@@ -47,7 +47,7 @@ pub mod producer;
 pub use cluster::Cluster;
 pub use sasl::{Credentials, SaslMechanism};
 pub use builder::{ConsumerBuilder, ProducerBuilder, StartOffset};
-pub use consumer::{Consumer, FetchedRecords, RecordRef, EARLIEST, LATEST};
+pub use consumer::{Consumer, ConsumerRecords, RecordRef, EARLIEST, LATEST};
 pub use producer::{Producer, ProducerRecord};
 
 use kestrel_core::{Disposition, ErrorCode};

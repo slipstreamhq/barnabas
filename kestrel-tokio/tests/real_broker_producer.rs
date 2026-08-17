@@ -75,7 +75,7 @@ async fn make_topic_with_partitions(topic: &str, partitions: i32) {
 }
 
 async fn read_all(topic: &str, want: usize, isolation: IsolationLevel) -> Vec<String> {
-    let mut consumer = Consumer::assign(
+    let mut consumer = Consumer::for_partition(
         kestrel_tokio::Tokio,
         &bootstrap(),
         "kestrel-producer-test",
@@ -91,7 +91,7 @@ async fn read_all(topic: &str, want: usize, isolation: IsolationLevel) -> Vec<St
     let mut out = Vec::new();
     for _ in 0..25 {
         for record in consumer
-            .fetch()
+            .poll()
             .await
             .expect("fetch")
             .into_iter()
@@ -360,7 +360,7 @@ fn keyed_records_land_on_the_partition_their_key_names() {
                 .map(|(k, _)| *k)
                 .collect();
 
-            let mut consumer = Consumer::assign(
+            let mut consumer = Consumer::for_partition(
                 kestrel_tokio::Tokio,
                 &bootstrap(),
                 "kestrel-producer-test",
@@ -376,7 +376,7 @@ fn keyed_records_land_on_the_partition_their_key_names() {
             let mut got = Vec::new();
             for _ in 0..10 {
                 for key in consumer
-                    .fetch()
+                    .poll()
                     .await
                     .expect("fetch")
                     .iter()
