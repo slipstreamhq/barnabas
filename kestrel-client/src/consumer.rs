@@ -342,6 +342,18 @@ impl<T: Transport> Consumer<T> {
         Ok(())
     }
 
+    /// How many partitions `topic` has, from the broker's metadata.
+    ///
+    /// This client never chooses partitions for you — there is no consumer
+    /// group, so nothing assigns them behind your back — but it does have to
+    /// ask the broker where they live, and the count comes back with that.
+    ///
+    /// # Errors
+    /// If metadata cannot be refreshed, or the topic does not exist.
+    pub async fn partition_count(&mut self, topic: &str) -> Result<i32> {
+        self.cluster.partition_count(topic).await
+    }
+
     /// Stop fetching a partition.
     ///
     /// Resets the fetch sessions: the broker's remembered partition set no

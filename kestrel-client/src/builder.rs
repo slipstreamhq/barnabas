@@ -108,6 +108,7 @@ impl<T: Transport> ConsumerNeedsClientId<T> {
             prefetch: None,
             incremental: None,
             assignments: Vec::new(),
+            every_partition: Vec::new(),
         }
     }
 }
@@ -123,6 +124,7 @@ pub struct ConsumerReady<T> {
     prefetch: Option<bool>,
     incremental: Option<bool>,
     assignments: Vec<(String, i32, StartOffset)>,
+    every_partition: Vec<(String, StartOffset)>,
 }
 
 impl<T: Transport> ConsumerReady<T> {
@@ -164,6 +166,24 @@ impl<T: Transport> ConsumerReady<T> {
         for partition in partitions {
             self.assignments.push((topic.clone(), partition, start));
         }
+        self
+    }
+
+    /// Assign **every** partition of `topic`, asking the broker how many there
+    /// are.
+    ///
+    /// The count is the one thing about an assignment worth asking for: it
+    /// changes when a topic is expanded, and hardcoding it in an
+    /// [`assign_range`](Self::assign_range) silently stops consuming the new
+    /// partitions. *Which* partitions this client owns is still the caller's —
+    /// there is no consumer group here, so a process that wants a share of a
+    /// topic rather than all of it assigns that share itself.
+    ///
+    /// Resolved once, at [`build`](Self::build). A topic expanded afterwards is
+    /// not picked up until the consumer is rebuilt.
+    #[must_use]
+    pub fn assign_all(mut self, topic: impl Into<String>, start: StartOffset) -> Self {
+        self.every_partition.push((topic.into(), start));
         self
     }
 
@@ -223,6 +243,12 @@ impl<T: Transport> ConsumerReady<T> {
         }
         if let Some(incremental) = self.incremental {
             consumer.set_incremental_fetch(incremental);
+        }
+        for (topic, start) in self.every_partition {
+            let count = consumer.partition_count(&topic).await?;
+            for partition in 0..count {
+                consumer.add(&topic, partition, start.as_i64()).await?;
+            }
         }
         for (topic, partition, start) in self.assignments {
             consumer.add(&topic, partition, start.as_i64()).await?;

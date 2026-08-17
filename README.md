@@ -173,6 +173,48 @@ mistake a type can prevent.
 
 ## Examples
 
+### Who decides which partitions you read
+
+**You do. There is no consumer group.**
+
+No `subscribe`, no JoinGroup/SyncGroup, no heartbeats, no rebalance, no
+generation fencing. The broker is never asked which partitions this client
+owns, because it has no idea — that half of a Kafka client does not exist here,
+deliberately. Slipstream's control plane assigns partitions and its checkpoints
+hold the offsets, so the group protocol would be a second, competing answer to
+questions already answered.
+
+So `assign`, `assign_range` and `assign_all` are not overrides of something the
+broker would otherwise tell you. They are the only mechanism.
+
+What the broker *is* asked, on your behalf:
+
+| question | request |
+|---|---|
+| which broker leads each partition | `Metadata` |
+| how many partitions does this topic have | `Metadata` (used by `assign_all`) |
+| what offset is `Earliest` / `Latest` right now | `ListOffsets` |
+
+You say *which* partitions; the broker says *where they live* and *what offsets
+bound them*.
+
+```rust
+// Every partition — the count comes from the broker, so expanding the topic
+// does not silently leave the new partitions unread on the next restart.
+.assign_all("events", StartOffset::Earliest)
+
+// A share of them, decided by something above this client.
+.assign_range("events", my_shard.partitions(), StartOffset::Earliest)
+
+// Resuming from offsets you stored yourself.
+.assign("events", 3, StartOffset::At(checkpoint.offset_for(3)))
+```
+
+**What you give up** by having no group: nothing redistributes partitions when
+an instance dies. If that is your problem rather than your control plane's,
+this client is the wrong shape — and the honest answer is librdkafka or the
+Java client, not a wrapper around this.
+
 ### Consume
 
 Assignment is the caller's: no consumer group, no rebalance, no offset commit.
