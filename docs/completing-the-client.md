@@ -76,14 +76,80 @@ naming is **the API surface a normal application uses**, which is much smaller.
 - Generation and member-id fencing: the failure mode is silent duplicate
   consumption, so it belongs in the simulator with the producer's sequencing
 
-**Decide first: KIP-848.** Kafka 4.x has a new group protocol that moves
-assignment to the coordinator; the classic protocol is still supported but is
-the past. Implementing classic only is a rewrite later; implementing the new
-one only excludes every broker below 4.0 and Redpanda until it follows.
-Recommendation: classic first for broker reach, but keep assignment strategy
-behind a seam so the new protocol is a second implementation rather than a
-second client. This decision should be made before any code, because it shapes
-the state machine.
+#### Decided: classic first, behind a seam for KIP-848
+
+Kafka 4.x moves assignment to the coordinator (KIP-848). Classic is still
+supported and is what every broker below 4.0 and Redpanda speak, so it goes
+first for reach. The new protocol arrives later as a **second implementation of
+one seam**, not a second client.
+
+##### What actually differs
+
+| | classic | KIP-848 |
+|---|---|---|
+| assignment computed by | the group **leader**, client-side | the **coordinator**, server-side |
+| RPCs | `JoinGroup`, `SyncGroup`, `Heartbeat` | `ConsumerGroupHeartbeat` alone |
+| fencing token | generation id | member epoch |
+| assignors | client-side, pluggable | server-side; the client names a preference |
+
+##### What does not differ, and therefore sits above the seam
+
+- `FindCoordinator` for the group
+- `OffsetCommit` / `OffsetFetch` — the same RPCs under both
+- the resulting assignment feeding the existing `assign`/`poll` machinery
+- revoke/assign callbacks: the *events* are the same concept either way
+- session and heartbeat timing as configuration
+
+So the seam is narrow — membership and assignment delivery — and everything
+expensive is on the shared side.
+
+##### The seam
+
+```rust
+/// How this client becomes and stays a member of a group, and how it learns
+/// what it is assigned. The only thing KIP-848 changes.
+trait GroupProtocol {
+    /// Join or rejoin. Returns the assignment and the token that fences us.
+    async fn ensure_member(
+        &mut self,
+        cluster: &mut Cluster<T>,
+        subscription: &Subscription,
+    ) -> Result<Membership>;
+
+    /// Periodic liveness, and where a reassignment is discovered.
+    async fn heartbeat(&mut self, cluster: &mut Cluster<T>) -> Result<HeartbeatOutcome>;
+
+    /// Leave deliberately, so the group rebalances now rather than at timeout.
+    async fn leave(&mut self, cluster: &mut Cluster<T>) -> Result<()>;
+}
+
+enum HeartbeatOutcome {
+    Unchanged,
+    Reassigned(Assignment),
+    /// Generation or member epoch moved on without us. Stop, do not commit.
+    Fenced,
+}
+```
+
+`ClassicProtocol` implements it with `JoinGroup`/`SyncGroup`/`Heartbeat` and
+owns the `Assignor` trait — range, round-robin, sticky, cooperative-sticky —
+because client-side assignment is exactly what KIP-848 removes. `ConsumerGroupProtocol`
+implements it later with the single heartbeat RPC and no assignor.
+
+Above the seam, one `GroupCoordinator` holds the current assignment, drives the
+revoke/assign callbacks, owns offset commit, and translates a `Fenced` outcome
+into "stop consuming and do not commit". That is the part worth getting right,
+and it is written once.
+
+##### The rule that keeps the seam honest
+
+Nothing above the seam may name a generation id or a member epoch. Both are
+fencing tokens; the moment shared code branches on which kind it has, the seam
+has leaked and the second implementation becomes a second client.
+
+Version negotiation already tells us which is available: the broker advertises
+`ConsumerGroupHeartbeat` or it does not, so selection can be automatic later
+without a configuration knob.
 
 ### Phase 2 — exactly-once with groups
 
