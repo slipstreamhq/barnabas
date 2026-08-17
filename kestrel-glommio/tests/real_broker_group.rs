@@ -477,11 +477,27 @@ fn heartbeating_without_polling_keeps_membership() {
 /// this one — which is right for both and made the loop terminate.
 ///
 /// What remains: the leader grants a partition to its new owner in the same
-/// round its current owner still holds it. The assignor withholds correctly in
-/// isolation (`cooperative_withholds_a_partition_that_must_move`), so the
-/// suspicion is the `owned` set the leader sees — either not surviving the
-/// subscription encode/decode, or read at a moment when the incumbent has
-/// briefly released everything.
+/// round its current owner still holds it, so the two members between them hold
+/// more partitions than exist. The assignor withholds correctly in isolation
+/// (`cooperative_withholds_a_partition_that_must_move`), so the fault is in the
+/// `owned` set the leader actually sees.
+///
+/// **Not a test artifact.** The first version of this test stopped as soon as
+/// both members held something, which is a transient state in a handover; it
+/// now requires the total to settle at four for five consecutive rounds, and
+/// that never happens either.
+///
+/// **Not the broker.** The coordinator only relays the assignment the leader
+/// computed — it never checks for overlap — and Java's `CooperativeStickyAssignor`
+/// works against this same cluster.
+///
+/// The leading suspicion is the subscription version. This client writes
+/// `ConsumerProtocolSubscription` v1, which carries `owned_partitions` but not
+/// the `generation_id` that v2 added. Java uses that generation to decide
+/// whether an ownership claim is still trustworthy, and discards claims from a
+/// member that has been away — without it, a leader cannot tell a live claim
+/// from a stale one, and a stale claim is exactly what would make it hand a
+/// partition to two members.
 ///
 /// Left failing rather than deleted: the eager path is unaffected, and shipping
 /// `cooperative-sticky` as available while it double-assigns would be far worse
@@ -554,12 +570,26 @@ fn cooperative_rebalancing_never_drops_everything() {
             .expect("subscribe");
 
         // Drive both through the handover, watching what the incumbent holds.
+        //
+        // **Settled, not merely non-zero.** A cooperative handover passes
+        // through a moment where the new owner has been granted nothing yet and
+        // another where the old owner has released but the grant has not landed
+        // — stopping at the first sight of both holding something reads one of
+        // those transients and calls it the result.
         let mut floor = 4usize;
-        for _ in 0..120 {
+        let mut stable_for = 0;
+        for _ in 0..200 {
             let _ = futures_lite::future::zip(first.poll(), second.poll()).await;
-            floor = floor.min(first.assignments().count());
-            if second.assignments().count() > 0 && first.assignments().count() > 0 {
-                break;
+            let a = first.assignments().count();
+            let b = second.assignments().count();
+            floor = floor.min(a);
+            if a + b == 4 && a > 0 && b > 0 {
+                stable_for += 1;
+                if stable_for >= 5 {
+                    break;
+                }
+            } else {
+                stable_for = 0;
             }
         }
 
