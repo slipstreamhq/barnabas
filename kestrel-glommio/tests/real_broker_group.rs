@@ -62,7 +62,7 @@ async fn settle(
     protocol: &mut ClassicProtocol,
     cluster: &mut kestrel_glommio::Cluster,
 ) -> Vec<kestrel_core::group::TopicPartition> {
-    for _ in 0..40 {
+    for _ in 0..200 {
         match protocol.advance(cluster).await.expect("advance") {
             Membership::Assigned(partitions) => return partitions,
             Membership::InProgress | Membership::Revoked => {
@@ -172,5 +172,99 @@ fn two_members_split_the_partitions_without_overlap() {
 
         a.leave(&mut cluster_a).await.expect("leave a");
         b.leave(&mut cluster_b).await.expect("leave b");
+    });
+}
+
+/// **The whole point, end to end**: subscribe, read, commit, and have a fresh
+/// consumer in the same group resume where the first one stopped.
+///
+/// This is the property a committed offset exists for, and the one that fails
+/// silently when the convention is wrong — Kafka stores *the next offset to
+/// read*, so an off-by-one here replays or skips exactly one record per
+/// partition per restart, which looks like a rare duplicate rather than a bug.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn a_committed_offset_is_where_the_next_consumer_resumes() {
+    run(|| async {
+        let topic = unique("commit");
+        let group = unique("cg");
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
+        prod.create_topic().await;
+        prod.produce_plain(6).await;
+
+        // First consumer: read three, commit, leave.
+        let first = {
+            let mut consumer = kestrel_glommio::Consumer::new(
+                kestrel_glommio::Glommio,
+                &bootstrap(),
+                "member-1",
+                kestrel_core::IsolationLevel::ReadCommitted,
+            )
+            .await
+            .expect("consumer");
+            consumer.set_max_wait(Duration::from_millis(200));
+            consumer
+                .subscribe(&group, vec![topic.clone()], Box::new(RangeAssignor), kestrel_glommio::EARLIEST)
+                .await
+                .expect("subscribe");
+
+            let mut seen = Vec::new();
+            for _ in 0..200 {
+                for group in consumer.poll().await.expect("poll") {
+                    for record in group.iter() {
+                        if seen.len() < 3 {
+                            seen.push(String::from_utf8_lossy(&record.value().unwrap()).into_owned());
+                        }
+                    }
+                }
+                if seen.len() >= 3 {
+                    break;
+                }
+            }
+            assert_eq!(seen.len(), 3, "expected three records, got {seen:?}");
+
+            // Commit exactly what was consumed, not wherever the fetch reached.
+            consumer.seek_to(&topic, 0, 3);
+            consumer.commit().await.expect("commit");
+            // Leave, or the next member waits out this one's session timeout
+            // before the group can rebalance.
+            consumer.unsubscribe().await.expect("unsubscribe");
+            seen
+        };
+        assert_eq!(first, vec!["v0", "v1", "v2"]);
+
+        // Second consumer, same group: must start at 3.
+        let mut consumer = kestrel_glommio::Consumer::new(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "member-2",
+            kestrel_core::IsolationLevel::ReadCommitted,
+        )
+        .await
+        .expect("consumer");
+        consumer.set_max_wait(Duration::from_millis(200));
+        consumer
+            .subscribe(&group, vec![topic.clone()], Box::new(RangeAssignor), kestrel_glommio::EARLIEST)
+            .await
+            .expect("subscribe");
+
+        let mut resumed = Vec::new();
+        // Generous, because a rebalance after the first member leaves takes as
+        // long as it takes and this runs beside the rest of the suite.
+        for _ in 0..200 {
+            for group in consumer.poll().await.expect("poll") {
+                for record in group.iter() {
+                    resumed.push(String::from_utf8_lossy(&record.value().unwrap()).into_owned());
+                }
+            }
+            if resumed.len() >= 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            resumed,
+            vec!["v3", "v4", "v5"],
+            "the second consumer must resume at the committed offset, not replay"
+        );
     });
 }

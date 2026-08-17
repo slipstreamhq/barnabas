@@ -28,10 +28,13 @@ use kafka_protocol::messages::{
         ConsumerProtocolSubscription, TopicPartition as SubscriptionTopicPartition,
     },
     join_group_request::{JoinGroupRequestProtocol, JoinGroupRequest},
+    offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
+    offset_fetch_request::OffsetFetchRequestTopic,
     sync_group_request::{SyncGroupRequestAssignment, SyncGroupRequest},
     ApiKey, FindCoordinatorRequest, FindCoordinatorResponse, GroupId, HeartbeatRequest,
-    HeartbeatResponse, JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, SyncGroupResponse,
-    TopicName,
+    HeartbeatResponse, JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse,
+    OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse,
+    SyncGroupResponse, TopicName,
 };
 use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
 use kestrel_core::group::{Assignor, Subscription, TopicPartition};
@@ -85,6 +88,34 @@ pub trait GroupProtocol<T: Transport> {
     /// Leave deliberately, so the group rebalances now rather than at the
     /// session timeout.
     fn leave(&mut self, cluster: &mut Cluster<T>) -> impl std::future::Future<Output = Result<()>>;
+
+    /// Commit these offsets for the group.
+    ///
+    /// **On the seam, not above it**, because a commit carries the fencing
+    /// token — a generation id here, a member epoch under KIP-848 — and the
+    /// rule that keeps the seam honest is that nothing above it names either.
+    /// The caller supplies positions; which token proves they are still ours is
+    /// the protocol's business.
+    ///
+    /// The offset committed is **the next one to read**, not the last one read.
+    /// Kafka's convention, and getting it wrong replays or skips exactly one
+    /// record per partition per restart.
+    fn commit(
+        &mut self,
+        cluster: &mut Cluster<T>,
+        offsets: &BTreeMap<TopicPartition, i64>,
+    ) -> impl std::future::Future<Output = Result<()>>;
+
+    /// Where this group last committed, for the partitions given.
+    ///
+    /// A partition with no committed offset is **absent** from the result
+    /// rather than zero — "never committed" and "committed at 0" are different
+    /// answers, and conflating them replays a whole partition.
+    fn committed(
+        &mut self,
+        cluster: &mut Cluster<T>,
+        partitions: &[TopicPartition],
+    ) -> impl std::future::Future<Output = Result<BTreeMap<TopicPartition, i64>>>;
 }
 
 /// Where membership stands after a step.
@@ -329,6 +360,22 @@ impl<T: Transport> GroupProtocol<T> for ClassicProtocol {
         Ok(Membership::InProgress)
     }
 
+    async fn commit(
+        &mut self,
+        cluster: &mut Cluster<T>,
+        offsets: &BTreeMap<TopicPartition, i64>,
+    ) -> Result<()> {
+        self.commit_offsets(cluster, offsets).await
+    }
+
+    async fn committed(
+        &mut self,
+        cluster: &mut Cluster<T>,
+        partitions: &[TopicPartition],
+    ) -> Result<BTreeMap<TopicPartition, i64>> {
+        self.fetch_offsets(cluster, partitions).await
+    }
+
     async fn leave(&mut self, cluster: &mut Cluster<T>) -> Result<()> {
         if self.member.member_id().is_empty() {
             return Ok(());
@@ -345,6 +392,113 @@ impl<T: Transport> GroupProtocol<T> for ClassicProtocol {
             cluster.call_at(&addr, ApiKey::LeaveGroup, 3, &req).await;
         self.member.on_leave();
         Ok(())
+    }
+}
+
+impl ClassicProtocol {
+    async fn commit_offsets<T: Transport>(
+        &mut self,
+        cluster: &mut Cluster<T>,
+        offsets: &BTreeMap<TopicPartition, i64>,
+    ) -> Result<()> {
+        if offsets.is_empty() {
+            return Ok(());
+        }
+        // Refused rather than sent: between a revocation and the next
+        // assignment these partitions may already belong to someone else, and
+        // the coordinator will not reject the write because the generation has
+        // not moved yet.
+        if !self.member.can_commit() {
+            return Err(Error::Broker {
+                op: "OffsetCommit",
+                code: codes::REBALANCE_IN_PROGRESS,
+                disposition: kestrel_core::Disposition::Retry,
+            });
+        }
+        let addr = self.coordinator_addr(cluster).await?;
+
+        let mut by_topic: BTreeMap<String, Vec<OffsetCommitRequestPartition>> = BTreeMap::new();
+        for (tp, offset) in offsets {
+            let mut partition = OffsetCommitRequestPartition::default();
+            partition.partition_index = tp.partition;
+            partition.committed_offset = *offset;
+            partition.committed_leader_epoch = -1;
+            by_topic.entry(tp.topic.clone()).or_default().push(partition);
+        }
+
+        let mut req = OffsetCommitRequest::default();
+        req.group_id = GroupId(StrBytes::from_string(self.member.group_id().to_owned()));
+        req.generation_id_or_member_epoch = self.member.generation();
+        req.member_id = StrBytes::from_string(self.member.member_id().to_owned());
+        req.topics = by_topic
+            .into_iter()
+            .map(|(name, partitions)| {
+                let mut topic = OffsetCommitRequestTopic::default();
+                topic.name = TopicName(StrBytes::from_string(name));
+                topic.partitions = partitions;
+                topic
+            })
+            .collect();
+
+        let resp: OffsetCommitResponse =
+            cluster.call_at(&addr, ApiKey::OffsetCommit, 8, &req).await?;
+        for topic in &resp.topics {
+            for partition in &topic.partitions {
+                crate::check("OffsetCommit", partition.error_code)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn fetch_offsets<T: Transport>(
+        &mut self,
+        cluster: &mut Cluster<T>,
+        partitions: &[TopicPartition],
+    ) -> Result<BTreeMap<TopicPartition, i64>> {
+        if partitions.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let addr = self.coordinator_addr(cluster).await?;
+
+        let mut by_topic: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+        for tp in partitions {
+            by_topic.entry(tp.topic.clone()).or_default().push(tp.partition);
+        }
+
+        let mut req = OffsetFetchRequest::default();
+        req.group_id = GroupId(StrBytes::from_string(self.member.group_id().to_owned()));
+        req.topics = Some(
+            by_topic
+                .into_iter()
+                .map(|(name, partition_indexes)| {
+                    let mut topic = OffsetFetchRequestTopic::default();
+                    topic.name = TopicName(StrBytes::from_string(name));
+                    topic.partition_indexes = partition_indexes;
+                    topic
+                })
+                .collect(),
+        );
+
+        let resp: OffsetFetchResponse =
+            cluster.call_at(&addr, ApiKey::OffsetFetch, 6, &req).await?;
+        crate::check("OffsetFetch", resp.error_code)?;
+
+        let mut out = BTreeMap::new();
+        for topic in &resp.topics {
+            for partition in &topic.partitions {
+                crate::check("OffsetFetch partition", partition.error_code)?;
+                // -1 is "never committed", which is not an offset. Left out so
+                // the caller falls back to its reset policy rather than
+                // replaying from zero.
+                if partition.committed_offset >= 0 {
+                    out.insert(
+                        TopicPartition::new(topic.name.0.to_string(), partition.partition_index),
+                        partition.committed_offset,
+                    );
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

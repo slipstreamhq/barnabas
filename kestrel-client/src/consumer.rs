@@ -238,6 +238,11 @@ pub struct Consumer<T: Transport> {
     outstanding: Option<Outstanding>,
     /// Whether to keep a fetch permanently in flight. On by default.
     prefetch: bool,
+    /// The group this consumer belongs to, if it subscribed rather than
+    /// assigned. See [`Self::subscribe`].
+    group: Option<crate::group::ClassicProtocol>,
+    /// Where to start a partition the group has no committed offset for.
+    reset: i64,
     /// Bumped whenever the assignment or a position changes for a reason other
     /// than consuming records. An outstanding fetch from an older generation
     /// asked a question that is no longer the one being asked.
@@ -275,6 +280,8 @@ impl<T: Transport> Consumer<T> {
             incremental: true,
             outstanding: None,
             prefetch: true,
+            group: None,
+            reset: EARLIEST,
             generation: 0,
         }
     }
@@ -300,6 +307,8 @@ impl<T: Transport> Consumer<T> {
             incremental: true,
             outstanding: None,
             prefetch: true,
+            group: None,
+            reset: EARLIEST,
             generation: 0,
         })
     }
@@ -366,6 +375,162 @@ impl<T: Transport> Consumer<T> {
     /// If metadata cannot be refreshed, or the topic does not exist.
     pub async fn partition_count(&mut self, topic: &str) -> Result<i32> {
         self.cluster.partition_count(topic).await
+    }
+
+    /// Join `group_id` and let the group decide which partitions this consumer
+    /// reads.
+    ///
+    /// **This is the shape most programs want**, and the opposite of
+    /// [`Self::assign`]: partitions arrive from the group's leader and change
+    /// when membership does. [`Self::poll`] drives the membership as a side
+    /// effect, so a caller that keeps polling keeps its place in the group.
+    ///
+    /// `reset` decides where a partition starts when the group has never
+    /// committed an offset for it — Kafka's `auto.offset.reset`.
+    ///
+    /// # Errors
+    /// If the coordinator cannot be found.
+    pub async fn subscribe(
+        &mut self,
+        group_id: &str,
+        topics: Vec<String>,
+        assignor: Box<dyn kestrel_core::group::Assignor>,
+        reset: i64,
+    ) -> Result<()> {
+        self.discard_outstanding().await;
+        self.positions.clear();
+        self.reset = reset;
+        self.group = Some(crate::group::ClassicProtocol::new(
+            group_id.to_owned(),
+            topics,
+            assignor,
+        ));
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Leave the group, giving up every partition.
+    ///
+    /// **Worth calling before dropping a consumer.** Without it the coordinator
+    /// keeps this member until its session times out — tens of seconds during
+    /// which its partitions are read by nobody, and any other member joining
+    /// waits out the same delay.
+    ///
+    /// # Errors
+    /// If the coordinator cannot be reached. The member is forgotten locally
+    /// either way: the coordinator drops it at the session timeout regardless.
+    pub async fn unsubscribe(&mut self) -> Result<()> {
+        self.discard_outstanding().await;
+        self.positions.clear();
+        self.generation += 1;
+        let Some(mut group) = self.group.take() else {
+            return Ok(());
+        };
+        crate::group::GroupProtocol::leave(&mut group, &mut self.cluster).await
+    }
+
+    /// Commit the position of every partition this consumer holds.
+    ///
+    /// The position is **the next offset to read**, which is what Kafka stores
+    /// and what a restart resumes from.
+    ///
+    /// # Errors
+    /// If this consumer is not in a group, or the group is mid-rebalance — a
+    /// commit then would write an offset for a partition that may already
+    /// belong to another member.
+    pub async fn commit(&mut self) -> Result<()> {
+        // **Before anything else touches a connection.** A prefetched `Fetch`
+        // is sitting unread on one of them, and the coordinator for this group
+        // may be that same broker — responses come back in order, so the commit
+        // would decode the fetch's answer. `add` and `list_offset` drain for
+        // the same reason; this one was missed, and the symptom was a commit
+        // failing with "decode Fetch v12 response".
+        self.discard_outstanding().await;
+
+        let offsets: BTreeMap<kestrel_core::group::TopicPartition, i64> = self
+            .positions
+            .iter()
+            .map(|((topic, partition), offset)| {
+                (
+                    kestrel_core::group::TopicPartition::new(topic.clone(), *partition),
+                    *offset,
+                )
+            })
+            .collect();
+
+        let Some(group) = self.group.as_mut() else {
+            return Err(Error::Missing("a group to commit to"));
+        };
+        crate::group::GroupProtocol::commit(group, &mut self.cluster, &offsets).await
+    }
+
+    /// Drive group membership, if this consumer subscribed.
+    ///
+    /// Returns whether the assignment changed, so [`Self::poll`] can discard a
+    /// fetch that is now for someone else's partitions.
+    async fn advance_group(&mut self) -> Result<bool> {
+        let Some(mut group) = self.group.take() else {
+            return Ok(false);
+        };
+        let outcome = crate::group::GroupProtocol::advance(&mut group, &mut self.cluster).await;
+        let changed = match &outcome {
+            Ok(crate::group::Membership::Assigned(partitions)) => {
+                let wanted: BTreeMap<(String, i32), ()> = partitions
+                    .iter()
+                    .map(|tp| ((tp.topic.clone(), tp.partition), ()))
+                    .collect();
+                let same = wanted.len() == self.positions.len()
+                    && wanted.keys().all(|k| self.positions.contains_key(k));
+                if same {
+                    false
+                } else {
+                    // A new assignment: resume each partition where the group
+                    // left off, or at the reset point if it never committed.
+                    let committed = crate::group::GroupProtocol::committed(
+                        &mut group,
+                        &mut self.cluster,
+                        partitions,
+                    )
+                    .await?;
+                    self.positions.clear();
+                    for tp in partitions {
+                        let start = committed.get(tp).copied().unwrap_or(self.reset);
+                        self.positions
+                            .insert((tp.topic.clone(), tp.partition), start);
+                    }
+                    true
+                }
+            }
+            // Everything was revoked: stop fetching before the next request,
+            // because another member is about to be given these.
+            Ok(crate::group::Membership::Revoked) => {
+                self.positions.clear();
+                true
+            }
+            Ok(crate::group::Membership::InProgress) | Err(_) => false,
+        };
+        self.group = Some(group);
+        outcome?;
+
+        if changed {
+            self.generation += 1;
+            for session in self.sessions.values_mut() {
+                session.reset();
+            }
+            // Offsets that are still `EARLIEST`/`LATEST` are resolved by `add`;
+            // resolve them now so the first fetch asks for a real position.
+            let unresolved: Vec<(String, i32, i64)> = self
+                .positions
+                .iter()
+                .filter(|(_, offset)| **offset == EARLIEST || **offset == LATEST)
+                .map(|((topic, partition), offset)| (topic.clone(), *partition, *offset))
+                .collect();
+            for (topic, partition, offset) in unresolved {
+                let resolved = self.list_offset(&topic, partition, offset).await?;
+                self.positions.insert((topic, partition), resolved);
+            }
+        }
+        Ok(changed)
     }
 
     /// Stop fetching a partition.
@@ -771,6 +936,15 @@ impl<T: Transport> Consumer<T> {
     /// # Errors
     /// As [`Self::poll`].
     pub async fn poll(&mut self) -> Result<Vec<ConsumerRecords>> {
+        // A subscribed consumer keeps its place in the group by polling, which
+        // is why membership is driven here rather than by a background task:
+        // this client spawns nothing.
+        if self.group.is_some() {
+            let changed = self.advance_group().await?;
+            if changed {
+                self.discard_outstanding().await;
+            }
+        }
         if self.positions.is_empty() {
             return Ok(Vec::new());
         }
