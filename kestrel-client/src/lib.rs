@@ -39,6 +39,7 @@ use std::time::Duration;
 pub mod cluster;
 pub mod sasl;
 pub mod builder;
+pub mod group;
 mod join;
 mod timeout;
 pub mod consumer;
@@ -48,6 +49,7 @@ pub use cluster::Cluster;
 pub use sasl::{Credentials, SaslMechanism};
 pub use builder::{ConsumerBuilder, ProducerBuilder, StartOffset};
 pub use consumer::{Consumer, ConsumerRecords, RecordRef, EARLIEST, LATEST};
+pub use group::{ClassicProtocol, GroupProtocol, Membership};
 pub use producer::{Producer, ProducerRecord};
 
 use kestrel_core::{Disposition, ErrorCode};

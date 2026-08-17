@@ -372,6 +372,29 @@ impl<T: Transport> Cluster<T> {
         Resp: Decodable,
     {
         let timeout = self.request_timeout;
+        self.call_at_with_timeout(addr, api_key, version, req, timeout)
+            .await
+    }
+
+    /// As [`Self::call_at`], with a deadline of its own.
+    ///
+    /// **Some requests are long-polls and the general deadline is wrong for
+    /// them.** `JoinGroup` is held by the coordinator until every member of the
+    /// group has joined — up to `rebalance_timeout_ms`, which is minutes — so a
+    /// 30-second request timeout cancels a request that is behaving correctly,
+    /// and takes the connection with it.
+    pub(crate) async fn call_at_with_timeout<Req, Resp>(
+        &mut self,
+        addr: &str,
+        api_key: ApiKey,
+        version: i16,
+        req: &Req,
+        timeout: Duration,
+    ) -> Result<Resp>
+    where
+        Req: Encodable,
+        Resp: Decodable,
+    {
         for attempt in 0..2 {
             let broker = self.broker_at(addr).await?;
             let outcome = with_timeout::<T, _>(timeout, broker.call(api_key, version, req)).await;

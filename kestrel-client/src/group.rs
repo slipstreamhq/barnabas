@@ -1,0 +1,464 @@
+//! The group protocol on a socket: the classic one, behind the seam.
+//!
+//! [`kestrel_core::member`] holds the state machine and decides *what* to do;
+//! this sends it. The split is the seam KIP-848 will plug into — see
+//! `docs/completing-the-client.md` — and the rule that keeps it honest is that
+//! nothing above [`GroupProtocol`] names a generation id or a member epoch.
+//! Both are fencing tokens; the moment shared code branches on which kind it
+//! holds, the seam has leaked.
+//!
+//! # The embedded blobs
+//!
+//! `JoinGroup` and `SyncGroup` carry the subscription and the assignment as
+//! **opaque bytes**, in a format the group's members agree on rather than one
+//! the broker parses. That is why a Rust member and a Java member can share a
+//! group at all — and why these encoders have to match, byte for byte, what
+//! `ConsumerProtocol` writes. `kafka-protocol` generates both from Kafka's own
+//! schemas, so the agreement is inherited rather than hand-rolled.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use bytes::Bytes;
+use kafka_protocol::messages::{
+    consumer_protocol_assignment::{
+        ConsumerProtocolAssignment, TopicPartition as AssignmentTopicPartition,
+    },
+    consumer_protocol_subscription::{
+        ConsumerProtocolSubscription, TopicPartition as SubscriptionTopicPartition,
+    },
+    join_group_request::{JoinGroupRequestProtocol, JoinGroupRequest},
+    sync_group_request::{SyncGroupRequestAssignment, SyncGroupRequest},
+    ApiKey, FindCoordinatorRequest, FindCoordinatorResponse, GroupId, HeartbeatRequest,
+    HeartbeatResponse, JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse, SyncGroupResponse,
+    TopicName,
+};
+use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
+use kestrel_core::group::{Assignor, Subscription, TopicPartition};
+use kestrel_core::member::{codes, GroupMember, Step};
+
+use crate::cluster::Cluster;
+use crate::{Error, Result, Transport};
+
+/// `protocol_type` for a consumer group. The coordinator rejects a member whose
+/// type does not match the group's, which is what stops a consumer joining a
+/// Connect group by accident.
+const CONSUMER_PROTOCOL: &str = "consumer";
+
+/// How many times to wait for a coordinator that is still being created.
+const COORDINATOR_RETRIES: usize = 40;
+const COORDINATOR_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Added to the rebalance timeout so the *broker* decides a slow rebalance has
+/// failed, rather than us abandoning a request it is still working on.
+const JOIN_SLACK: Duration = Duration::from_secs(5);
+
+/// How this client becomes and stays a member of a group, and how it learns
+/// what it is assigned.
+///
+/// **The only thing KIP-848 changes.** Offset commit, fetching, the callbacks
+/// and the assignment's effect all sit above this.
+pub trait GroupProtocol<T: Transport> {
+    /// Drive one step of membership. Called until it reports [`Membership`]
+    /// stable.
+    fn advance(
+        &mut self,
+        cluster: &mut Cluster<T>,
+    ) -> impl std::future::Future<Output = Result<Membership>>;
+
+    /// Leave deliberately, so the group rebalances now rather than at the
+    /// session timeout.
+    fn leave(&mut self, cluster: &mut Cluster<T>) -> impl std::future::Future<Output = Result<()>>;
+}
+
+/// Where membership stands after a step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Membership {
+    /// Still joining or syncing; call again.
+    InProgress,
+    /// Assigned and stable. The partitions are this member's to fetch.
+    Assigned(Vec<TopicPartition>),
+    /// Everything was revoked. The caller must stop fetching **before** the
+    /// next call, because another member is about to be given these.
+    Revoked,
+}
+
+/// The classic protocol: `JoinGroup`, `SyncGroup`, `Heartbeat`.
+pub struct ClassicProtocol {
+    member: GroupMember,
+    assignor: Box<dyn Assignor>,
+    coordinator: Option<String>,
+    session_timeout_ms: i32,
+    rebalance_timeout_ms: i32,
+    /// What the last `advance` reported, so a revocation is announced once.
+    announced_revoked: bool,
+    /// Whether anything was ever assigned. Without it the first join reports a
+    /// revocation, and a caller with a revoke callback runs it for partitions
+    /// it never had.
+    ever_assigned: bool,
+}
+
+impl ClassicProtocol {
+    #[must_use]
+    pub fn new(group_id: impl Into<String>, topics: Vec<String>, assignor: Box<dyn Assignor>) -> Self {
+        Self {
+            member: GroupMember::new(group_id, topics),
+            assignor,
+            coordinator: None,
+            session_timeout_ms: 45_000,
+            rebalance_timeout_ms: 300_000,
+            announced_revoked: false,
+            ever_assigned: false,
+        }
+    }
+
+    #[must_use]
+    pub fn member(&self) -> &GroupMember {
+        &self.member
+    }
+
+    /// How long the coordinator waits for a heartbeat before removing us.
+    pub fn set_session_timeout(&mut self, ms: i32) {
+        self.session_timeout_ms = ms;
+    }
+
+    /// How long the coordinator waits for every member to rejoin. Should exceed
+    /// the longest a caller can spend between polls, or a slow consumer is
+    /// dropped mid-rebalance.
+    pub fn set_rebalance_timeout(&mut self, ms: i32) {
+        self.rebalance_timeout_ms = ms;
+    }
+
+    /// The **group** coordinator, which is a different broker from a
+    /// transaction coordinator and is found the same way.
+    async fn coordinator_addr<T: Transport>(&mut self, cluster: &mut Cluster<T>) -> Result<String> {
+        if let Some(addr) = &self.coordinator {
+            return Ok(addr.clone());
+        }
+        let mut req = FindCoordinatorRequest::default();
+        req.key = StrBytes::from_string(self.member.group_id().to_owned());
+        req.key_type = 0; // GROUP
+
+        // **The first call for a new group is expected to fail.**
+        // `__consumer_offsets` is created lazily by this very request, so a
+        // fresh cluster answers COORDINATOR_NOT_AVAILABLE until it exists. The
+        // transactional producer met the same thing on `__transaction_state`.
+        for attempt in 0..COORDINATOR_RETRIES {
+            let resp: FindCoordinatorResponse =
+                cluster.call_any(ApiKey::FindCoordinator, 3, &req).await?;
+            match resp.error_code {
+                codes::NONE => {
+                    let addr = format!("{}:{}", resp.host.as_str(), resp.port);
+                    self.coordinator = Some(addr.clone());
+                    return Ok(addr);
+                }
+                codes::COORDINATOR_NOT_AVAILABLE | codes::COORDINATOR_LOAD_IN_PROGRESS => {
+                    let _ = attempt;
+                    T::sleep(COORDINATOR_BACKOFF).await;
+                }
+                code => crate::check("FindCoordinator", code)?,
+            }
+        }
+        Err(Error::Broker {
+            op: "FindCoordinator",
+            code: codes::COORDINATOR_NOT_AVAILABLE,
+            disposition: kestrel_core::Disposition::Retry,
+        })
+    }
+
+    async fn join<T: Transport>(&mut self, cluster: &mut Cluster<T>) -> Result<Step> {
+        let addr = self.coordinator_addr(cluster).await?;
+
+        let mut protocol = JoinGroupRequestProtocol::default();
+        protocol.name = StrBytes::from_string(self.assignor.name().to_owned());
+        protocol.metadata = encode_subscription(&self.member.subscription())?;
+
+        let mut req = JoinGroupRequest::default();
+        req.group_id = GroupId(StrBytes::from_string(self.member.group_id().to_owned()));
+        req.session_timeout_ms = self.session_timeout_ms;
+        req.rebalance_timeout_ms = self.rebalance_timeout_ms;
+        req.member_id = StrBytes::from_string(self.member.member_id().to_owned());
+        req.protocol_type = StrBytes::from_static_str(CONSUMER_PROTOCOL);
+        req.protocols = vec![protocol];
+
+        // The coordinator holds this until the whole group has joined, so its
+        // deadline is the rebalance timeout, not the general request timeout.
+        let deadline = Duration::from_millis(u64::try_from(self.rebalance_timeout_ms).unwrap_or(300_000))
+            + JOIN_SLACK;
+        let resp: JoinGroupResponse = cluster
+            .call_at_with_timeout(&addr, ApiKey::JoinGroup, 7, &req, deadline)
+            .await?;
+
+        // Only the leader is given the members, and only it needs to decode
+        // them.
+        let members = if resp.leader == resp.member_id {
+            resp.members
+                .iter()
+                .map(|m| decode_subscription(m.member_id.as_str(), &m.metadata))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+
+        Ok(self.member.on_join(
+            resp.error_code,
+            resp.generation_id,
+            resp.member_id.as_str(),
+            resp.leader.as_str(),
+            members,
+        ))
+    }
+
+    async fn sync<T: Transport>(
+        &mut self,
+        cluster: &mut Cluster<T>,
+        assignments: Vec<SyncGroupRequestAssignment>,
+    ) -> Result<Step> {
+        let addr = self.coordinator_addr(cluster).await?;
+
+        let mut req = SyncGroupRequest::default();
+        req.group_id = GroupId(StrBytes::from_string(self.member.group_id().to_owned()));
+        req.generation_id = self.member.generation();
+        req.member_id = StrBytes::from_string(self.member.member_id().to_owned());
+        req.protocol_type = Some(StrBytes::from_static_str(CONSUMER_PROTOCOL));
+        req.protocol_name = Some(StrBytes::from_string(self.assignor.name().to_owned()));
+        req.assignments = assignments;
+
+        let resp: SyncGroupResponse = cluster.call_at(&addr, ApiKey::SyncGroup, 4, &req).await?;
+        let assigned = if resp.error_code == codes::NONE && !resp.assignment.is_empty() {
+            decode_assignment(&resp.assignment)?
+        } else {
+            Vec::new()
+        };
+        Ok(self.member.on_sync(resp.error_code, assigned))
+    }
+
+    async fn heartbeat<T: Transport>(&mut self, cluster: &mut Cluster<T>) -> Result<Step> {
+        let addr = self.coordinator_addr(cluster).await?;
+
+        let mut req = HeartbeatRequest::default();
+        req.group_id = GroupId(StrBytes::from_string(self.member.group_id().to_owned()));
+        req.generation_id = self.member.generation();
+        req.member_id = StrBytes::from_string(self.member.member_id().to_owned());
+
+        let resp: HeartbeatResponse = cluster.call_at(&addr, ApiKey::Heartbeat, 4, &req).await?;
+        Ok(self.member.on_heartbeat(resp.error_code))
+    }
+
+    /// Compute the assignment as leader, and send it.
+    async fn assign_and_sync<T: Transport>(
+        &mut self,
+        cluster: &mut Cluster<T>,
+        members: Vec<Subscription>,
+    ) -> Result<Step> {
+        // The count comes from metadata, not from the members: a member only
+        // says which *topics* it wants.
+        let mut partitions_per_topic: BTreeMap<String, i32> = BTreeMap::new();
+        for topic in members.iter().flat_map(|m| m.topics.iter()) {
+            if !partitions_per_topic.contains_key(topic) {
+                let count = cluster.partition_count(topic).await?;
+                partitions_per_topic.insert(topic.clone(), count);
+            }
+        }
+
+        let assignment = self.assignor.assign(&members, &partitions_per_topic);
+        let encoded = assignment
+            .iter()
+            .map(|(member_id, partitions)| {
+                let mut entry = SyncGroupRequestAssignment::default();
+                entry.member_id = StrBytes::from_string(member_id.clone());
+                entry.assignment = encode_assignment(partitions)?;
+                Ok(entry)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        self.sync(cluster, encoded).await
+    }
+}
+
+impl<T: Transport> GroupProtocol<T> for ClassicProtocol {
+    async fn advance(&mut self, cluster: &mut Cluster<T>) -> Result<Membership> {
+        let step = self.member.step();
+        let outcome = match step {
+            Step::Join { .. } => self.join(cluster).await?,
+            Step::AssignAndSync { members } => self.assign_and_sync(cluster, members).await?,
+            Step::Sync => self.sync(cluster, Vec::new()).await?,
+            Step::Heartbeat => self.heartbeat(cluster).await?,
+            Step::FindCoordinator => {
+                self.coordinator = None;
+                Step::Join {
+                    member_id: self.member.member_id().to_owned(),
+                }
+            }
+        };
+
+        // A step that asked us to re-discover clears the coordinator, whichever
+        // call produced it.
+        if outcome == Step::FindCoordinator {
+            self.coordinator = None;
+        }
+
+        if self.member.state() == kestrel_core::member::MemberState::Stable {
+            self.announced_revoked = false;
+            self.ever_assigned = true;
+            return Ok(Membership::Assigned(self.member.assignment().to_vec()));
+        }
+        // **Announced once, and before the next request goes out.** The caller
+        // has to stop fetching these partitions now: another member is about to
+        // be told it owns them.
+        if self.ever_assigned && !self.announced_revoked {
+            self.announced_revoked = true;
+            return Ok(Membership::Revoked);
+        }
+        Ok(Membership::InProgress)
+    }
+
+    async fn leave(&mut self, cluster: &mut Cluster<T>) -> Result<()> {
+        if self.member.member_id().is_empty() {
+            return Ok(());
+        }
+        let addr = self.coordinator_addr(cluster).await?;
+
+        let mut req = LeaveGroupRequest::default();
+        req.group_id = GroupId(StrBytes::from_string(self.member.group_id().to_owned()));
+        req.member_id = StrBytes::from_string(self.member.member_id().to_owned());
+
+        // A failure here costs a rebalance delay, not correctness: the
+        // coordinator drops us at the session timeout anyway.
+        let _: std::result::Result<LeaveGroupResponse, Error> =
+            cluster.call_at(&addr, ApiKey::LeaveGroup, 3, &req).await;
+        self.member.on_leave();
+        Ok(())
+    }
+}
+
+// ── the embedded blobs ───────────────────────────────────────────────────────
+
+fn encode_subscription(subscription: &Subscription) -> Result<Bytes> {
+    let mut owned: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+    for tp in &subscription.owned {
+        owned.entry(tp.topic.clone()).or_default().push(tp.partition);
+    }
+
+    let mut body = ConsumerProtocolSubscription::default();
+    body.topics = subscription
+        .topics
+        .iter()
+        .map(|t| StrBytes::from_string(t.clone()))
+        .collect();
+    body.owned_partitions = owned
+        .into_iter()
+        .map(|(topic, partitions)| {
+            let mut entry = SubscriptionTopicPartition::default();
+            entry.topic = TopicName(StrBytes::from_string(topic));
+            entry.partitions = partitions;
+            entry
+        })
+        .collect();
+
+    let mut buf = bytes::BytesMut::new();
+    body.encode(&mut buf, 3)
+        .map_err(|e| Error::Core(kestrel_core::Error::Codec(format!("subscription: {e}"))))?;
+    Ok(buf.freeze())
+}
+
+fn decode_subscription(member_id: &str, metadata: &Bytes) -> Result<Subscription> {
+    let mut cursor = metadata.clone();
+    let body = ConsumerProtocolSubscription::decode(&mut cursor, 3)
+        .map_err(|e| Error::Core(kestrel_core::Error::Codec(format!("subscription: {e}"))))?;
+
+    Ok(Subscription {
+        member_id: member_id.to_owned(),
+        topics: body.topics.iter().map(|t| t.to_string()).collect(),
+        owned: body
+            .owned_partitions
+            .iter()
+            .flat_map(|tp| {
+                let topic = tp.topic.0.to_string();
+                tp.partitions
+                    .iter()
+                    .map(move |p| TopicPartition::new(topic.clone(), *p))
+            })
+            .collect(),
+    })
+}
+
+fn encode_assignment(partitions: &[TopicPartition]) -> Result<Bytes> {
+    let mut by_topic: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+    for tp in partitions {
+        by_topic.entry(tp.topic.clone()).or_default().push(tp.partition);
+    }
+
+    let mut body = ConsumerProtocolAssignment::default();
+    body.assigned_partitions = by_topic
+        .into_iter()
+        .map(|(topic, partitions)| {
+            let mut entry = AssignmentTopicPartition::default();
+            entry.topic = TopicName(StrBytes::from_string(topic));
+            entry.partitions = partitions;
+            entry
+        })
+        .collect();
+
+    let mut buf = bytes::BytesMut::new();
+    body.encode(&mut buf, 3)
+        .map_err(|e| Error::Core(kestrel_core::Error::Codec(format!("assignment: {e}"))))?;
+    Ok(buf.freeze())
+}
+
+fn decode_assignment(assignment: &Bytes) -> Result<Vec<TopicPartition>> {
+    let mut cursor = assignment.clone();
+    let body = ConsumerProtocolAssignment::decode(&mut cursor, 3)
+        .map_err(|e| Error::Core(kestrel_core::Error::Codec(format!("assignment: {e}"))))?;
+
+    let mut out: Vec<TopicPartition> = body
+        .assigned_partitions
+        .iter()
+        .flat_map(|tp| {
+            let topic = tp.topic.0.to_string();
+            tp.partitions
+                .iter()
+                .map(move |p| TopicPartition::new(topic.clone(), *p))
+        })
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The blobs must survive a round trip: they are what a Java member reads.
+    #[test]
+    fn a_subscription_round_trips() {
+        let subscription = Subscription {
+            member_id: "m-1".to_owned(),
+            topics: vec!["a".to_owned(), "b".to_owned()],
+            owned: vec![TopicPartition::new("a", 0), TopicPartition::new("a", 3)],
+        };
+        let encoded = encode_subscription(&subscription).expect("encode");
+        let decoded = decode_subscription("m-1", &encoded).expect("decode");
+        assert_eq!(decoded.topics, subscription.topics);
+        assert_eq!(decoded.owned, subscription.owned);
+    }
+
+    #[test]
+    fn an_assignment_round_trips() {
+        let partitions = vec![
+            TopicPartition::new("a", 0),
+            TopicPartition::new("a", 1),
+            TopicPartition::new("b", 7),
+        ];
+        let encoded = encode_assignment(&partitions).expect("encode");
+        assert_eq!(decode_assignment(&encoded).expect("decode"), partitions);
+    }
+
+    /// An empty assignment is a real answer — "you got nothing this round" —
+    /// and must not decode as an error.
+    #[test]
+    fn an_empty_assignment_decodes_to_nothing() {
+        let encoded = encode_assignment(&[]).expect("encode");
+        assert!(decode_assignment(&encoded).expect("decode").is_empty());
+    }
+}
