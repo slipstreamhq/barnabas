@@ -81,6 +81,15 @@ pub struct GroupMember {
     topics: Vec<String>,
     assignment: Vec<TopicPartition>,
     leader: bool,
+    /// The membership the coordinator handed us as leader, kept until the
+    /// assignment is computed.
+    ///
+    /// **Held here rather than returned once**, because the caller re-asks
+    /// [`Self::step`] for what to do and `Syncing` alone cannot say whether we
+    /// are the leader. Without it a leader syncs like a follower, sends an
+    /// empty assignment, and the whole group is assigned nothing — which is
+    /// exactly what happened.
+    pending_members: Vec<Subscription>,
 }
 
 impl GroupMember {
@@ -94,6 +103,7 @@ impl GroupMember {
             topics,
             assignment: Vec::new(),
             leader: false,
+            pending_members: Vec::new(),
         }
     }
 
@@ -147,6 +157,9 @@ impl GroupMember {
             MemberState::Unjoined | MemberState::Joining => Step::Join {
                 member_id: self.member_id.clone(),
             },
+            MemberState::Syncing if self.leader => Step::AssignAndSync {
+                members: self.pending_members.clone(),
+            },
             MemberState::Syncing => Step::Sync,
             MemberState::Stable => Step::Heartbeat,
         }
@@ -190,8 +203,10 @@ impl GroupMember {
                 self.leader = leader_id == member_id;
                 self.state = MemberState::Syncing;
                 if self.leader {
+                    self.pending_members = members.clone();
                     Step::AssignAndSync { members }
                 } else {
+                    self.pending_members.clear();
                     Step::Sync
                 }
             }
@@ -315,6 +330,7 @@ impl GroupMember {
     /// does too, which is duplicate consumption that no error reports.
     fn revoke_and_rejoin(&mut self) {
         self.assignment.clear();
+        self.pending_members.clear();
         self.generation = NO_GENERATION;
         self.leader = false;
         self.state = MemberState::Unjoined;
@@ -368,6 +384,32 @@ mod tests {
         let step = m.on_join(codes::NONE, 3, "m-1", "m-1", members.clone());
         assert_eq!(step, Step::AssignAndSync { members });
         assert!(m.is_leader());
+    }
+
+    /// **The leader must still be the leader when asked a second time.**
+    ///
+    /// `advance` re-asks `step()` rather than acting on what `on_join`
+    /// returned, so `Syncing` has to remember leadership. When it did not, the
+    /// leader synced like a follower, sent an empty assignment, and every
+    /// member of the group was assigned nothing.
+    #[test]
+    fn the_leader_is_still_the_leader_on_the_next_step() {
+        let mut m = member();
+        let members = vec![Subscription {
+            member_id: "m-1".to_owned(),
+            topics: vec!["t".to_owned()],
+            owned: vec![],
+        }];
+        m.on_join(codes::NONE, 3, "m-1", "m-1", members.clone());
+        assert_eq!(m.step(), Step::AssignAndSync { members });
+    }
+
+    /// A follower asked twice stays a follower.
+    #[test]
+    fn a_follower_is_still_a_follower_on_the_next_step() {
+        let mut m = member();
+        m.on_join(codes::NONE, 3, "m-1", "m-2", vec![]);
+        assert_eq!(m.step(), Step::Sync);
     }
 
     /// **Offsets may only be committed while stable.** Between a revocation and

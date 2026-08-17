@@ -5,34 +5,22 @@
 //! one Kafka accepts, that the embedded subscription blob is one it relays, and
 //! that two members of the same group are given disjoint partitions.
 //!
-//! # These do not pass yet, and are gated behind `KESTREL_GROUP_TESTS`
+//! # Two bugs these found
 //!
-//! **Where it stops:** the coordinator accepts the first `JoinGroup` (empty
-//! member id) and answers `MEMBER_ID_REQUIRED` with an id, exactly as KIP-394
-//! says. The second `JoinGroup`, carrying that id, is accepted too — the broker
-//! logs `Preparing to rebalance ... (reason: Adding new member ...)` — and then
-//! the rebalance never completes. No `Stabilized group` line ever appears, and
-//! our request eventually times out.
+//! **The `ConsumerProtocol` blobs need a version prefix.** Kafka's
+//! `serializeSubscription` writes an int16 version and then the struct;
+//! `kafka-protocol`'s generated type is only the struct. Without the prefix the
+//! coordinator accepted the `JoinGroup`, logged `Preparing to rebalance`, and
+//! then never stabilized the group — no error, no response, just a request held
+//! until the rebalance timeout. A Java consumer on the same broker stabilized
+//! in a millisecond.
 //!
-//! **What has been ruled out**, each by experiment against the same cluster:
-//!
-//! - *The cluster.* `kafka-console-consumer` joins a group on it and is
-//!   assigned within milliseconds: `Assignment received from leader ... for
-//!   generation 1`.
-//! - *Timeouts.* Reproduced with 10s/10s, 3s/10s, and the Java client's own
-//!   45s/300s.
-//! - *Request versions.* Reproduced with `JoinGroup` v7 and v9, `SyncGroup` v4
-//!   and v5.
-//! - *The initial rebalance delay.* `group.initial.rebalance.delay.ms=0` on
-//!   this cluster, confirmed in the broker's config.
-//!
-//! So the difference is somewhere in the request we build that the coordinator
-//! accepts but does not treat as a completed join. The next step is to compare
-//! our `JoinGroup` bytes against the Java client's for the same group, rather
-//! than guessing at fields.
-//!
-//! Gated rather than `#[ignore]`d because the full suite runs with `--ignored`,
-//! and a known-failing test there is indistinguishable from a regression.
+//! **A leader must still be a leader when asked twice.** `advance` re-asks
+//! `step()` rather than acting on what `on_join` returned, and `Syncing` did
+//! not record leadership — so the leader synced like a follower, sent an empty
+//! assignment, and every member was assigned nothing. The group was *stable*
+//! and owned no partitions, which is the kind of failure that looks like a
+//! working consumer with an idle topic.
 
 mod producer;
 
@@ -60,15 +48,6 @@ fn unique(prefix: &str) -> String {
         .unwrap()
         .as_nanos();
     format!("kestrel-{prefix}-{nanos}")
-}
-
-/// Opt in with `KESTREL_GROUP_TESTS=1` once the open issue above is fixed.
-fn gated() -> bool {
-    if std::env::var("KESTREL_GROUP_TESTS").is_err() {
-        eprintln!("skipped: group tests are gated pending the open JoinGroup issue");
-        return true;
-    }
-    false
 }
 
 fn run<F: std::future::Future<Output = ()>>(fut: impl FnOnce() -> F + 'static) {
@@ -100,9 +79,6 @@ async fn settle(
 #[test]
 #[ignore = "needs a Kafka broker on localhost:9092"]
 fn a_single_member_is_assigned_every_partition() {
-    if gated() {
-        return;
-    }
     run(|| async {
         let topic = unique("group");
         let mut prod = TestProducer::connect(&broker(), &topic).await;
@@ -139,9 +115,6 @@ fn a_single_member_is_assigned_every_partition() {
 #[test]
 #[ignore = "needs a Kafka broker on localhost:9092"]
 fn two_members_split_the_partitions_without_overlap() {
-    if gated() {
-        return;
-    }
     run(|| async {
         let topic = unique("group2");
         let group = unique("g2");

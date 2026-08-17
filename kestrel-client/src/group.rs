@@ -53,6 +53,22 @@ const COORDINATOR_BACKOFF: Duration = Duration::from_millis(250);
 /// failed, rather than us abandoning a request it is still working on.
 const JOIN_SLACK: Duration = Duration::from_secs(5);
 
+/// The `ConsumerProtocol` version this client writes. Members negotiate down to
+/// the lowest any of them wrote, so a reader must honour what it is given
+/// rather than assume this one.
+const PROTOCOL_VERSION: i16 = 1;
+
+/// The int16 that prefixes every subscription and assignment blob.
+fn read_version(cursor: &mut Bytes) -> Result<i16> {
+    use bytes::Buf;
+    if cursor.remaining() < 2 {
+        return Err(Error::Core(kestrel_core::Error::Codec(
+            "consumer protocol blob is too short for its version".to_owned(),
+        )));
+    }
+    Ok(cursor.get_i16())
+}
+
 /// How this client becomes and stays a member of a group, and how it learns
 /// what it is assigned.
 ///
@@ -356,15 +372,22 @@ fn encode_subscription(subscription: &Subscription) -> Result<Bytes> {
         })
         .collect();
 
+    // **The version goes on the wire ahead of the struct.** Kafka's
+    // `ConsumerProtocol.serializeSubscription` writes an int16 version and then
+    // the body; `kafka-protocol`'s generated type is only the body, so the
+    // prefix is ours to add. Without it every member — ours and Java's — reads
+    // the blob shifted by two bytes.
     let mut buf = bytes::BytesMut::new();
-    body.encode(&mut buf, 3)
+    buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    body.encode(&mut buf, PROTOCOL_VERSION)
         .map_err(|e| Error::Core(kestrel_core::Error::Codec(format!("subscription: {e}"))))?;
     Ok(buf.freeze())
 }
 
 fn decode_subscription(member_id: &str, metadata: &Bytes) -> Result<Subscription> {
     let mut cursor = metadata.clone();
-    let body = ConsumerProtocolSubscription::decode(&mut cursor, 3)
+    let version = read_version(&mut cursor)?;
+    let body = ConsumerProtocolSubscription::decode(&mut cursor, version)
         .map_err(|e| Error::Core(kestrel_core::Error::Codec(format!("subscription: {e}"))))?;
 
     Ok(Subscription {
@@ -401,14 +424,16 @@ fn encode_assignment(partitions: &[TopicPartition]) -> Result<Bytes> {
         .collect();
 
     let mut buf = bytes::BytesMut::new();
-    body.encode(&mut buf, 3)
+    buf.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    body.encode(&mut buf, PROTOCOL_VERSION)
         .map_err(|e| Error::Core(kestrel_core::Error::Codec(format!("assignment: {e}"))))?;
     Ok(buf.freeze())
 }
 
 fn decode_assignment(assignment: &Bytes) -> Result<Vec<TopicPartition>> {
     let mut cursor = assignment.clone();
-    let body = ConsumerProtocolAssignment::decode(&mut cursor, 3)
+    let version = read_version(&mut cursor)?;
+    let body = ConsumerProtocolAssignment::decode(&mut cursor, version)
         .map_err(|e| Error::Core(kestrel_core::Error::Codec(format!("assignment: {e}"))))?;
 
     let mut out: Vec<TopicPartition> = body
