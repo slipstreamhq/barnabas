@@ -465,6 +465,33 @@ impl<T: Transport> Consumer<T> {
         self.listener = Some(listener);
     }
 
+    /// Tell the coordinator this member is alive, without polling.
+    ///
+    /// **This client spawns nothing, so heartbeats ride on [`Self::poll`].**
+    /// That is fine for a caller that polls in a loop, and wrong for one that
+    /// spends longer than `session.timeout.ms` handling a batch: the
+    /// coordinator removes a member it has not heard from, its partitions are
+    /// given to someone else, and the slow member's next commit is rejected.
+    ///
+    /// Java hides this with a background heartbeat thread and a separate
+    /// `max.poll.interval.ms`. The equivalent here is to call this from your
+    /// own task while you work — it needs only `&mut Consumer`, so a caller
+    /// that processes on the same executor can interleave it.
+    ///
+    /// Returns whether the assignment changed, which is the same signal
+    /// [`Self::poll`] acts on: `true` means partitions were revoked or granted
+    /// and any in-flight work on the old ones should stop.
+    ///
+    /// # Errors
+    /// If the coordinator cannot be reached. Not being in a group is not an
+    /// error — it simply does nothing.
+    pub async fn heartbeat(&mut self) -> Result<bool> {
+        if self.group.is_none() {
+            return Ok(false);
+        }
+        self.advance_group().await
+    }
+
     /// Leave the group, giving up every partition.
     ///
     /// **Worth calling before dropping a consumer.** Without it the coordinator

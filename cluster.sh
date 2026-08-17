@@ -131,6 +131,7 @@ up() {
     if [ "$(podman exec kafka1 /opt/kafka/bin/kafka-broker-api-versions.sh \
         --bootstrap-server kafka1:9092 2>/dev/null | grep -c 'id:')" = "$NODES" ]; then
       echo " ok"
+      wait_for_group_coordinator
       ports
       return 0
     fi
@@ -140,6 +141,42 @@ up() {
   echo " timed out"
   podman logs --tail 40 kafka1
   return 1
+}
+
+# **Brokers being up is not the same as groups working.**
+#
+# `__consumer_offsets` is created lazily by the first group operation, and until
+# it exists with elected leaders the coordinator answers
+# COORDINATOR_NOT_AVAILABLE or holds a rebalance that never completes. A test
+# suite started at that moment fails in scattered ways that look like client
+# bugs — which cost several debugging runs before this was understood.
+#
+# So force the topic into existence and wait for it, the same way a first
+# consumer would.
+wait_for_group_coordinator() {
+  echo -n "waiting for the group coordinator"
+  # Listing groups does not create the topic; joining one does. A console
+  # consumer with a group id is the shortest way to make the coordinator do it.
+  podman exec kafka1 sh -c '/opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server kafka1:9092 --topic __cluster_warmup --group __warmup \
+    --timeout-ms 3000 >/dev/null 2>&1' || true
+  # No pipeline: under `set -o pipefail` a describe that fails because the
+  # topic does not exist yet would poison the test either way, and the
+  # captured-output form says what it means.
+  local described
+  for _ in $(seq 1 60); do
+    described=$(podman exec kafka1 /opt/kafka/bin/kafka-topics.sh \
+      --bootstrap-server kafka1:9092 --describe --topic __consumer_offsets 2>/dev/null || true)
+    case "$described" in
+      *"Leader: "[0-9]*)
+        echo " ok"
+        return 0
+        ;;
+    esac
+    echo -n .
+    sleep 1
+  done
+  echo " timed out (groups may be slow to start)"
 }
 
 down() {

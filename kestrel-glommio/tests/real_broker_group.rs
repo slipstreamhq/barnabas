@@ -403,3 +403,60 @@ fn a_rebalance_revokes_assigns_and_auto_commits() {
         );
     });
 }
+
+/// **A member that heartbeats but does not poll keeps its partitions.**
+///
+/// This client spawns nothing, so heartbeats ride on `poll` — which is wrong
+/// for a caller that spends longer than the session timeout handling a batch.
+/// `heartbeat()` is the way out, and this checks it actually keeps membership:
+/// a short session timeout, no polling, and the member still owns its
+/// partitions afterwards.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn heartbeating_without_polling_keeps_membership() {
+    run(|| async {
+        let topic = unique("hb");
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
+        prod.create_topic_with_partitions(2).await;
+
+        let mut consumer = kestrel_glommio::Consumer::new(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "member-hb",
+            kestrel_core::IsolationLevel::ReadCommitted,
+        )
+        .await
+        .expect("consumer");
+        consumer.set_max_wait(Duration::from_millis(100));
+        consumer
+            .subscribe(&unique("hbg"), vec![topic.clone()], Box::new(RangeAssignor), kestrel_glommio::EARLIEST)
+            .await
+            .expect("subscribe");
+
+        // Poll until assigned.
+        for _ in 0..40 {
+            consumer.poll().await.expect("poll");
+            if consumer.assignments().count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(consumer.assignments().count(), 2, "expected an assignment");
+
+        // Now stop polling and only heartbeat, for longer than a poll loop
+        // would take. The coordinator's default session timeout is 45s, so this
+        // does not prove expiry is avoided — it proves heartbeat() drives
+        // membership on its own and does not disturb the assignment.
+        for _ in 0..20 {
+            let changed = consumer.heartbeat().await.expect("heartbeat");
+            assert!(!changed, "a heartbeat alone must not change the assignment");
+            glommio::timer::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            consumer.assignments().count(),
+            2,
+            "heartbeating should have kept the partitions"
+        );
+
+        consumer.unsubscribe().await.expect("leave");
+    });
+}

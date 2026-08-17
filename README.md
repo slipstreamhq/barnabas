@@ -5,14 +5,11 @@ including thread-per-core ones, which is what it was built for.
 
 **Working name, and early.** Nothing here is published and the API will change.
 
-> **No consumer groups yet, and no reaction to topic expansion.** You choose the partitions
-> and store the offsets. If you want `subscribe("topic")` with rebalancing and committed
-> offsets — which is what most projects want — this client cannot do it today; use
-> [`rdkafka`](https://crates.io/crates/rdkafka) or the Java client.
->
-> The sharper edge: a topic you do not own can gain partitions at any time, and this client
-> will not notice. `assign_all` means *all of them as of process start*, so new partitions go
-> unread with no error. Both are scoped in [`docs/completing-the-client.md`](docs/completing-the-client.md).
+> **Consumer groups work**: `subscribe`, rebalancing, committed offsets, auto-commit and
+> rebalance callbacks. Two gaps to know about before choosing this client:
+> **heartbeats only go out when you `poll`** (see below), and **only eager rebalancing** —
+> `cooperative-sticky` is not implemented yet. Remaining work is scoped in
+> [`docs/completing-the-client.md`](docs/completing-the-client.md).
 
 Design and sequencing:
 `../docs/superpowers/specs/2026-08-15-native-kafka-client-design.md`.
@@ -185,17 +182,27 @@ mistake a type can prevent.
 
 ### Who decides which partitions you read
 
-**You do. There is no consumer group.**
+**Either you or the group — both are supported, and they are different tools.**
 
-No `subscribe`, no JoinGroup/SyncGroup, no heartbeats, no rebalance, no
-generation fencing. The broker is never asked which partitions this client
-owns, because it has no idea — that half of a Kafka client does not exist here,
-deliberately. Slipstream's control plane assigns partitions and its checkpoints
-hold the offsets, so the group protocol would be a second, competing answer to
-questions already answered.
+`subscribe` joins a consumer group and lets it decide: partitions arrive from
+the group's leader and move when membership changes. This is what most programs
+want.
 
-So `assign`, `assign_range` and `assign_all` are not overrides of something the
-broker would otherwise tell you. They are the only mechanism.
+```rust
+consumer.subscribe("my-group", vec!["events".into()], Box::new(RangeAssignor), EARLIEST).await?;
+consumer.set_auto_commit(Some(Duration::from_secs(5)));
+
+loop {
+    for batch in consumer.poll().await? {      // also drives membership
+        for record in batch.iter() { handle(record.value()); }
+    }
+}
+```
+
+`assign` is the other tool: **you** choose the partitions and store the offsets,
+and no group protocol runs at all. That suits a system whose own control plane
+places partitions and whose checkpoints hold offsets — a group would be a second
+authority for both. It is what Slipstream uses.
 
 What the broker *is* asked, on your behalf:
 
@@ -220,10 +227,17 @@ bound them*.
 .assign("events", 3, StartOffset::At(checkpoint.offset_for(3)))
 ```
 
-**What you give up** by having no group: nothing redistributes partitions when
-an instance dies. If that is your problem rather than your control plane's,
-this client is the wrong shape — and the honest answer is librdkafka or the
-Java client, not a wrapper around this.
+**Two things to know about the group implementation:**
+
+- **Heartbeats go out when you `poll`.** This client spawns nothing, so there is
+  no background thread sending them. A caller that spends longer than
+  `session.timeout.ms` between polls is removed from the group — Java avoids
+  this with a heartbeat thread and a separate `max.poll.interval.ms`. Call
+  [`Consumer::heartbeat`] from your own task if your processing can outlast the
+  session timeout.
+- **Rebalancing is eager**: on a rebalance every partition is given up and
+  reassigned. `cooperative-sticky`, which moves only what has to move, is not
+  implemented yet.
 
 ### Consume
 
