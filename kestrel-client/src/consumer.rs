@@ -1,5 +1,19 @@
 //! The assign-only consumer.
 //!
+//! # There is no consumer group, and that is a scope decision
+//!
+//! No `subscribe`, no JoinGroup/SyncGroup, no heartbeats, no rebalance, no
+//! offset commit. **You choose the partitions** — see [`Consumer::add`] and the
+//! builder's `assign_all` — and you store the offsets.
+//!
+//! That suits a system whose own control plane places partitions and whose
+//! checkpoints hold offsets, because a group would be a second authority for
+//! both. It suits most other programs badly: if you want partitions
+//! redistributed when an instance dies, this client cannot do it yet, and
+//! `rdkafka` or the Java client can. Groups are planned — see
+//! `docs/consumer-groups.md` — as a layer over this one, not a replacement for
+//! it.
+//!
 //! # One fetch per broker, not per partition
 //!
 //! A consumer holds any number of `(topic, partition)` assignments and fetches

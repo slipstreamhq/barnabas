@@ -3,8 +3,14 @@
 A native Rust Kafka client with a sans-io core, so it runs on any async runtime —
 including thread-per-core ones, which is what it was built for.
 
-**Working name, and early.** Nothing here is published, the API will change, and only the
-assign-only consumer exists so far. Design and sequencing:
+**Working name, and early.** Nothing here is published and the API will change.
+
+> **No consumer groups yet.** You choose the partitions and store the offsets. If you want
+> `subscribe("topic")` with rebalancing and committed offsets — which is what most projects
+> want — this client cannot do it today; use [`rdkafka`](https://crates.io/crates/rdkafka) or
+> the Java client. Groups are the next major piece: see [`docs/consumer-groups.md`](docs/consumer-groups.md).
+
+Design and sequencing:
 `../docs/superpowers/specs/2026-08-15-native-kafka-client-design.md`.
 
 ## Why
