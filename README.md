@@ -52,6 +52,218 @@ Both properties were mutation-proved: resetting sequences per transaction fails
 `sequences_continue_across_transactions`, and classifying `NOT_COORDINATOR` as a plain retry fails
 `a_moved_coordinator_is_rediscovered`.
 
+## Choosing a runtime
+
+**By depending on a binding, not by setting a feature.** There is no `cfg` in
+this workspace selecting a runtime, and no default one to override.
+
+`kestrel-client` is generic over one trait:
+
+```rust
+pub trait Transport: 'static {
+    type Stream: 'static;
+    fn connect(&self, addr: &str) -> impl Future<Output = io::Result<Self::Stream>>;
+    fn read(stream: &mut Self::Stream, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>>;
+    fn write_all(stream: &mut Self::Stream, buf: &[u8]) -> impl Future<Output = io::Result<()>>;
+    fn sleep(dur: Duration) -> impl Future<Output = ()>;
+}
+```
+
+A binding is that trait plus three type aliases. `kestrel-glommio` is 64 lines;
+`kestrel-tokio` is 67. So the choice is which line you put in `Cargo.toml`:
+
+```toml
+# thread-per-core, io_uring
+kestrel-glommio = "0.1"
+```
+```toml
+# work-stealing
+kestrel-tokio = "0.1"
+```
+
+and which name you import:
+
+```rust
+use kestrel_glommio::{Consumer, Glommio, EARLIEST};   // or
+use kestrel_tokio::{Consumer, Tokio, EARLIEST};
+```
+
+Each binding re-exports everything shared — `Error`, `Result`, `RecordRef`,
+`FetchedRecords`, `ProducerRecord`, `IsolationLevel`, `Partitioner`,
+`CompressionCodec`, `EARLIEST`, `LATEST` — so **only those two lines differ**
+between the two programs below.
+
+### Why not a feature flag
+
+Cargo features are additive: if two crates in a build ask for different
+runtimes, a feature-selected client gets both and has to pick one, and the
+program that did not ask for the winner is the one that breaks. Types do not
+unify that way — `Consumer<Glommio>` and `Consumer<Tokio>` are different types,
+so a binary can hold both at once, on different threads, and the compiler keeps
+them apart.
+
+It also means the `Send`-ness is the *binding's* property. `glommio::net::TcpStream`
+belongs to the core that opened it, so everything on `Glommio` is `!Send` and
+stays on its executor; the tokio side is `Send` from the same client code
+because `kestrel-client` places no `Send` bound anywhere. A trait that demanded
+`Send` would have forbidden the per-core side outright.
+
+Selecting per build is then the *caller's* job, and a `cfg` in one place does
+it. Slipstream, for instance, does this in its Kafka crate:
+
+```rust
+#[cfg(feature = "glommio")]
+use kestrel_glommio as kestrel;
+#[cfg(not(feature = "glommio"))]
+use kestrel_tokio as kestrel;
+```
+
+## Examples
+
+### Consume
+
+Assignment is the caller's: no consumer group, no rebalance, no offset commit.
+Offsets are yours to store, which is what makes this usable from a system that
+checkpoints them itself.
+
+```rust
+use kestrel_glommio::{Consumer, Glommio, IsolationLevel, EARLIEST};
+
+let mut consumer = Consumer::new(
+    Glommio,
+    &["localhost:9092".to_owned()],
+    "my-app",
+    IsolationLevel::ReadCommitted,
+).await?;
+
+for partition in 0..8 {
+    consumer.add("events", partition, EARLIEST).await?;
+}
+
+loop {
+    // One `Fetch` per *broker*, carrying every partition it leads — not one
+    // per partition. All of them are in flight at once.
+    for group in consumer.fetch().await? {
+        for record in group.iter() {
+            // Key, value and headers are built when you ask for them, not at
+            // decode time. Skipping a record costs nothing.
+            let value = record.value();
+            println!("{}-{} @{}: {:?}", group.topic, group.partition, record.offset(), value);
+        }
+    }
+}
+```
+
+To resume from stored offsets, seek instead of assigning at `EARLIEST`:
+
+```rust
+consumer.seek_to("events", 3, my_checkpoint.offset_for(3));
+```
+
+### Produce
+
+```rust
+use bytes::Bytes;
+use kestrel_glommio::{Glommio, Producer, ProducerRecord};
+
+let mut producer = Producer::idempotent(
+    Glommio,
+    &["localhost:9092".to_owned()],
+    "my-app",
+).await?;
+
+let records = vec![
+    ProducerRecord::new(Some(Bytes::from("user-1")), Some(Bytes::from("hello"))),
+    ProducerRecord::new(Some(Bytes::from("user-2")), Some(Bytes::from("world"))),
+];
+
+// Keys are hashed the way librdkafka hashes them (CRC-32), so a program
+// migrating off `rdkafka` keeps its key placement. `Partitioner::Murmur2`
+// matches the Java client instead; the two disagree for most keys.
+producer.send_keyed("events", &records).await?;
+```
+
+### Produce with several requests in flight
+
+`send` and `send_keyed` await, so they have exactly one request outstanding.
+To pipeline, enqueue and then flush:
+
+```rust
+for batch in batches {
+    producer.enqueue("events", partition, &batch).await?;  // encodes, sends nothing
+}
+let written = producer.flush().await?;   // up to 5 in flight, then collected
+```
+
+Five is the default, as in the Java client. If a request fails partway through
+the window, everything behind it is re-sent **in order** — see
+[`spec/`](spec/) for the model check of that rule.
+
+### Transactions
+
+```rust
+let mut producer = Producer::transactional(
+    Glommio,
+    &brokers,
+    "my-app",
+    "my-app-sink-0",   // stable per instance: this is what fences a zombie
+).await?;
+
+producer.begin_transaction()?;
+producer.send_keyed("events", &records).await?;
+producer.commit_transaction().await?;   // or abort_transaction()
+```
+
+`InitProducerId` fences any earlier producer holding that transactional id, so
+give each parallel instance its own — and only one process may hold one at a
+time. Two initialisations of the same id is always a bug, and its symptom
+appears later and elsewhere, as a failed commit.
+
+### The same program on tokio
+
+```rust
+use kestrel_tokio::{Consumer, IsolationLevel, Tokio, EARLIEST};
+
+let mut consumer = Consumer::new(
+    Tokio,
+    &["localhost:9092".to_owned()],
+    "my-app",
+    IsolationLevel::ReadCommitted,
+).await?;
+```
+
+The rest is character-for-character identical.
+
+### TLS and SASL
+
+TLS is a feature on the binding, since the socket is the binding's business:
+
+```toml
+kestrel-glommio = { version = "0.1", features = ["tls"] }
+```
+
+```rust
+// The type aliases are bound to the plaintext transport, so a TLS client is
+// spelled out in full — which also needs `kestrel-client` as a direct
+// dependency.
+let transport = kestrel_glommio::tls::GlommioTls::new();
+let mut consumer =
+    kestrel_client::Consumer::<_>::new(transport, &brokers, "my-app", isolation).await?;
+```
+
+SASL is on the client and works on either runtime — PLAIN, SCRAM-SHA-256 and
+SCRAM-SHA-512, with the server signature verified:
+
+```rust
+let mut cluster = Cluster::connect(Glommio, &brokers, "my-app").await?;
+cluster.set_credentials(Credentials::scram_sha256("user", "pass"));
+```
+
+### Writing another binding
+
+Implement the four functions. `kestrel-tokio/src/lib.rs` is the shortest
+complete example at 67 lines, and nothing above the transport needs to change.
+
 ## Status
 
 | | |

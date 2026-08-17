@@ -33,6 +33,10 @@ pub use kestrel_client::{
     Error, FetchedRecords, ProducerRecord, RecordRef, Result, EARLIEST, LATEST,
 };
 pub use kestrel_core::{Disposition, ErrorCode, IsolationLevel, Partitioner};
+/// SASL works on either runtime — it is the client's business, not the
+/// socket's — so the bindings re-export it too. Without this a caller had to
+/// depend on `kestrel-client` directly just to name a password.
+pub use kestrel_client::{Credentials, SaslMechanism};
 
 /// The runtime selector. Never instantiated — it exists to name a choice.
 #[derive(Debug, Clone, Copy)]
