@@ -34,12 +34,14 @@
 pub mod conn;
 pub mod consumer;
 pub mod frame;
+pub mod group;
 pub mod metadata;
 pub mod partitioner;
 pub mod producer;
 pub mod records;
 
 pub use conn::{Connection, PendingResponse};
+pub use group::{Assignment, Assignor, RangeAssignor, RoundRobinAssignor, StickyAssignor, Subscription, TopicPartition};
 pub use consumer::{FetchPosition, IsolationLevel};
 pub use metadata::{BrokerAddr, Metadata};
 pub use partitioner::Partitioner;
