@@ -1,0 +1,146 @@
+# Completing the client
+
+## The goal
+
+**Kestrel is a general-purpose Kafka client, and a user with Kafka experience
+should be immediately at home.** Familiar names, familiar semantics, familiar
+defaults. Group semantics are central, not optional.
+
+Slipstream is no longer the thing driving the shape. The client gets completed
+first; how Slipstream uses it is a question to answer afterwards, and it may
+well keep using the assign-only layer underneath.
+
+## Familiarity is a feature, and today we fail it
+
+Someone arriving from the Java client or `rdkafka` knows a vocabulary. Where we
+use a different word for the same idea we cost them a lookup and gain nothing.
+This should be settled **before** the group work, not after, because groups
+double the surface it would have to be applied to.
+
+| what a Kafka user calls it | kestrel today | verdict |
+|---|---|---|
+| `poll` | `fetch` | rename — `poll` is the word in every client |
+| `assign` | `add` | rename; keep the range/all conveniences alongside |
+| `ConsumerRecords` | `FetchedRecords` | rename |
+| `subscribe` | *absent* | Phase 1 |
+| `commitSync` / `commitAsync` | *absent* | Phase 1 |
+| `auto.offset.reset` | `StartOffset` | keep — typed, and the mapping is obvious |
+| `isolation.level` | `IsolationLevel` | already matches |
+| `max.poll.records` | *absent* | Phase 3 |
+| `linger.ms` | *absent* | Phase 3 — there is no accumulator at all |
+| `enable.idempotence` | always on | keep, and say why: off is how records get duplicated |
+
+Two decisions belong with it:
+
+- **Configuration shape.** Kafka users expect a property map; we have a staged
+  builder. Keep the builder — it makes illegal states unrepresentable and guides
+  completion — but name its methods after the properties people already know
+  (`session_timeout`, `max_poll_interval`, `auto_commit`), so the knowledge
+  transfers even though the syntax does not.
+- **State what we do differently, and why**, in the docs rather than leaving it
+  to be discovered: a batch per `poll` rather than a record at a time (it is
+  most of the consume throughput), and no ambient runtime.
+
+## Topic expansion, which is not a group problem
+
+A topic is usually created and produced by another team. You do not choose its
+partition count and you are not told when it changes — and **adding partitions
+is how a topic is scaled**, so the change is routine.
+
+`assign_all` resolves the count once, at build. A topic expanded from 8 to 16
+partitions afterwards leaves 8–15 unread indefinitely: nothing errors, and the
+consumer looks healthy while missing a share of its input.
+
+Kafka's group protocol handles this incidentally — the coordinator reassigns on
+a metadata change — which is an advantage of groups that has nothing to do with
+coordinating instances. But the assign-only layer needs its own answer, because
+it will outlive this gap:
+
+- a metadata watch, or a `partition_count` poll the caller drives
+- an explicit signal when the count changes, rather than a silent difference
+- `assign_all` documented as *all of them as of now* until then
+
+## What "parity" should and should not mean
+
+Parity with librdkafka in full includes Kerberos/GSSAPI, interceptors,
+statistics callbacks, and something like two hundred configuration properties.
+Chasing all of it is how a client spends years being 90% done. The target worth
+naming is **the API surface a normal application uses**, which is much smaller.
+
+### Phase 1 — the group protocol (the piece that unlocks most users)
+
+- `FindCoordinator` (group), `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup`
+- `OffsetCommit` / `OffsetFetch`, auto-commit and manual
+- Assignors: range, round-robin, sticky, cooperative-sticky
+- Rebalance callbacks — revoke and assign — which a stateful consumer needs
+- Generation and member-id fencing: the failure mode is silent duplicate
+  consumption, so it belongs in the simulator with the producer's sequencing
+
+**Decide first: KIP-848.** Kafka 4.x has a new group protocol that moves
+assignment to the coordinator; the classic protocol is still supported but is
+the past. Implementing classic only is a rewrite later; implementing the new
+one only excludes every broker below 4.0 and Redpanda until it follows.
+Recommendation: classic first for broker reach, but keep assignment strategy
+behind a seam so the new protocol is a second implementation rather than a
+second client. This decision should be made before any code, because it shapes
+the state machine.
+
+### Phase 2 — exactly-once with groups
+
+- `AddOffsetsToTxn` + `TxnOffsetCommit`, so offsets commit inside the producer's
+  transaction
+
+Deliberately absent today because Slipstream does not need it: source offsets
+live in its checkpoints. Every other EOS user does need it.
+
+### Phase 3 — the rest of a normal application's surface
+
+- Consumer: `pause`/`resume`, `committed`, `position`, `offsets_for_times`,
+  `end_offsets`, lag
+- Admin: `CreateTopics`, `DeletePartitions`, `DescribeCluster`,
+  `DescribeConfigs`, `DeleteRecords` — enough to write a test suite and an
+  operational tool without a second client
+- Producer: a time-based accumulator (`linger.ms`). We have none, which is why
+  the batch-1 benchmark row is our weakest and why callers must batch by hand
+
+### Not planned, and worth saying so
+
+Kerberos/GSSAPI, interceptors, and a configuration-string API. A caller wanting
+librdkafka's full surface should use librdkafka.
+
+## What this costs
+
+The group protocol is the largest single piece of a Kafka client — larger than
+the transactional producer already built here. It is months, not weeks, and the
+failure modes are silent: a fencing bug duplicates records, and a rebalance bug
+loses them. The correctness apparatus already in this workspace is the reason to
+believe it is tractable — the sans-io core, the scripted broker, the TLA+ model
+of the producer window. Groups should arrive with the same three.
+
+## Sequencing
+
+1. **Naming and API alignment** — cheap now, expensive once groups double the
+   surface.
+2. **Phase 1, the group protocol** — the piece that makes this usable by
+   ordinary applications.
+3. **Topic expansion** — groups solve it partly; the assign-only path still
+   needs it.
+4. **Phase 2, EOS with groups.**
+5. **Phase 3, the ordinary surface.**
+
+Performance work is finished for now: the client leads the Java client and
+librdkafka on every cell measured, and what remains are features, not speed.
+`PERF.md` is the record, including the cells where it does not lead.
+
+## Slipstream, afterwards
+
+Two questions to answer once the client is complete, not before:
+
+- Does Slipstream keep `assign` — its control plane genuinely does own
+  placement, and a group would be a second authority — or adopt groups and
+  retire that part of the control plane?
+- Either way it needs topic-expansion detection, which is why that item is not
+  filed under groups.
+
+The open correctness item there is the fenced-sink bug in its recovery path,
+which is not this client's.

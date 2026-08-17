@@ -186,7 +186,7 @@ impl<T: Transport> ConsumerReady<T> {
     /// indefinitely: nothing errors, and the consumer looks healthy while
     /// missing a share of its input.
     ///
-    /// Until this client can watch for that — see `docs/consumer-groups.md`,
+    /// Until this client can watch for that — see `docs/completing-the-client.md`,
     /// which is where the fix is scoped — `assign_all` means *all of them as of
     /// now*, and a caller reading a topic owned by someone else should poll
     /// [`Consumer::partition_count`](crate::Consumer::partition_count) and

@@ -11,7 +11,7 @@
 //! both. It suits most other programs badly: if you want partitions
 //! redistributed when an instance dies, this client cannot do it yet, and
 //! `rdkafka` or the Java client can. Groups are planned — see
-//! `docs/consumer-groups.md` — as a layer over this one, not a replacement for
+//! `docs/completing-the-client.md` — as a layer over this one, not a replacement for
 //! it.
 //!
 //! # One fetch per broker, not per partition

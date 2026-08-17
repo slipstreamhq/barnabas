@@ -12,7 +12,7 @@ including thread-per-core ones, which is what it was built for.
 >
 > The sharper edge: a topic you do not own can gain partitions at any time, and this client
 > will not notice. `assign_all` means *all of them as of process start*, so new partitions go
-> unread with no error. Both are scoped in [`docs/consumer-groups.md`](docs/consumer-groups.md).
+> unread with no error. Both are scoped in [`docs/completing-the-client.md`](docs/completing-the-client.md).
 
 Design and sequencing:
 `../docs/superpowers/specs/2026-08-15-native-kafka-client-design.md`.
