@@ -268,3 +268,138 @@ fn a_committed_offset_is_where_the_next_consumer_resumes() {
         );
     });
 }
+
+/// **The callbacks fire on a real rebalance, and auto-commit lands.**
+///
+/// A second member joining is what makes the first give partitions up, so this
+/// drives an actual rebalance rather than asserting on a state machine. The
+/// listener records what it was told; auto-commit is checked by reading the
+/// committed offset back through a third consumer.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn a_rebalance_revokes_assigns_and_auto_commits() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Records what happened, which is all a synchronous listener needs to do.
+    struct Recorder {
+        events: Rc<RefCell<Vec<String>>>,
+    }
+    impl kestrel_glommio::RebalanceListener for Recorder {
+        fn on_revoked(&mut self, partitions: &[kestrel_core::group::TopicPartition]) {
+            self.events
+                .borrow_mut()
+                .push(format!("revoked:{}", partitions.len()));
+        }
+        fn on_assigned(&mut self, partitions: &[kestrel_core::group::TopicPartition]) {
+            self.events
+                .borrow_mut()
+                .push(format!("assigned:{}", partitions.len()));
+        }
+    }
+
+    run(|| async {
+        let topic = unique("rebal");
+        let group = unique("rg");
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
+        prod.create_topic_with_partitions(4).await;
+        prod.produce_plain(4).await;
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+
+        let mut first = kestrel_glommio::Consumer::new(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "member-1",
+            kestrel_core::IsolationLevel::ReadCommitted,
+        )
+        .await
+        .expect("consumer");
+        first.set_max_wait(Duration::from_millis(200));
+        first.set_rebalance_listener(Box::new(Recorder {
+            events: Rc::clone(&events),
+        }));
+        // Every poll, so the commit is not waiting on a timer in a short test.
+        first.set_auto_commit(Some(Duration::from_millis(0)));
+        first
+            .subscribe(&group, vec![topic.clone()], Box::new(RangeAssignor), kestrel_glommio::EARLIEST)
+            .await
+            .expect("subscribe");
+
+        // Read everything, so there is a position worth committing.
+        let mut seen = 0;
+        for _ in 0..60 {
+            for g in first.poll().await.expect("poll") {
+                seen += g.len();
+            }
+            if seen >= 4 {
+                break;
+            }
+        }
+        assert_eq!(seen, 4, "the first member should read every record");
+        assert!(
+            events.borrow().iter().any(|e| e == "assigned:4"),
+            "expected an assignment of four partitions, got {:?}",
+            events.borrow()
+        );
+
+        // A second member forces a rebalance; both must be driven for the join
+        // to complete.
+        let mut second = kestrel_glommio::Consumer::new(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "member-2",
+            kestrel_core::IsolationLevel::ReadCommitted,
+        )
+        .await
+        .expect("consumer");
+        second.set_max_wait(Duration::from_millis(200));
+        second
+            .subscribe(&group, vec![topic.clone()], Box::new(RangeAssignor), kestrel_glommio::EARLIEST)
+            .await
+            .expect("subscribe");
+
+        for _ in 0..80 {
+            let _ = futures_lite::future::zip(first.poll(), second.poll()).await;
+            if events.borrow().iter().any(|e| e.starts_with("revoked")) {
+                break;
+            }
+        }
+
+        let seen_events = events.borrow().clone();
+        assert!(
+            seen_events.iter().any(|e| e.starts_with("revoked")),
+            "the first member should have been told it lost its partitions: {seen_events:?}"
+        );
+
+        first.unsubscribe().await.expect("leave 1");
+        second.unsubscribe().await.expect("leave 2");
+
+        // Auto-commit should have stored the first member's progress: a fresh
+        // consumer must not replay all four records.
+        let mut third = kestrel_glommio::Consumer::new(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "member-3",
+            kestrel_core::IsolationLevel::ReadCommitted,
+        )
+        .await
+        .expect("consumer");
+        third.set_max_wait(Duration::from_millis(200));
+        third
+            .subscribe(&group, vec![topic.clone()], Box::new(RangeAssignor), kestrel_glommio::EARLIEST)
+            .await
+            .expect("subscribe");
+
+        let mut replayed = 0;
+        for _ in 0..40 {
+            for g in third.poll().await.expect("poll") {
+                replayed += g.len();
+            }
+        }
+        assert!(
+            replayed < 4,
+            "auto-commit did not land: all {replayed} records were replayed"
+        );
+    });
+}

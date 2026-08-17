@@ -317,6 +317,15 @@ pub struct Cluster<T: Transport> {
     /// new id at the same address should reuse the socket, and a bootstrap
     /// address has no node id until the first `Metadata` reply.
     conns: HashMap<String, Broker<T>>,
+    /// Connections used **only** for group-coordinator traffic.
+    ///
+    /// A consumer keeps a fetch permanently in flight, and its group
+    /// coordinator is usually one of the brokers it fetches from. Sharing the
+    /// connection would put a `Heartbeat` behind a `Fetch` — which Kafka
+    /// answers in order, so the heartbeat reads the fetch's response. Draining
+    /// the fetch first would work and would cost the prefetch on every poll;
+    /// a second connection costs one socket per coordinator and nothing else.
+    coordinator_conns: HashMap<String, Broker<T>>,
     metadata: Metadata,
     request_timeout: Duration,
     credentials: Option<Credentials>,
@@ -333,6 +342,7 @@ impl<T: Transport> Cluster<T> {
             client_id: client_id.to_owned(),
             bootstrap: bootstrap.to_vec(),
             conns: HashMap::new(),
+            coordinator_conns: HashMap::new(),
             metadata: Metadata::new(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             credentials: None,
@@ -563,6 +573,57 @@ impl<T: Transport> Cluster<T> {
         req: &Req,
     ) -> Result<Resp> {
         self.call_at(addr, api_key, version, req).await
+    }
+
+    /// As [`Self::call_at`], on the connection reserved for coordinator
+    /// traffic. See [`Self::coordinator_conns`].
+    pub(crate) async fn call_coordinator<Req, Resp>(
+        &mut self,
+        addr: &str,
+        api_key: ApiKey,
+        version: i16,
+        req: &Req,
+        timeout: Duration,
+    ) -> Result<Resp>
+    where
+        Req: Encodable,
+        Resp: Decodable,
+    {
+        for attempt in 0..2 {
+            if !self.coordinator_conns.contains_key(addr) {
+                let broker = Broker::<T>::connect(
+                    &self.transport,
+                    addr,
+                    &self.client_id,
+                    self.credentials.as_ref(),
+                )
+                .await?;
+                self.coordinator_conns.insert(addr.to_owned(), broker);
+            }
+            let broker = self
+                .coordinator_conns
+                .get_mut(addr)
+                .expect("just inserted");
+
+            match with_timeout::<T, _>(timeout, broker.call(api_key, version, req)).await {
+                Some(Ok(resp)) => return Ok(resp),
+                Some(Err(Error::Io(e))) => {
+                    self.coordinator_conns.remove(addr);
+                    if attempt == 1 {
+                        return Err(Error::Io(e));
+                    }
+                }
+                Some(Err(e)) => return Err(e),
+                None => {
+                    self.coordinator_conns.remove(addr);
+                    return Err(Error::Timeout {
+                        op: api_key,
+                        addr: addr.to_owned(),
+                    });
+                }
+            }
+        }
+        unreachable!("the loop returns on its last attempt")
     }
 
     /// As [`Self::call_at`], for requests any broker can serve.

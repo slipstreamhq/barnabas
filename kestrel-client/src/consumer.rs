@@ -144,6 +144,25 @@ impl ConsumerRecords {
     }
 }
 
+/// Told when the group gives this consumer partitions, and before it takes
+/// them away.
+///
+/// Kafka's `ConsumerRebalanceListener`, with one difference worth knowing:
+/// **these are synchronous**. This client spawns nothing and holds `!Send`
+/// state, so an async callback would need a boxed future and a runtime to
+/// drive it — and the useful work here (dropping per-partition state, noting
+/// what changed) does not need one. A caller with async cleanup should record
+/// what happened and do it after `poll` returns.
+///
+/// `on_revoked` runs **before** the partitions are given up, so the positions
+/// it is handed are the ones about to be lost. It cannot commit them: by the
+/// time a rebalance is visible the generation that would authorise a commit is
+/// already gone, which is what makes auto-commit at-least-once.
+pub trait RebalanceListener {
+    fn on_revoked(&mut self, partitions: &[kestrel_core::group::TopicPartition]);
+    fn on_assigned(&mut self, partitions: &[kestrel_core::group::TopicPartition]);
+}
+
 /// One record, without a record having been built for it.
 ///
 /// A key, value or header list is materialised when asked for, not at decode
@@ -243,6 +262,12 @@ pub struct Consumer<T: Transport> {
     group: Option<crate::group::ClassicProtocol>,
     /// Where to start a partition the group has no committed offset for.
     reset: i64,
+    /// Commit positions periodically without being asked.
+    auto_commit: Option<Duration>,
+    /// When the last automatic commit happened.
+    last_auto_commit: Option<std::time::Instant>,
+    /// Told when partitions arrive and before they are taken away.
+    listener: Option<Box<dyn RebalanceListener>>,
     /// Bumped whenever the assignment or a position changes for a reason other
     /// than consuming records. An outstanding fetch from an older generation
     /// asked a question that is no longer the one being asked.
@@ -282,6 +307,9 @@ impl<T: Transport> Consumer<T> {
             prefetch: true,
             group: None,
             reset: EARLIEST,
+            auto_commit: None,
+            last_auto_commit: None,
+            listener: None,
             generation: 0,
         }
     }
@@ -309,6 +337,9 @@ impl<T: Transport> Consumer<T> {
             prefetch: true,
             group: None,
             reset: EARLIEST,
+            auto_commit: None,
+            last_auto_commit: None,
+            listener: None,
             generation: 0,
         })
     }
@@ -409,6 +440,31 @@ impl<T: Transport> Consumer<T> {
         Ok(())
     }
 
+    /// Commit positions on a timer, without the caller asking.
+    ///
+    /// Kafka's `enable.auto.commit` with `auto.commit.interval.ms`, and the same
+    /// guarantee: **at least once**. The commit happens at the *start* of a
+    /// [`Self::poll`], so what is committed is where the previous poll's records
+    /// ended — records handed to the caller and not yet committed are
+    /// re-delivered after a crash. A caller that needs a record committed only
+    /// once it is durably handled should commit itself, with
+    /// [`Self::commit`], after it has.
+    ///
+    /// Off by default, because "at least once, silently" is a worse surprise
+    /// than having to ask.
+    pub fn set_auto_commit(&mut self, interval: Option<Duration>) {
+        self.auto_commit = interval;
+        self.last_auto_commit = None;
+    }
+
+    /// Be told when partitions arrive and before they are taken away.
+    ///
+    /// The Kafka equivalent of `ConsumerRebalanceListener`. See
+    /// [`RebalanceListener`] for why these are synchronous.
+    pub fn set_rebalance_listener(&mut self, listener: Box<dyn RebalanceListener>) {
+        self.listener = Some(listener);
+    }
+
     /// Leave the group, giving up every partition.
     ///
     /// **Worth calling before dropping a consumer.** Without it the coordinator
@@ -464,6 +520,28 @@ impl<T: Transport> Consumer<T> {
         crate::group::GroupProtocol::commit(group, &mut self.cluster, &offsets).await
     }
 
+    /// Commit if auto-commit is on and its interval has elapsed.
+    async fn maybe_auto_commit(&mut self) -> Result<()> {
+        let Some(interval) = self.auto_commit else {
+            return Ok(());
+        };
+        let due = self
+            .last_auto_commit
+            .is_none_or(|last| last.elapsed() >= interval);
+        if !due || self.positions.is_empty() {
+            return Ok(());
+        }
+        // A commit refused because the group is mid-rebalance is not an error
+        // for the caller: the partitions are about to belong to someone else,
+        // and the offsets go with them.
+        match self.commit().await {
+            Ok(()) | Err(Error::Broker { op: "OffsetCommit", .. }) => {}
+            Err(e) => return Err(e),
+        }
+        self.last_auto_commit = Some(std::time::Instant::now());
+        Ok(())
+    }
+
     /// Drive group membership, if this consumer subscribed.
     ///
     /// Returns whether the assignment changed, so [`Self::poll`] can discard a
@@ -498,12 +576,25 @@ impl<T: Transport> Consumer<T> {
                         self.positions
                             .insert((tp.topic.clone(), tp.partition), start);
                     }
+                    if let Some(listener) = self.listener.as_mut() {
+                        listener.on_assigned(partitions);
+                    }
                     true
                 }
             }
             // Everything was revoked: stop fetching before the next request,
             // because another member is about to be given these.
             Ok(crate::group::Membership::Revoked) => {
+                if let Some(listener) = self.listener.as_mut() {
+                    let held: Vec<kestrel_core::group::TopicPartition> = self
+                        .positions
+                        .keys()
+                        .map(|(topic, partition)| {
+                            kestrel_core::group::TopicPartition::new(topic.clone(), *partition)
+                        })
+                        .collect();
+                    listener.on_revoked(&held);
+                }
                 self.positions.clear();
                 true
             }
@@ -940,6 +1031,13 @@ impl<T: Transport> Consumer<T> {
         // is why membership is driven here rather than by a background task:
         // this client spawns nothing.
         if self.group.is_some() {
+            // **Before membership is advanced, not after.** A rebalance is
+            // discovered by advancing, and by then the generation that would
+            // authorise a commit is gone — so the last chance to commit is
+            // now. It is also why auto-commit is at-least-once: anything read
+            // since this commit will be read again by whoever takes the
+            // partition.
+            self.maybe_auto_commit().await?;
             let changed = self.advance_group().await?;
             if changed {
                 self.discard_outstanding().await;

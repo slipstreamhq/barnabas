@@ -48,7 +48,7 @@ pub mod producer;
 pub use cluster::Cluster;
 pub use sasl::{Credentials, SaslMechanism};
 pub use builder::{ConsumerBuilder, ProducerBuilder, StartOffset};
-pub use consumer::{Consumer, ConsumerRecords, RecordRef, EARLIEST, LATEST};
+pub use consumer::{Consumer, ConsumerRecords, RecordRef, RebalanceListener, EARLIEST, LATEST};
 pub use group::{ClassicProtocol, GroupProtocol, Membership};
 pub use producer::{Producer, ProducerRecord};
 

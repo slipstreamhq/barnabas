@@ -56,6 +56,9 @@ const COORDINATOR_BACKOFF: Duration = Duration::from_millis(250);
 /// failed, rather than us abandoning a request it is still working on.
 const JOIN_SLACK: Duration = Duration::from_secs(5);
 
+/// Coordinator requests other than `JoinGroup` answer promptly.
+const COORDINATOR_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The `ConsumerProtocol` version this client writes. Members negotiate down to
 /// the lowest any of them wrote, so a reader must honour what it is given
 /// rather than assume this one.
@@ -233,7 +236,7 @@ impl ClassicProtocol {
         let deadline = Duration::from_millis(u64::try_from(self.rebalance_timeout_ms).unwrap_or(300_000))
             + JOIN_SLACK;
         let resp: JoinGroupResponse = cluster
-            .call_at_with_timeout(&addr, ApiKey::JoinGroup, 7, &req, deadline)
+            .call_coordinator(&addr, ApiKey::JoinGroup, 7, &req, deadline)
             .await?;
 
         // Only the leader is given the members, and only it needs to decode
@@ -271,7 +274,7 @@ impl ClassicProtocol {
         req.protocol_name = Some(StrBytes::from_string(self.assignor.name().to_owned()));
         req.assignments = assignments;
 
-        let resp: SyncGroupResponse = cluster.call_at(&addr, ApiKey::SyncGroup, 4, &req).await?;
+        let resp: SyncGroupResponse = cluster.call_coordinator(&addr, ApiKey::SyncGroup, 4, &req, COORDINATOR_TIMEOUT).await?;
         let assigned = if resp.error_code == codes::NONE && !resp.assignment.is_empty() {
             decode_assignment(&resp.assignment)?
         } else {
@@ -288,7 +291,7 @@ impl ClassicProtocol {
         req.generation_id = self.member.generation();
         req.member_id = StrBytes::from_string(self.member.member_id().to_owned());
 
-        let resp: HeartbeatResponse = cluster.call_at(&addr, ApiKey::Heartbeat, 4, &req).await?;
+        let resp: HeartbeatResponse = cluster.call_coordinator(&addr, ApiKey::Heartbeat, 4, &req, COORDINATOR_TIMEOUT).await?;
         Ok(self.member.on_heartbeat(resp.error_code))
     }
 
@@ -389,7 +392,7 @@ impl<T: Transport> GroupProtocol<T> for ClassicProtocol {
         // A failure here costs a rebalance delay, not correctness: the
         // coordinator drops us at the session timeout anyway.
         let _: std::result::Result<LeaveGroupResponse, Error> =
-            cluster.call_at(&addr, ApiKey::LeaveGroup, 3, &req).await;
+            cluster.call_coordinator(&addr, ApiKey::LeaveGroup, 3, &req, COORDINATOR_TIMEOUT).await;
         self.member.on_leave();
         Ok(())
     }
@@ -441,7 +444,7 @@ impl ClassicProtocol {
             .collect();
 
         let resp: OffsetCommitResponse =
-            cluster.call_at(&addr, ApiKey::OffsetCommit, 8, &req).await?;
+            cluster.call_coordinator(&addr, ApiKey::OffsetCommit, 8, &req, COORDINATOR_TIMEOUT).await?;
         for topic in &resp.topics {
             for partition in &topic.partitions {
                 crate::check("OffsetCommit", partition.error_code)?;
@@ -480,7 +483,7 @@ impl ClassicProtocol {
         );
 
         let resp: OffsetFetchResponse =
-            cluster.call_at(&addr, ApiKey::OffsetFetch, 6, &req).await?;
+            cluster.call_coordinator(&addr, ApiKey::OffsetFetch, 6, &req, COORDINATOR_TIMEOUT).await?;
         crate::check("OffsetFetch", resp.error_code)?;
 
         let mut out = BTreeMap::new();
