@@ -38,6 +38,7 @@ use std::time::Duration;
 
 pub mod cluster;
 pub mod sasl;
+pub mod builder;
 mod join;
 mod timeout;
 pub mod consumer;
@@ -45,6 +46,7 @@ pub mod producer;
 
 pub use cluster::Cluster;
 pub use sasl::{Credentials, SaslMechanism};
+pub use builder::{ConsumerBuilder, ProducerBuilder, StartOffset};
 pub use consumer::{Consumer, FetchedRecords, RecordRef, EARLIEST, LATEST};
 pub use producer::{Producer, ProducerRecord};
 

@@ -5,8 +5,10 @@
 //! `scram_sha256`, and a `GlommioTls::new` taking an argument it does not take
 //! — and nothing would have caught that, because a README is not code.
 //!
-//! `#[ignore]`d rather than `#[test]`ed: they need a broker to *run*. Compiling
-//! them is the point, and `cargo test --no-run` does that.
+//! **Functions, not tests.** They need a broker to run, and an `#[ignore]`d
+//! test still runs under `--ignored`, which the full suite uses — so these are
+//! never-called functions instead. The compiler checks them; nothing executes
+//! them.
 
 use bytes::Bytes;
 use kestrel_glommio::{
@@ -17,8 +19,7 @@ fn brokers() -> Vec<String> {
     vec!["localhost:9092".to_owned()]
 }
 
-#[test]
-#[ignore = "compiled, not run: needs a broker"]
+#[allow(dead_code)]
 fn readme_consume() {
     glommio::LocalExecutorBuilder::default()
         .make()
@@ -50,8 +51,7 @@ fn readme_consume() {
         });
 }
 
-#[test]
-#[ignore = "compiled, not run: needs a broker"]
+#[allow(dead_code)]
 fn readme_produce_and_transactions() {
     glommio::LocalExecutorBuilder::default()
         .make()
@@ -82,8 +82,7 @@ fn readme_produce_and_transactions() {
         });
 }
 
-#[test]
-#[ignore = "compiled, not run: needs a broker"]
+#[allow(dead_code)]
 fn readme_sasl() {
     glommio::LocalExecutorBuilder::default()
         .make()
@@ -93,5 +92,37 @@ fn readme_sasl() {
                 .await
                 .expect("cluster");
             cluster.set_credentials(Credentials::scram_sha256("user", "pass"));
+        });
+}
+
+/// The staged builder, which is the guided way in.
+#[allow(dead_code)]
+fn readme_builder() {
+    use kestrel_glommio::StartOffset;
+    use std::time::Duration;
+
+    glommio::LocalExecutorBuilder::default()
+        .make()
+        .expect("executor")
+        .run(async {
+            let _consumer = Consumer::builder(Glommio)
+                .bootstrap(["localhost:9092"])
+                .client_id("my-app")
+                .assign_range("events", 0..8, StartOffset::Earliest)
+                .assign("late-events", 0, StartOffset::At(1_234))
+                .max_wait(Duration::from_millis(100))
+                .build()
+                .await
+                .expect("consumer");
+
+            let _producer = Producer::builder(Glommio)
+                .bootstrap(["localhost:9092"])
+                .client_id("my-app")
+                .transactional_id("my-app-sink-0")
+                .compression(kestrel_glommio::CompressionCodec::Snappy)
+                .max_in_flight(5)
+                .build()
+                .await
+                .expect("producer");
         });
 }

@@ -119,6 +119,12 @@ pub struct Producer<T: Transport> {
 }
 
 impl<T: Transport> Producer<T> {
+    /// A staged builder, which is the guided way in — see
+    /// [`builder`](crate::builder).
+    pub fn builder(transport: T) -> crate::builder::ProducerBuilder<T> {
+        crate::builder::ProducerBuilder::new(transport)
+    }
+
     /// A transactional producer under `transactional_id`.
     ///
     /// `InitProducerId` fences any previous producer using the same id, which

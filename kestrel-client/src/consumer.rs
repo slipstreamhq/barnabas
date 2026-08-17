@@ -241,6 +241,30 @@ struct Outstanding {
 }
 
 impl<T: Transport> Consumer<T> {
+    /// A staged builder, which is the guided way in — see
+    /// [`builder`](crate::builder).
+    pub fn builder(transport: T) -> crate::builder::ConsumerBuilder<T> {
+        crate::builder::ConsumerBuilder::new(transport)
+    }
+
+    /// Wrap an already-configured cluster, so the builder can set credentials
+    /// before the first request.
+    pub(crate) fn from_cluster(cluster: Cluster<T>, isolation: IsolationLevel) -> Self {
+        Self {
+            cluster,
+            positions: BTreeMap::new(),
+            isolation,
+            max_wait: Duration::from_millis(500),
+            max_bytes: 10 * 1024 * 1024,
+            max_response_bytes: 64 * 1024 * 1024,
+            sessions: BTreeMap::new(),
+            incremental: true,
+            outstanding: None,
+            prefetch: true,
+            generation: 0,
+        }
+    }
+
     /// Connect with no assignments. Add them with [`Self::add`].
     ///
     /// # Errors

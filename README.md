@@ -118,6 +118,59 @@ use kestrel_glommio as kestrel;
 use kestrel_tokio as kestrel;
 ```
 
+## Creating a client
+
+There are two ways in. The **staged builder** is the guided one:
+
+```rust
+use kestrel_glommio::{Consumer, Glommio, StartOffset};
+
+let mut consumer = Consumer::builder(Glommio)      // needs a bootstrap list
+    .bootstrap(["localhost:9092"])                 // needs a client id
+    .client_id("my-app")                           // now everything else appears
+    .assign_range("events", 0..8, StartOffset::Earliest)
+    .assign("late-events", 0, StartOffset::At(1_234))
+    .max_wait(Duration::from_millis(100))
+    .build()
+    .await?;
+```
+
+```rust
+let mut producer = Producer::builder(Glommio)
+    .bootstrap(["localhost:9092"])
+    .client_id("my-app")
+    .transactional_id("my-app-sink-0")   // omit for a plain idempotent producer
+    .compression(CompressionCodec::Snappy)
+    .max_in_flight(5)
+    .build()
+    .await?;
+```
+
+**Each stage is its own type.** `bootstrap` is the only method on the first,
+`client_id` the only one on the second, and the optional settings and `build`
+exist only on the third. So a completion list is the set of legal next steps,
+and a missing required argument is a compile error naming the stage rather than
+a failure at connect. `tests/builder_stages.rs` pins that; the shapes that must
+*not* compile are listed there too.
+
+`StartOffset` is an enum — `Earliest`, `Latest`, `At(offset)` — rather than the
+protocol's `i64`, where the two sentinels are negative numbers sharing a
+parameter with real offsets.
+
+The **constructors** are still there and are the shortest path when nothing
+optional is wanted:
+
+```rust
+let mut consumer =
+    Consumer::new(Glommio, &brokers, "my-app", IsolationLevel::ReadCommitted).await?;
+consumer.add("events", 0, EARLIEST).await?;
+```
+
+Worth knowing what you are choosing: `Consumer::assign` takes seven positional
+arguments including an adjacent `partition: i32` and `offset: i64`, so
+transposing them compiles. The builder exists because that is the kind of
+mistake a type can prevent.
+
 ## Examples
 
 ### Consume
