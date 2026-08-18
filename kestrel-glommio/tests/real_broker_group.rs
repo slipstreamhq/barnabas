@@ -513,12 +513,26 @@ fn heartbeating_without_polling_keeps_membership() {
 ///    member whose claim is judged stale is reading it regardless. Filtering
 ///    there hands its partitions to another member while it still holds them.
 ///
-/// All three are checked by unit tests and all three were worth fixing. What
-/// remains is unidentified, and the next step is the one deferred three times:
-/// trace each member's `(generation, owned, assigned, lost)` per round beside
-/// the broker's `Stabilized group` lines. Reasoning from the protocol found
-/// three causes and has now stopped paying; the trace is the instrument that
-/// found the version-prefix and forgotten-leader bugs earlier in this work.
+/// 4. `revoke_and_rejoin` cleared the generation, so every rejoin advertised
+///    -1 and a leader read every ownership claim — including the member's own —
+///    as stale. A rebalance does not un-make a member of the generation it was
+///    assigned; only fencing does, and that drops the member id with it.
+///
+/// All four are checked by unit tests. The trace that found the last one is
+/// still in the client behind `KESTREL_TRACE=1`, which prints each member's
+/// join, sync, heartbeat and what the leader saw.
+///
+/// **What remains, stated exactly**: the two members ping-pong. Each rejoin
+/// completes a rebalance that excludes the other, and the excluded one's next
+/// heartbeat returns `UNKNOWN_MEMBER_ID` (25) rather than `REBALANCE_IN_PROGRESS`
+/// (27), so it rejoins as a brand-new member and the cycle repeats — visible in
+/// the trace as a fresh member id every round and a leader that only ever sees
+/// itself. A member is therefore being dropped by the coordinator between
+/// rounds, and the question to answer next is why: this client rejoins only
+/// when polled, so a member that is not polled inside the rebalance window is
+/// removed, and the lockstep the test drives both members with may simply be
+/// too slow for it. That is a question about *when* rejoins are driven, not
+/// about the assignor, which now matches the reference.
 ///
 /// Left failing rather than deleted: the eager path is unaffected, and shipping
 /// `cooperative-sticky` as available while it double-assigns would be far worse
@@ -551,7 +565,7 @@ fn cooperative_rebalancing_never_drops_everything() {
         // `JoinGroup` is held until the whole group rejoins, so a member
         // waiting on it blocks the very loop that would drive the other one.
         // A real deployment has one member per process and does not care.
-        first.set_group_timeouts(Duration::from_secs(6), Duration::from_secs(6));
+        first.set_group_timeouts(Duration::from_secs(30), Duration::from_secs(20));
         first
             .subscribe(
                 &group,
@@ -579,7 +593,7 @@ fn cooperative_rebalancing_never_drops_everything() {
         .await
         .expect("consumer");
         second.set_max_wait(Duration::from_millis(100));
-        second.set_group_timeouts(Duration::from_secs(6), Duration::from_secs(6));
+        second.set_group_timeouts(Duration::from_secs(30), Duration::from_secs(20));
         second
             .subscribe(
                 &group,

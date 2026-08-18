@@ -423,7 +423,13 @@ impl GroupMember {
             self.lost.clear();
         }
         self.pending_members.clear();
-        self.generation = NO_GENERATION;
+        // **The generation is not cleared.** A member belongs to the generation
+        // it was last assigned until the coordinator gives it another one, and
+        // the ownership claim it makes on rejoining is dated with it. Clearing
+        // it here made every rejoin advertise -1, so a leader read every claim
+        // — including the member's own — as stale. Only fencing
+        // (`UNKNOWN_MEMBER_ID`, `FENCED_INSTANCE_ID`) invalidates it, and those
+        // paths drop the member id too.
         self.leader = false;
         self.state = MemberState::Unjoined;
     }
@@ -536,8 +542,12 @@ mod tests {
         let step = m.on_heartbeat(codes::REBALANCE_IN_PROGRESS);
         assert_eq!(step, Step::Join { member_id: "m-1".to_owned() });
         assert!(m.assignment().is_empty(), "partitions must be given up");
-        assert_eq!(m.generation(), NO_GENERATION);
         assert_eq!(m.state(), MemberState::Unjoined);
+        // **The generation is kept.** A rebalance does not un-make this member
+        // of the generation it was assigned; only fencing does, and that drops
+        // the member id with it. Clearing it here made every rejoin advertise
+        // -1, so a leader read every ownership claim as stale.
+        assert_eq!(m.generation(), 1);
     }
 
     /// A stale generation is the same situation, discovered a different way.

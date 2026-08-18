@@ -270,6 +270,16 @@ impl ClassicProtocol {
             Vec::new()
         };
 
+        if std::env::var("KESTREL_TRACE").is_ok() {
+            eprintln!(
+                "[{}] JOIN<- err={} gen={} id={} leader={}",
+                self.member.member_id(),
+                resp.error_code,
+                resp.generation_id,
+                resp.member_id.as_str(),
+                resp.leader.as_str()
+            );
+        }
         Ok(self.member.on_join(
             resp.error_code,
             resp.generation_id,
@@ -286,6 +296,19 @@ impl ClassicProtocol {
     ) -> Result<Step> {
         let addr = self.coordinator_addr(cluster).await?;
 
+        if std::env::var("KESTREL_TRACE").is_ok() {
+            let sub = self.member.subscription();
+            eprintln!(
+                "[{}] SYNC-> gen={} owned={:?} sending={:?}",
+                self.member.member_id(),
+                self.member.generation(),
+                sub.owned.iter().map(|t| t.partition).collect::<Vec<_>>(),
+                assignments
+                    .iter()
+                    .map(|a| (a.member_id.to_string(), a.assignment.len()))
+                    .collect::<Vec<_>>()
+            );
+        }
         let mut req = SyncGroupRequest::default();
         req.group_id = GroupId(StrBytes::from_string(self.member.group_id().to_owned()));
         req.generation_id = self.member.generation();
@@ -300,7 +323,26 @@ impl ClassicProtocol {
         } else {
             Vec::new()
         };
-        Ok(self.member.on_sync(resp.error_code, assigned))
+        if std::env::var("KESTREL_TRACE").is_ok() {
+            eprintln!(
+                "[{}] SYNC<- err={} assigned={:?}",
+                self.member.member_id(),
+                resp.error_code,
+                assigned.iter().map(|t| t.partition).collect::<Vec<_>>()
+            );
+        }
+        let step = self.member.on_sync(resp.error_code, assigned);
+        if std::env::var("KESTREL_TRACE").is_ok() {
+            eprintln!(
+                "[{}]   after: gen={} assignment={:?} lost={:?} step={:?}",
+                self.member.member_id(),
+                self.member.generation(),
+                self.member.assignment().iter().map(|t| t.partition).collect::<Vec<_>>(),
+                self.member.lost().iter().map(|t| t.partition).collect::<Vec<_>>(),
+                step
+            );
+        }
+        Ok(step)
     }
 
     async fn heartbeat<T: Transport>(&mut self, cluster: &mut Cluster<T>) -> Result<Step> {
@@ -312,6 +354,14 @@ impl ClassicProtocol {
         req.member_id = StrBytes::from_string(self.member.member_id().to_owned());
 
         let resp: HeartbeatResponse = cluster.call_coordinator(&addr, ApiKey::Heartbeat, 4, &req, COORDINATOR_TIMEOUT).await?;
+        if std::env::var("KESTREL_TRACE").is_ok() {
+            eprintln!(
+                "[{}] HB<- err={} gen={}",
+                self.member.member_id(),
+                resp.error_code,
+                self.member.generation()
+            );
+        }
         Ok(self.member.on_heartbeat(resp.error_code))
     }
 
@@ -331,7 +381,31 @@ impl ClassicProtocol {
             }
         }
 
+        if std::env::var("KESTREL_TRACE").is_ok() {
+            eprintln!(
+                "[{}] LEADER sees: {:?}",
+                self.member.member_id(),
+                members
+                    .iter()
+                    .map(|m| (
+                        m.member_id.clone(),
+                        m.generation,
+                        m.owned.iter().map(|t| t.partition).collect::<Vec<_>>()
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
         let assignment = self.assignor.assign(&members, &partitions_per_topic);
+        if std::env::var("KESTREL_TRACE").is_ok() {
+            eprintln!(
+                "[{}] LEADER assigns: {:?}",
+                self.member.member_id(),
+                assignment
+                    .iter()
+                    .map(|(m, p)| (m.clone(), p.iter().map(|t| t.partition).collect::<Vec<_>>()))
+                    .collect::<Vec<_>>()
+            );
+        }
         let encoded = assignment
             .iter()
             .map(|(member_id, partitions)| {
