@@ -491,13 +491,23 @@ fn heartbeating_without_polling_keeps_membership() {
 /// computed — it never checks for overlap — and Java's `CooperativeStickyAssignor`
 /// works against this same cluster.
 ///
-/// The leading suspicion is the subscription version. This client writes
-/// `ConsumerProtocolSubscription` v1, which carries `owned_partitions` but not
-/// the `generation_id` that v2 added. Java uses that generation to decide
-/// whether an ownership claim is still trustworthy, and discards claims from a
-/// member that has been away — without it, a leader cannot tell a live claim
-/// from a stale one, and a stale claim is exactly what would make it hand a
-/// partition to two members.
+/// Two real causes have been found and fixed, and it still does not converge:
+///
+/// 1. The subscription was written at `ConsumerProtocolSubscription` v1, which
+///    carries `owned_partitions` but not the `generation_id` that v2 added. A
+///    leader could not tell a live ownership claim from a stale one. Now v2,
+///    with the stale-claim filter every client applies.
+/// 2. A cooperative rejoin cleared its own generation before rejoining, so the
+///    member advertised -1 and that same filter read *its own* claim as stale —
+///    handing away partitions it was still reading. The generation is now kept
+///    across a handover, which is what being a member of that generation means.
+///
+/// Both are checked by unit tests and both were worth fixing on their own. What
+/// remains is unidentified: with two live members the handover still does not
+/// settle at four partitions between them. The next step is tracing each
+/// member's `(generation, owned, assigned, lost)` per round against the
+/// broker's `Stabilized group` lines, which is the view that found the earlier
+/// causes and was not yet applied here.
 ///
 /// Left failing rather than deleted: the eager path is unaffected, and shipping
 /// `cooperative-sticky` as available while it double-assigns would be far worse

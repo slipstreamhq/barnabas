@@ -59,10 +59,17 @@ const JOIN_SLACK: Duration = Duration::from_secs(5);
 /// Coordinator requests other than `JoinGroup` answer promptly.
 const COORDINATOR_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The `ConsumerProtocol` version this client writes. Members negotiate down to
-/// the lowest any of them wrote, so a reader must honour what it is given
-/// rather than assume this one.
-const PROTOCOL_VERSION: i16 = 1;
+/// The `ConsumerProtocol` version this client writes.
+///
+/// **v2, because v1 cannot carry a generation.** A member that has been away
+/// still advertises the partitions it used to own, and a leader with no way to
+/// date that claim hands the same partition to two members — which is what
+/// `cooperative-sticky` did here until this changed. v2 added `generation_id`
+/// for exactly that.
+///
+/// Members negotiate down to the lowest version any of them wrote, so a reader
+/// must honour what it is given rather than assume this one.
+const PROTOCOL_VERSION: i16 = 2;
 
 /// The int16 that prefixes every subscription and assignment blob.
 fn read_version(cursor: &mut Bytes) -> Result<i16> {
@@ -532,6 +539,7 @@ fn encode_subscription(subscription: &Subscription) -> Result<Bytes> {
         .iter()
         .map(|t| StrBytes::from_string(t.clone()))
         .collect();
+    body.generation_id = subscription.generation;
     body.owned_partitions = owned
         .into_iter()
         .map(|(topic, partitions)| {
@@ -562,6 +570,9 @@ fn decode_subscription(member_id: &str, metadata: &Bytes) -> Result<Subscription
 
     Ok(Subscription {
         member_id: member_id.to_owned(),
+        // A v0 or v1 blob has no generation; -1 says "unknown", and an unknown
+        // claim is treated as stale rather than trusted.
+        generation: if version >= 2 { body.generation_id } else { -1 },
         topics: body.topics.iter().map(|t| t.to_string()).collect(),
         owned: body
             .owned_partitions
@@ -631,11 +642,17 @@ mod tests {
             member_id: "m-1".to_owned(),
             topics: vec!["a".to_owned(), "b".to_owned()],
             owned: vec![TopicPartition::new("a", 0), TopicPartition::new("a", 3)],
+            generation: 7,
         };
         let encoded = encode_subscription(&subscription).expect("encode");
         let decoded = decode_subscription("m-1", &encoded).expect("decode");
         assert_eq!(decoded.topics, subscription.topics);
         assert_eq!(decoded.owned, subscription.owned);
+        assert_eq!(
+            decoded.generation, 7,
+            "the generation must survive: without it a leader cannot tell a \
+             live ownership claim from a stale one"
+        );
     }
 
     #[test]

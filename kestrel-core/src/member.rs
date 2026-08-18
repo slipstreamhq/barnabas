@@ -215,8 +215,11 @@ impl GroupMember {
         Subscription {
             member_id: self.member_id.clone(),
             topics: self.topics.clone(),
-            // Sent so a sticky assignor can keep what we hold.
+            // Sent so a sticky assignor can keep what we hold — with the
+            // generation it was true in, so a leader can tell this claim from a
+            // stale one.
             owned: self.assignment.clone(),
+            generation: self.generation,
         }
     }
 
@@ -312,8 +315,15 @@ impl GroupMember {
                 if !self.lost.is_empty() {
                     // Rejoin at once: the partitions this member released are
                     // assigned to nobody until it does.
+                    //
+                    // **The generation is kept.** This member is still part of
+                    // the generation it was just assigned, and the claim it is
+                    // about to make on the partitions it kept is current. An
+                    // earlier version cleared it here, so the next `JoinGroup`
+                    // advertised generation -1, the leader read the claim as
+                    // stale, and handed those partitions to another member
+                    // while this one was still reading them.
                     self.state = MemberState::Unjoined;
-                    self.generation = NO_GENERATION;
                     self.leader = false;
                     self.pending_members.clear();
                     return Step::Join {
@@ -462,6 +472,7 @@ mod tests {
             member_id: "m-1".to_owned(),
             topics: vec!["t".to_owned()],
             owned: vec![],
+            generation: 1,
         }];
         let step = m.on_join(codes::NONE, 3, "m-1", "m-1", members.clone());
         assert_eq!(step, Step::AssignAndSync { members });
@@ -481,6 +492,7 @@ mod tests {
             member_id: "m-1".to_owned(),
             topics: vec!["t".to_owned()],
             owned: vec![],
+            generation: 1,
         }];
         m.on_join(codes::NONE, 3, "m-1", "m-1", members.clone());
         assert_eq!(m.step(), Step::AssignAndSync { members });
@@ -683,6 +695,25 @@ mod tests {
             step,
             Step::Join { member_id: "m-1".to_owned() },
             "rejoin at once: the released partitions have no owner until we do"
+        );
+    }
+
+    /// **A cooperative rejoin keeps its generation**, or the claim it makes on
+    /// the partitions it kept is read as stale and they are given away.
+    #[test]
+    fn a_handover_rejoin_keeps_its_generation() {
+        let mut m = cooperative();
+        m.on_join(codes::NONE, 4, "m-1", "m-2", vec![]);
+        m.on_sync(codes::NONE, vec![tp(0), tp(1)]);
+        m.on_heartbeat(codes::REBALANCE_IN_PROGRESS);
+        m.on_join(codes::NONE, 5, "m-1", "m-2", vec![]);
+        m.on_sync(codes::NONE, vec![tp(0)]);
+
+        assert_eq!(m.generation(), 5, "still a member of the generation just assigned");
+        assert_eq!(
+            m.subscription().generation,
+            5,
+            "and it says so, so its claim on tp(0) is believed"
         );
     }
 

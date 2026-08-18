@@ -30,6 +30,15 @@ pub struct Subscription {
     /// What this member holds now, for assignors that try to keep it.
     /// Empty for the stateless strategies.
     pub owned: Vec<TopicPartition>,
+    /// The generation `owned` was true in, or -1 if the member did not say.
+    ///
+    /// **This is what makes an ownership claim trustworthy.** A member that was
+    /// away still advertises the partitions it used to hold, and a leader that
+    /// believes it will hand the same partition to two members at once. Kafka
+    /// added the field to `ConsumerProtocolSubscription` v2 for exactly this,
+    /// and the rule every client applies is the same: a claim from below the
+    /// highest generation in the group is stale and is ignored.
+    pub generation: i32,
 }
 
 /// A topic and one of its partitions.
@@ -197,6 +206,26 @@ impl Assignor for RoundRobinAssignor {
     }
 }
 
+/// The ownership claims worth believing.
+///
+/// A member reporting a generation below the highest in the group has been away
+/// and its `owned` list describes a world that has moved on. Believing it is how
+/// a leader assigns one partition to two members.
+fn live_claims(members: &[Subscription]) -> BTreeMap<&str, &[TopicPartition]> {
+    let highest = members.iter().map(|m| m.generation).max().unwrap_or(-1);
+    members
+        .iter()
+        .map(|m| {
+            let owned: &[TopicPartition] = if m.generation >= highest && highest >= 0 {
+                &m.owned
+            } else {
+                &[]
+            };
+            (m.member_id.as_str(), owned)
+        })
+        .collect()
+}
+
 /// Keep what you had where possible, Java's `StickyAssignor` in spirit.
 ///
 /// **Not Java's algorithm.** Java's does a balanced-then-shuffle pass with
@@ -256,10 +285,11 @@ impl Assignor for StickyAssignor {
             wanted.div_ceil(sharers)
         };
 
+        let claims = live_claims(members);
         let mut taken: BTreeSet<TopicPartition> = BTreeSet::new();
         for member in &sorted {
             let quota = quota_of(member);
-            for tp in &member.owned {
+            for tp in claims[member.member_id.as_str()] {
                 if assignment[&member.member_id].len() >= quota {
                     break;
                 }
@@ -334,11 +364,13 @@ impl Assignor for CooperativeStickyAssignor {
         // The target: where each partition should end up.
         let target = StickyAssignor.assign(members, partitions_per_topic);
 
-        // Who holds what right now, so a move can be spotted.
+        // Who holds what right now, so a move can be spotted — believing only
+        // the claims that are still current.
+        let claims = live_claims(members);
         let mut owner: BTreeMap<&TopicPartition, &str> = BTreeMap::new();
-        for member in members {
-            for tp in &member.owned {
-                owner.insert(tp, member.member_id.as_str());
+        for (member_id, owned) in &claims {
+            for tp in *owned {
+                owner.insert(tp, member_id);
             }
         }
 
@@ -371,6 +403,7 @@ mod tests {
             member_id: id.to_owned(),
             topics: topics.iter().map(|t| (*t).to_owned()).collect(),
             owned: Vec::new(),
+            generation: 1,
         }
     }
 
@@ -382,6 +415,7 @@ mod tests {
                 .iter()
                 .map(|(t, p)| TopicPartition::new(*t, *p))
                 .collect(),
+            generation: 1,
         }
     }
 
@@ -654,6 +688,39 @@ mod tests {
         let members = [holding("c0", &["t"], &[("t", 0)])];
         let assignment = CooperativeStickyAssignor.assign(&members, &topics(&[("t", 2)]));
         assert_eq!(assignment["c0"].len(), 2, "the new partition needs no handover");
+    }
+
+    /// **A claim from an older generation is ignored.**
+    ///
+    /// A member that was away still advertises what it used to hold. Believing
+    /// it is how one partition ends up assigned to two members — silently,
+    /// since Kafka relays whatever the leader computed without checking.
+    #[test]
+    fn a_stale_ownership_claim_is_not_believed() {
+        let stale = Subscription {
+            member_id: "old".to_owned(),
+            topics: vec!["t".to_owned()],
+            owned: vec![TopicPartition::new("t", 0), TopicPartition::new("t", 1)],
+            generation: 1,
+        };
+        let current = Subscription {
+            member_id: "new".to_owned(),
+            topics: vec!["t".to_owned()],
+            owned: vec![],
+            generation: 5,
+        };
+
+        let assignment = CooperativeStickyAssignor.assign(&[stale, current], &topics(&[("t", 2)]));
+        let total: usize = assignment.values().map(Vec::len).sum();
+        assert_eq!(
+            total, 2,
+            "nothing is being taken from a live owner, so nothing is withheld: {assignment:?}"
+        );
+        let mut all: Vec<&TopicPartition> = assignment.values().flatten().collect();
+        let before = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), before, "a partition was assigned twice");
     }
 
     /// Every strategy must place every partition of a subscribed topic exactly
