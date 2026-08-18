@@ -590,74 +590,87 @@ impl<T: Transport> Consumer<T> {
         Ok(())
     }
 
-    /// Drive group membership, if this consumer subscribed.
+    /// Drive group membership to a settled state, if this consumer subscribed.
     ///
-    /// Returns whether the assignment changed, so [`Self::poll`] can discard a
-    /// fetch that is now for someone else's partitions.
+    /// **Loops until the member is stable**, rather than taking one protocol
+    /// step per call. A rejoin is `JoinGroup` then `SyncGroup`, sometimes twice
+    /// over — and a coordinator waits only `rebalance.timeout.ms` for every
+    /// member to come back. A client that advanced one step per poll spent a
+    /// whole poll cycle on each, so the rebalance completed without it, and its
+    /// next heartbeat returned `UNKNOWN_MEMBER_ID`: dropped, rejoined as a new
+    /// member, and the group never settled. Java's `joinGroupIfNeeded` loops
+    /// for the same reason.
+    ///
+    /// Returns whether the assignment changed.
     async fn advance_group(&mut self) -> Result<bool> {
-        let Some(mut group) = self.group.take() else {
-            return Ok(false);
-        };
-        let outcome = crate::group::GroupProtocol::advance(&mut group, &mut self.cluster).await;
-        let changed = match &outcome {
-            Ok(crate::group::Membership::Assigned(partitions)) => {
-                let wanted: BTreeMap<(String, i32), ()> = partitions
-                    .iter()
-                    .map(|tp| ((tp.topic.clone(), tp.partition), ()))
-                    .collect();
-                let same = wanted.len() == self.positions.len()
-                    && wanted.keys().all(|k| self.positions.contains_key(k));
-                if same {
-                    false
-                } else {
-                    // A new assignment: resume each partition where the group
-                    // left off, or at the reset point if it never committed.
-                    let committed = crate::group::GroupProtocol::committed(
-                        &mut group,
-                        &mut self.cluster,
-                        partitions,
-                    )
-                    .await?;
-                    self.positions.clear();
-                    for tp in partitions {
-                        let start = committed.get(tp).copied().unwrap_or(self.reset);
-                        self.positions
-                            .insert((tp.topic.clone(), tp.partition), start);
-                    }
-                    if let Some(listener) = self.listener.as_mut() {
-                        listener.on_assigned(partitions);
+        // Bounded so a group that genuinely cannot settle returns to the caller
+        // instead of spinning here: a poll that never comes back is worse than
+        // one that reports no records.
+        const MAX_STEPS: usize = 20;
+
+        let mut changed = false;
+        for _ in 0..MAX_STEPS {
+            let Some(mut group) = self.group.take() else {
+                return Ok(changed);
+            };
+            let outcome =
+                crate::group::GroupProtocol::advance(&mut group, &mut self.cluster).await;
+
+            let settled = match &outcome {
+                Ok(crate::group::Membership::Assigned(partitions)) => {
+                    let wanted: BTreeMap<(String, i32), ()> = partitions
+                        .iter()
+                        .map(|tp| ((tp.topic.clone(), tp.partition), ()))
+                        .collect();
+                    let same = wanted.len() == self.positions.len()
+                        && wanted.keys().all(|k| self.positions.contains_key(k));
+                    if !same {
+                        let committed = crate::group::GroupProtocol::committed(
+                            &mut group,
+                            &mut self.cluster,
+                            partitions,
+                        )
+                        .await?;
+                        self.positions.clear();
+                        for tp in partitions {
+                            let start = committed.get(tp).copied().unwrap_or(self.reset);
+                            self.positions
+                                .insert((tp.topic.clone(), tp.partition), start);
+                        }
+                        if let Some(listener) = self.listener.as_mut() {
+                            listener.on_assigned(partitions);
+                        }
+                        changed = true;
                     }
                     true
                 }
-            }
-            // Everything was revoked: stop fetching before the next request,
-            // because another member is about to be given these.
-            Ok(crate::group::Membership::Revoked(lost)) => {
-                // **Only what was actually lost.** Clearing everything here is
-                // right for the eager protocol and wrong for the cooperative
-                // one, which keeps reading the partitions nobody is taking —
-                // and re-adding them on the next assignment restarts the very
-                // rebalance that just finished.
-                if let Some(listener) = self.listener.as_mut() {
-                    listener.on_revoked(lost);
+                Ok(crate::group::Membership::Revoked(lost)) => {
+                    // Only what was actually lost: the eager protocol reports
+                    // everything, the cooperative one only what moved.
+                    if let Some(listener) = self.listener.as_mut() {
+                        listener.on_revoked(lost);
+                    }
+                    for tp in lost {
+                        self.positions.remove(&(tp.topic.clone(), tp.partition));
+                    }
+                    changed |= !lost.is_empty();
+                    false
                 }
-                for tp in lost {
-                    self.positions.remove(&(tp.topic.clone(), tp.partition));
-                }
-                !lost.is_empty()
+                Ok(crate::group::Membership::InProgress) | Err(_) => false,
+            };
+
+            self.group = Some(group);
+            outcome?;
+            if settled {
+                break;
             }
-            Ok(crate::group::Membership::InProgress) | Err(_) => false,
-        };
-        self.group = Some(group);
-        outcome?;
+        }
 
         if changed {
             self.generation += 1;
             for session in self.sessions.values_mut() {
                 session.reset();
             }
-            // Offsets that are still `EARLIEST`/`LATEST` are resolved by `add`;
-            // resolve them now so the first fetch asks for a real position.
             let unresolved: Vec<(String, i32, i64)> = self
                 .positions
                 .iter()

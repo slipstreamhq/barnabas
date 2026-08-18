@@ -522,17 +522,23 @@ fn heartbeating_without_polling_keeps_membership() {
 /// still in the client behind `KESTREL_TRACE=1`, which prints each member's
 /// join, sync, heartbeat and what the leader saw.
 ///
-/// **What remains, stated exactly**: the two members ping-pong. Each rejoin
-/// completes a rebalance that excludes the other, and the excluded one's next
-/// heartbeat returns `UNKNOWN_MEMBER_ID` (25) rather than `REBALANCE_IN_PROGRESS`
-/// (27), so it rejoins as a brand-new member and the cycle repeats — visible in
-/// the trace as a fresh member id every round and a leader that only ever sees
-/// itself. A member is therefore being dropped by the coordinator between
-/// rounds, and the question to answer next is why: this client rejoins only
-/// when polled, so a member that is not polled inside the rebalance window is
-/// removed, and the lockstep the test drives both members with may simply be
-/// too slow for it. That is a question about *when* rejoins are driven, not
-/// about the assignor, which now matches the reference.
+/// 5. `advance_group` took one protocol step per `poll`. A rejoin is
+///    `JoinGroup` then `SyncGroup`, sometimes twice over, so a member spent a
+///    poll cycle on each while the coordinator waited — Java's
+///    `joinGroupIfNeeded` loops until the member is stable, and now so does
+///    this.
+///
+/// **What remains, from the trace**: the second member joins as *leader of a
+/// group of one*, so the first was already gone before it arrived — and only
+/// afterwards does the first see `UNKNOWN_MEMBER_ID`. So a member is being
+/// dropped while idle, not during a rebalance, which points at the window
+/// between the first consumer's last poll and the second one's `subscribe`:
+/// nothing heartbeats there, because this client heartbeats only when polled.
+///
+/// That makes it the same architectural question as `Consumer::heartbeat`
+/// rather than an assignor bug — the assignor and the state machine now match
+/// `kafka-clients` 3.9.0, and the eager path, which rejoins from scratch every
+/// time, is unaffected either way.
 ///
 /// Left failing rather than deleted: the eager path is unaffected, and shipping
 /// `cooperative-sticky` as available while it double-assigns would be far worse
