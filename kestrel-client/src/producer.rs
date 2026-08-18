@@ -68,6 +68,32 @@ const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(250);
 /// only bounded work if the window is.
 pub const DEFAULT_MAX_IN_FLIGHT: usize = 5;
 
+/// How many bytes of records accumulate before a batch is sent regardless of
+/// [`Producer::set_linger`].
+///
+/// 16 KiB, which is `batch.size`'s default in the Java client. The number is
+/// not magic; matching it means a caller reasoning from Kafka documentation
+/// gets the behaviour that documentation describes.
+pub const DEFAULT_BATCH_SIZE: usize = 16 * 1024;
+
+/// Roughly what one record costs on the wire beyond its key and value: the
+/// varint lengths, the attributes byte, the offset and timestamp deltas.
+///
+/// An estimate on purpose. It decides *when* to send, not what to encode, so
+/// being a few bytes out changes batch sizes slightly and correctness not at
+/// all.
+const RECORD_OVERHEAD: usize = 16;
+
+/// Records waiting to be encoded, for one partition.
+struct Staged {
+    records: Vec<ProducerRecord>,
+    /// Estimated encoded size, so the batch-size check costs nothing.
+    bytes: usize,
+    /// When the **first** record arrived — the linger clock starts then, not
+    /// at the last one, or a steady stream would never be sent.
+    since: std::time::Instant,
+}
+
 /// One broker's address and the partitions its request carried.
 type RoundTarget = (String, Vec<(String, i32)>);
 
@@ -116,6 +142,14 @@ pub struct Producer<T: Transport> {
     pending: BTreeMap<(String, i32), VecDeque<Bytes>>,
     /// How many `Produce` requests may be in flight on one connection.
     max_in_flight: usize,
+    /// Records accumulating per partition, not yet encoded. Empty unless a
+    /// caller uses [`Producer::produce`].
+    staged: BTreeMap<(String, i32), Staged>,
+    /// How long a partial batch may wait for company. Zero by default, which
+    /// is Kafka's default and means "send as soon as asked".
+    linger: Duration,
+    /// How large a batch may grow before it is sent regardless of `linger`.
+    batch_size: usize,
     /// Base offsets from the window being processed, keyed by partition and
     /// round. Cleared each time the window is retired.
     offsets: BTreeMap<((String, i32), usize), i64>,
@@ -151,6 +185,9 @@ impl<T: Transport> Producer<T> {
             compression: Compression::None,
             partitioner: Partitioner::default(),
             round_robin: 0,
+            staged: BTreeMap::new(),
+            linger: Duration::ZERO,
+            batch_size: DEFAULT_BATCH_SIZE,
             pending: BTreeMap::new(),
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             offsets: BTreeMap::new(),
@@ -174,6 +211,9 @@ impl<T: Transport> Producer<T> {
             compression: Compression::None,
             partitioner: Partitioner::default(),
             round_robin: 0,
+            staged: BTreeMap::new(),
+            linger: Duration::ZERO,
+            batch_size: DEFAULT_BATCH_SIZE,
             pending: BTreeMap::new(),
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
             offsets: BTreeMap::new(),
@@ -720,6 +760,151 @@ impl<T: Transport> Producer<T> {
         Ok(())
     }
 
+    /// How long a partial batch waits for company before being sent.
+    ///
+    /// Zero — the default, and Kafka's — means a record is sent as soon as it
+    /// is produced. A few milliseconds is what turns a stream of single records
+    /// into batches, and it is the single largest throughput knob for a caller
+    /// producing one record at a time.
+    ///
+    /// **This client spawns nothing**, so the clock is only read when the
+    /// producer is called. A steady stream of [`Self::produce`] calls sends
+    /// itself; an idle producer holds its last partial batch until
+    /// [`Self::flush`] or [`Self::tick`]. [`Self::linger_deadline`] is there so
+    /// an event loop can arm a timer for exactly that.
+    pub fn set_linger(&mut self, linger: Duration) {
+        self.linger = linger;
+    }
+
+    /// How large a batch may grow before it is sent regardless of the linger.
+    ///
+    /// Defaults to [`DEFAULT_BATCH_SIZE`].
+    ///
+    /// # Panics
+    /// If `bytes` is zero.
+    pub fn set_batch_size(&mut self, bytes: usize) {
+        assert!(bytes > 0, "batch_size must be at least 1");
+        self.batch_size = bytes;
+    }
+
+    /// Produce one record, letting the client choose the partition and the
+    /// batch.
+    ///
+    /// This is the ordinary way to produce: records accumulate per partition
+    /// and go out when a batch fills or its linger expires, so a caller writing
+    /// one record at a time still gets batches. [`Self::send`] remains the
+    /// explicit form for a caller who has already batched and knows the
+    /// partition.
+    ///
+    /// It does **not** wait for the broker: it returns once the record is
+    /// accumulated, having sent whatever became ready. Use [`Self::flush`] to
+    /// wait for everything to land.
+    ///
+    /// # Errors
+    /// If the producer is fenced, no transaction is open when one is required,
+    /// the topic's partition count cannot be learned, or a send that became
+    /// ready fails.
+    pub async fn produce(&mut self, topic: &str, record: ProducerRecord) -> Result<()> {
+        let partition = self.partition_for(topic, record.key.as_deref()).await?;
+        self.produce_to(topic, partition, record).await
+    }
+
+    /// [`Self::produce`], to a partition the caller chose.
+    ///
+    /// # Errors
+    /// As [`Self::produce`].
+    pub async fn produce_to(
+        &mut self,
+        topic: &str,
+        partition: i32,
+        record: ProducerRecord,
+    ) -> Result<()> {
+        let bytes = record.key.as_ref().map_or(0, bytes::Bytes::len)
+            + record.value.as_ref().map_or(0, bytes::Bytes::len)
+            + RECORD_OVERHEAD;
+
+        let staged = self
+            .staged
+            .entry((topic.to_owned(), partition))
+            .or_insert_with(|| Staged {
+                records: Vec::new(),
+                bytes: 0,
+                since: std::time::Instant::now(),
+            });
+        staged.records.push(record);
+        staged.bytes += bytes;
+
+        self.send_ready().await
+    }
+
+    /// When the oldest staged batch is due, if anything is staged.
+    ///
+    /// An event loop with nothing else to do should sleep until this and then
+    /// call [`Self::tick`]; without that, an idle producer's last partial batch
+    /// waits for the next call. Returning the deadline rather than sleeping is
+    /// deliberate — the caller owns the timer, because this client owns no
+    /// tasks.
+    #[must_use]
+    pub fn linger_deadline(&self) -> Option<std::time::Instant> {
+        self.staged
+            .values()
+            .map(|staged| staged.since + self.linger)
+            .min()
+    }
+
+    /// Send every staged batch whose linger has expired.
+    ///
+    /// Cheap when nothing is due. Safe to call as often as an event loop
+    /// likes.
+    ///
+    /// # Errors
+    /// As [`Self::flush`].
+    pub async fn tick(&mut self) -> Result<()> {
+        self.send_ready().await
+    }
+
+    /// Encode and send whatever is full or overdue.
+    ///
+    /// A batch that is merely *partial and recent* stays staged: that is the
+    /// whole point of the linger, and sending it would make the setting
+    /// decorative.
+    async fn send_ready(&mut self) -> Result<()> {
+        let now = std::time::Instant::now();
+        let ready: Vec<(String, i32)> = self
+            .staged
+            .iter()
+            .filter(|(_, staged)| {
+                staged.bytes >= self.batch_size || now.duration_since(staged.since) >= self.linger
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if ready.is_empty() {
+            return Ok(());
+        }
+        for (topic, partition) in ready {
+            let Some(staged) = self.staged.remove(&(topic.clone(), partition)) else {
+                continue;
+            };
+            self.enqueue(&topic, partition, &staged.records).await?;
+        }
+        self.flush().await?;
+        Ok(())
+    }
+
+    /// Move every staged record into the pending queue, however recent.
+    ///
+    /// What [`Self::flush`] does first, and what makes "flush" mean everything.
+    async fn drain_staged(&mut self) -> Result<()> {
+        let keys: Vec<(String, i32)> = self.staged.keys().cloned().collect();
+        for (topic, partition) in keys {
+            let Some(staged) = self.staged.remove(&(topic.clone(), partition)) else {
+                continue;
+            };
+            self.enqueue(&topic, partition, &staged.records).await?;
+        }
+        Ok(())
+    }
+
     /// How many `Produce` requests may be in flight on one connection.
     ///
     /// Defaults to [`DEFAULT_MAX_IN_FLIGHT`]. One restores strict
@@ -732,10 +917,11 @@ impl<T: Transport> Producer<T> {
         self.max_in_flight = max;
     }
 
-    /// How many batches are queued and not yet acknowledged.
+    /// How many batches are queued and not yet acknowledged, staged records
+    /// included — one staged partition counts as the one batch it will become.
     #[must_use]
     pub fn queued(&self) -> usize {
-        self.pending.values().map(VecDeque::len).sum()
+        self.pending.values().map(VecDeque::len).sum::<usize>() + self.staged.len()
     }
 
     /// Allocate this batch's sequence numbers and encode it **once**.
@@ -782,6 +968,11 @@ impl<T: Transport> Producer<T> {
     /// neither about leadership nor a consequence of an earlier failure in the
     /// same window.
     pub async fn flush(&mut self) -> Result<Vec<(String, i32, i64)>> {
+        // **Staged records are part of "everything".** Without this a caller
+        // who produces and then flushes gets an empty answer and a batch still
+        // sitting in memory, which is the worst possible reading of the word.
+        self.drain_staged().await?;
+
         let mut written: Vec<(String, i32, i64)> = Vec::new();
 
         for attempt in 0..MAX_RETRIES {

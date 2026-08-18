@@ -177,15 +177,26 @@ It is `None` unless the member is stable, and must be re-read per transaction.
 Static membership (`group.instance.id`, KIP-345) is still absent; the field is
 on the wire and always `None`.
 
-### Phase 3 — the rest of a normal application's surface
+### ~~Phase 3 — the rest of a normal application's surface~~ — done
 
-- Consumer: `pause`/`resume`, `committed`, `position`, `offsets_for_times`,
-  `end_offsets`, lag
-- Admin: `CreateTopics`, `DeletePartitions`, `DescribeCluster`,
-  `DescribeConfigs`, `DeleteRecords` — enough to write a test suite and an
-  operational tool without a second client
-- Producer: a time-based accumulator (`linger.ms`). We have none, which is why
-  the batch-1 benchmark row is our weakest and why callers must batch by hand
+- Consumer: `pause`/`resume`/`paused`/`is_paused`, `committed`, `position`,
+  `offsets_for_times`, `end_offsets`, `beginning_offsets`, `lag`. All the
+  offset lookups share one batched `ListOffsets` — one request per leader, not
+  per partition.
+- Admin: `create_topics`, `delete_topics`, `create_partitions`,
+  `describe_cluster`, `describe_topic_config`, `delete_records`. Topic
+  operations route to the controller and re-discover it on `NOT_CONTROLLER`;
+  `delete_records` routes to the leader.
+- Producer: `produce`/`produce_to` accumulate per partition and go out when a
+  batch fills or its linger expires — `set_linger`, `set_batch_size`, `tick`,
+  `linger_deadline`. **This client spawns nothing**, so the linger clock is
+  read only when the producer is called: a steady stream sends itself, and an
+  idle producer needs `tick` or `flush`. `linger_deadline` exists so an event
+  loop can arm the timer, because the caller owns the timer.
+
+Two absences remain deliberate: broker configs (a broker config must be asked
+of that broker, and hiding the routing would return one broker's answer for
+all of them) and static membership, KIP-345.
 
 ### Not planned, and worth saying so
 
@@ -211,7 +222,7 @@ of the producer window. Groups should arrive with the same three.
 3. **Topic expansion** — groups solve it partly; the assign-only path still
    needs it.
 4. ~~**Phase 2, EOS with groups**~~ — done.
-5. **Phase 3, the ordinary surface.**
+5. ~~**Phase 3, the ordinary surface**~~ — done.
 
 Performance work is finished for now: the client leads the Java client and
 librdkafka on every cell measured, and what remains are features, not speed.

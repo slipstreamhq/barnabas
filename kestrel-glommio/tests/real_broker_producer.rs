@@ -692,3 +692,162 @@ fn sending_offsets_outside_a_transaction_is_rejected() {
         consumer.unsubscribe().await.expect("leave");
     });
 }
+
+// ── the accumulator ────────────────────────────────────────────────────────
+
+/// With a linger set, single records coalesce into **one** batch, and a flush
+/// sends whatever is still partial.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn lingering_coalesces_single_records_into_one_batch() {
+    run(|| async {
+        let topic = unique("linger");
+        make_topic(&topic).await;
+
+        let mut producer = Producer::idempotent(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test")
+            .await
+            .expect("producer");
+        producer.set_linger(Duration::from_secs(30));
+
+        for i in 0..5 {
+            producer
+                .produce_to(
+                    &topic,
+                    0,
+                    ProducerRecord::new(None, Some(Bytes::from(format!("r{i}")))),
+                )
+                .await
+                .expect("produce");
+        }
+
+        // Nothing has been sent: the linger has not expired and the batch is
+        // nowhere near full.
+        assert_eq!(producer.queued(), 1, "one partition staged, unsent");
+
+        producer.flush().await.expect("flush");
+        assert_eq!(producer.queued(), 0);
+
+        let written = read_all(&topic, 5, IsolationLevel::ReadCommitted).await;
+        assert_eq!(written, vec!["r0", "r1", "r2", "r3", "r4"]);
+    });
+}
+
+/// A batch that reaches `batch_size` is sent without waiting for the linger.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn a_full_batch_does_not_wait_for_the_linger() {
+    run(|| async {
+        let topic = unique("batchsize");
+        make_topic(&topic).await;
+
+        let mut producer = Producer::idempotent(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test")
+            .await
+            .expect("producer");
+        producer.set_linger(Duration::from_secs(30));
+        producer.set_batch_size(64);
+
+        // Each record is well under 64 bytes, so this crosses the threshold
+        // partway through and sends without any flush.
+        for i in 0..8 {
+            producer
+                .produce_to(
+                    &topic,
+                    0,
+                    ProducerRecord::new(None, Some(Bytes::from(format!("value-{i}")))),
+                )
+                .await
+                .expect("produce");
+        }
+
+        // Each record is ~23 bytes estimated, so the threshold is crossed at
+        // three and again at six; the last two are still staged. That the
+        // first six are *readable with no flush at all* is the assertion.
+        assert_eq!(producer.queued(), 1, "a partial batch remains");
+        let early = read_all(&topic, 6, IsolationLevel::ReadCommitted).await;
+        assert_eq!(early.len(), 6, "full batches went out on their own");
+
+        producer.flush().await.expect("flush");
+        let all = read_all(&topic, 8, IsolationLevel::ReadCommitted).await;
+        assert_eq!(all.len(), 8);
+    });
+}
+
+/// `tick` sends an overdue batch, and `linger_deadline` says when that is.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn tick_sends_what_the_linger_has_made_due() {
+    run(|| async {
+        let topic = unique("tick");
+        make_topic(&topic).await;
+
+        let mut producer = Producer::idempotent(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test")
+            .await
+            .expect("producer");
+        producer.set_linger(Duration::from_millis(150));
+
+        assert!(producer.linger_deadline().is_none(), "nothing staged yet");
+        producer
+            .produce_to(&topic, 0, ProducerRecord::new(None, Some(Bytes::from("late"))))
+            .await
+            .expect("produce");
+        let deadline = producer.linger_deadline().expect("a deadline once staged");
+        assert_eq!(producer.queued(), 1, "still waiting");
+
+        // An early tick must not send it — otherwise the linger is decorative.
+        producer.tick().await.expect("early tick");
+        assert_eq!(producer.queued(), 1, "not due yet");
+
+        glommio::timer::sleep(deadline.saturating_duration_since(std::time::Instant::now())).await;
+        glommio::timer::sleep(Duration::from_millis(20)).await;
+        producer.tick().await.expect("tick");
+        assert_eq!(producer.queued(), 0, "due, so sent");
+
+        assert_eq!(
+            read_all(&topic, 1, IsolationLevel::ReadCommitted).await,
+            vec!["late"]
+        );
+    });
+}
+
+/// `produce` picks the partition from the key, the same way `send_keyed` does:
+/// equal keys land together.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn produce_places_records_by_key() {
+    run(|| async {
+        let topic = unique("produce-key");
+        make_topic_with_partitions(&topic, 3).await;
+
+        let mut producer = Producer::idempotent(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test")
+            .await
+            .expect("producer");
+        producer.set_linger(Duration::from_secs(30));
+
+        let expected = producer
+            .partition_for(&topic, Some(b"same"))
+            .await
+            .expect("partition for key");
+
+        for i in 0..4 {
+            producer
+                .produce(
+                    &topic,
+                    ProducerRecord::new(
+                        Some(Bytes::from_static(b"same")),
+                        Some(Bytes::from(format!("v{i}"))),
+                    ),
+                )
+                .await
+                .expect("produce");
+        }
+        assert_eq!(
+            producer.queued(),
+            1,
+            "one key means one partition means one staged batch"
+        );
+
+        let written = producer.flush().await.expect("flush");
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].1, expected, "the key decided the partition");
+    });
+}
