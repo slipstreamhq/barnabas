@@ -528,17 +528,28 @@ fn heartbeating_without_polling_keeps_membership() {
 ///    `joinGroupIfNeeded` loops until the member is stable, and now so does
 ///    this.
 ///
-/// **What remains, from the trace**: the second member joins as *leader of a
-/// group of one*, so the first was already gone before it arrived — and only
-/// afterwards does the first see `UNKNOWN_MEMBER_ID`. So a member is being
-/// dropped while idle, not during a rebalance, which points at the window
-/// between the first consumer's last poll and the second one's `subscribe`:
-/// nothing heartbeats there, because this client heartbeats only when polled.
+/// **What remains, from the trace.** The second member's `JoinGroup` returns it
+/// as leader of a group containing only itself, and only afterwards does the
+/// first member's heartbeat return `UNKNOWN_MEMBER_ID` (25) — never
+/// `REBALANCE_IN_PROGRESS` (27). So the coordinator drops the incumbent while
+/// admitting the newcomer, and the incumbent learns about it too late to rejoin
+/// the same generation.
 ///
-/// That makes it the same architectural question as `Consumer::heartbeat`
-/// rather than an assignor bug — the assignor and the state machine now match
-/// `kafka-clients` 3.9.0, and the eager path, which rejoins from scratch every
-/// time, is unaffected either way.
+/// **Ruled out**, each by experiment rather than argument:
+///
+/// - *The assignors.* They match `kafka-clients` 3.9.0 and are unit-tested,
+///   including the withholding rule and the stale-claim filter.
+/// - *The idle window.* Both consumers are now connected before either
+///   subscribes, so nothing sits unpolled while the other sets up; the symptom
+///   is unchanged.
+/// - *The group id.* Both subscribe with the same one.
+/// - *The rejoin pace.* `advance_group` now drives a rejoin to completion in a
+///   single `poll`, as `joinGroupIfNeeded` does.
+///
+/// The next step is the one that cracked the original `JoinGroup` hang: run this
+/// with `KESTREL_TRACE=1` **beside the broker's own `kafka.coordinator.group`
+/// DEBUG log**, and read why the coordinator considers the incumbent gone. The
+/// client-side view alone cannot say.
 ///
 /// Left failing rather than deleted: the eager path is unaffected, and shipping
 /// `cooperative-sticky` as available while it double-assigns would be far worse
@@ -558,6 +569,10 @@ fn cooperative_rebalancing_never_drops_everything() {
         let mut prod = TestProducer::connect(&broker(), &topic).await;
         prod.create_topic_with_partitions(4).await;
 
+        // **Both consumers are connected before either joins.** Connecting is a
+        // round trip, and this client heartbeats only when polled — so doing it
+        // between the first member's assignment and the second's subscribe
+        // leaves the first silent for the whole of it.
         let mut first = kestrel_glommio::Consumer::new(
             kestrel_glommio::Glommio,
             &bootstrap(),
@@ -566,12 +581,20 @@ fn cooperative_rebalancing_never_drops_everything() {
         )
         .await
         .expect("consumer");
-        first.set_max_wait(Duration::from_millis(100));
-        // **Bounded, because both members are driven from one task here.** A
-        // `JoinGroup` is held until the whole group rejoins, so a member
-        // waiting on it blocks the very loop that would drive the other one.
-        // A real deployment has one member per process and does not care.
-        first.set_group_timeouts(Duration::from_secs(30), Duration::from_secs(20));
+        let mut second = kestrel_glommio::Consumer::new(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "coop-2",
+            kestrel_core::IsolationLevel::ReadCommitted,
+        )
+        .await
+        .expect("consumer");
+
+        for consumer in [&mut first, &mut second] {
+            consumer.set_max_wait(Duration::from_millis(100));
+            consumer.set_group_timeouts(Duration::from_secs(30), Duration::from_secs(20));
+        }
+
         first
             .subscribe(
                 &group,
@@ -590,16 +613,6 @@ fn cooperative_rebalancing_never_drops_everything() {
         }
         assert_eq!(first.assignments().count(), 4, "the first member takes all four");
 
-        let mut second = kestrel_glommio::Consumer::new(
-            kestrel_glommio::Glommio,
-            &bootstrap(),
-            "coop-2",
-            kestrel_core::IsolationLevel::ReadCommitted,
-        )
-        .await
-        .expect("consumer");
-        second.set_max_wait(Duration::from_millis(100));
-        second.set_group_timeouts(Duration::from_secs(30), Duration::from_secs(20));
         second
             .subscribe(
                 &group,
@@ -610,13 +623,8 @@ fn cooperative_rebalancing_never_drops_everything() {
             .await
             .expect("subscribe");
 
-        // Drive both through the handover, watching what the incumbent holds.
-        //
-        // **Settled, not merely non-zero.** A cooperative handover passes
-        // through a moment where the new owner has been granted nothing yet and
-        // another where the old owner has released but the grant has not landed
-        // — stopping at the first sight of both holding something reads one of
-        // those transients and calls it the result.
+        // Settled, not merely non-zero: a handover passes through states where
+        // one side holds nothing yet.
         let mut floor = 4usize;
         let mut stable_for = 0;
         for _ in 0..200 {
@@ -636,7 +644,7 @@ fn cooperative_rebalancing_never_drops_everything() {
 
         let a = first.assignments().count();
         let b = second.assignments().count();
-        assert_eq!(a + b, 4, "every partition must be held by someone: {a} + {b}");
+        assert_eq!(a + b, 4, "every partition must be held by exactly one: {a} + {b}");
         assert!(a > 0 && b > 0, "the four should be shared: {a} + {b}");
         assert!(
             floor > 0,
