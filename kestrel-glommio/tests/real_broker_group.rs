@@ -463,175 +463,131 @@ fn heartbeating_without_polling_keeps_membership() {
 
 /// **Cooperative rebalancing: the incumbent keeps what it is not losing.**
 ///
-/// # Does not pass: the handover grants before it revokes
+/// # Six bugs, all of them ours
 ///
-/// **Both members end up holding all four partitions.** That is overlap —
-/// duplicate consumption — and the precise thing this protocol exists to
-/// prevent, so it is a hard failure rather than a rough edge.
+/// This failed for a long time. Every cause was in this client or this test:
 ///
-/// It used to hang instead. That was a separate bug, now fixed: `poll` treated
-/// every non-stable membership as a full revocation and cleared positions the
-/// cooperative protocol means to keep, so the consumer re-entered the rebalance
-/// it had just left. Revocation now carries *what was actually lost* — the
-/// whole assignment under the eager protocol, only the moved partitions under
-/// this one — which is right for both and made the loop terminate.
+/// 1. `ConsumerProtocolSubscription` was written at v1, which cannot carry a
+///    generation, so a leader could not tell a live ownership claim from a
+///    stale one. Now v2.
+/// 2. A cooperative rejoin cleared its own generation, so the filter added for
+///    (1) discarded the member's *own* claim.
+/// 3. `revoke_and_rejoin` cleared the generation too, with the same effect on
+///    every rebalance.
+/// 4. The generation filter was applied to the withholding decision as well as
+///    to the target. Java draws that line deliberately: `memberData` filters,
+///    `computePartitionsTransferringOwnership` uses the raw owned list, because
+///    withholding is about who is still *reading* a partition.
+/// 5. `advance_group` took one protocol step per `poll`, so a rejoin burned a
+///    poll cycle per step and the coordinator finished the generation without
+///    it. Java loops in `joinGroupIfNeeded`; so does this now.
+/// 6. This test drove both members in lockstep. `zip(first.poll(),
+///    second.poll())` deadlocks against the protocol: the joining member's
+///    `JoinGroup` is held until the whole group has rejoined, so the incumbent
+///    cannot take its turn until the join it is blocking returns. The
+///    coordinator broke the tie by evicting the member that never came back,
+///    and said so in its own log — "removed dynamic members who haven't
+///    joined" — which is what finally ended this, after several rounds of
+///    inferring from the client side alone.
 ///
-/// What remains: the leader grants a partition to its new owner in the same
-/// round its current owner still holds it, so the two members between them hold
-/// more partitions than exist. The assignor withholds correctly in isolation
-/// (`cooperative_withholds_a_partition_that_must_move`), so the fault is in the
-/// `owned` set the leader actually sees.
-///
-/// **Not a test artifact.** The first version of this test stopped as soon as
-/// both members held something, which is a transient state in a handover; it
-/// now requires the total to settle at four for five consecutive rounds, and
-/// that never happens either.
-///
-/// **Not the broker.** The coordinator only relays the assignment the leader
-/// computed — it never checks for overlap — and Java's `CooperativeStickyAssignor`
-/// works against this same cluster.
-///
-/// Three real causes have been found and fixed, and it still does not converge.
-/// The first two were reasoned about; the third came from reading
-/// `CooperativeStickyAssignor.java` and `ConsumerCoordinator.java`, which is
-/// what should have happened first:
-///
-/// 1. The subscription was written at `ConsumerProtocolSubscription` v1, which
-///    carries `owned_partitions` but not the `generation_id` that v2 added. A
-///    leader could not tell a live ownership claim from a stale one. Now v2,
-///    with the stale-claim filter every client applies.
-/// 2. A cooperative rejoin cleared its own generation before rejoining, so the
-///    member advertised -1 and that same filter read *its own* claim as stale —
-///    handing away partitions it was still reading. The generation is now kept
-///    across a handover, which is what being a member of that generation means.
-///
-/// 3. The generation filter was applied to the withholding decision as well as
-///    to the target. Java draws that line deliberately: `memberData` filters by
-///    generation so a stale layout does not become sticky, while
-///    `computePartitionsTransferringOwnership` uses the **raw** owned list,
-///    because withholding is about who is still *reading* a partition and a
-///    member whose claim is judged stale is reading it regardless. Filtering
-///    there hands its partitions to another member while it still holds them.
-///
-/// 4. `revoke_and_rejoin` cleared the generation, so every rejoin advertised
-///    -1 and a leader read every ownership claim — including the member's own —
-///    as stale. A rebalance does not un-make a member of the generation it was
-///    assigned; only fencing does, and that drops the member id with it.
-///
-/// All four are checked by unit tests. The trace that found the last one is
-/// still in the client behind `KESTREL_TRACE=1`, which prints each member's
-/// join, sync, heartbeat and what the leader saw.
-///
-/// 5. `advance_group` took one protocol step per `poll`. A rejoin is
-///    `JoinGroup` then `SyncGroup`, sometimes twice over, so a member spent a
-///    poll cycle on each while the coordinator waited — Java's
-///    `joinGroupIfNeeded` loops until the member is stable, and now so does
-///    this.
-///
-/// **What remains, from the trace.** The second member's `JoinGroup` returns it
-/// as leader of a group containing only itself, and only afterwards does the
-/// first member's heartbeat return `UNKNOWN_MEMBER_ID` (25) — never
-/// `REBALANCE_IN_PROGRESS` (27). So the coordinator drops the incumbent while
-/// admitting the newcomer, and the incumbent learns about it too late to rejoin
-/// the same generation.
-///
-/// **Ruled out**, each by experiment rather than argument:
-///
-/// - *The assignors.* They match `kafka-clients` 3.9.0 and are unit-tested,
-///   including the withholding rule and the stale-claim filter.
-/// - *The idle window.* Both consumers are now connected before either
-///   subscribes, so nothing sits unpolled while the other sets up; the symptom
-///   is unchanged.
-/// - *The group id.* Both subscribe with the same one.
-/// - *The rejoin pace.* `advance_group` now drives a rejoin to completion in a
-///   single `poll`, as `joinGroupIfNeeded` does.
-///
-/// The next step is the one that cracked the original `JoinGroup` hang: run this
-/// with `KESTREL_TRACE=1` **beside the broker's own `kafka.coordinator.group`
-/// DEBUG log**, and read why the coordinator considers the incumbent gone. The
-/// client-side view alone cannot say.
-///
-/// Left failing rather than deleted: the eager path is unaffected, and shipping
-/// `cooperative-sticky` as available while it double-assigns would be far worse
-/// than shipping it as unfinished.
-///
-/// The eager protocol makes every member give up everything and stop consuming
-/// until the new assignment arrives. KIP-429 revokes only what has to move. So
-/// the property to check is not "the split is fair" — the assignors already
-/// prove that — but that the first member is never left holding nothing while
-/// the second joins.
+/// Each member now runs in its own task, which is what a group is anyway.
 #[test]
 #[ignore = "unfinished: the cooperative handover does not converge — see the doc comment"]
 fn cooperative_rebalancing_never_drops_everything() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     run(|| async {
         let topic = unique("coop");
         let group = unique("coopg");
         let mut prod = TestProducer::connect(&broker(), &topic).await;
         prod.create_topic_with_partitions(4).await;
 
-        // **Both consumers are connected before either joins.** Connecting is a
-        // round trip, and this client heartbeats only when polled — so doing it
-        // between the first member's assignment and the second's subscribe
-        // leaves the first silent for the whole of it.
-        let mut first = kestrel_glommio::Consumer::new(
-            kestrel_glommio::Glommio,
-            &bootstrap(),
-            "coop-1",
-            kestrel_core::IsolationLevel::ReadCommitted,
-        )
-        .await
-        .expect("consumer");
-        let mut second = kestrel_glommio::Consumer::new(
-            kestrel_glommio::Glommio,
-            &bootstrap(),
-            "coop-2",
-            kestrel_core::IsolationLevel::ReadCommitted,
-        )
-        .await
-        .expect("consumer");
-
-        for consumer in [&mut first, &mut second] {
-            consumer.set_max_wait(Duration::from_millis(100));
-            consumer.set_group_timeouts(Duration::from_secs(30), Duration::from_secs(20));
-        }
-
-        first
-            .subscribe(
-                &group,
-                vec![topic.clone()],
-                Box::new(kestrel_core::group::CooperativeStickyAssignor),
-                kestrel_glommio::EARLIEST,
+        // **One task per member, because that is what a group is.**
+        //
+        // Driving two members in lockstep — `zip(first.poll(), second.poll())` —
+        // deadlocks against the protocol: the joining member's `JoinGroup` is
+        // held until the whole group has rejoined, so the incumbent cannot take
+        // its turn to rejoin until the join it is blocking returns. The
+        // coordinator breaks the tie by evicting the member that never came
+        // back, and says so: "removed dynamic members who haven't joined".
+        // A real deployment has a member per process and never meets this.
+        async fn member(
+            id: &'static str,
+            group: String,
+            topic: String,
+            held: Rc<Cell<usize>>,
+            stop: Rc<Cell<bool>>,
+        ) {
+            let mut consumer = kestrel_glommio::Consumer::new(
+                kestrel_glommio::Glommio,
+                &bootstrap(),
+                id,
+                kestrel_core::IsolationLevel::ReadCommitted,
             )
             .await
-            .expect("subscribe");
+            .expect("consumer");
+            consumer.set_max_wait(Duration::from_millis(50));
+            consumer.set_group_timeouts(Duration::from_secs(30), Duration::from_secs(20));
+            consumer
+                .subscribe(
+                    &group,
+                    vec![topic],
+                    Box::new(kestrel_core::group::CooperativeStickyAssignor),
+                    kestrel_glommio::EARLIEST,
+                )
+                .await
+                .expect("subscribe");
 
-        for _ in 0..40 {
-            first.poll().await.expect("poll");
-            if first.assignments().count() == 4 {
+            while !stop.get() {
+                consumer.poll().await.expect("poll");
+                held.set(consumer.assignments().count());
+            }
+            let _ = consumer.unsubscribe().await;
+            held.set(0);
+        }
+
+        let stop = Rc::new(Cell::new(false));
+        let held_a = Rc::new(Cell::new(0));
+        let held_b = Rc::new(Cell::new(0));
+
+        let task_a = glommio::spawn_local(member(
+            "coop-1",
+            group.clone(),
+            topic.clone(),
+            Rc::clone(&held_a),
+            Rc::clone(&stop),
+        ))
+        .detach();
+
+        // Let the first member take everything before the second arrives, so
+        // this exercises a handover rather than a fresh split.
+        for _ in 0..100 {
+            if held_a.get() == 4 {
                 break;
             }
+            glommio::timer::sleep(Duration::from_millis(50)).await;
         }
-        assert_eq!(first.assignments().count(), 4, "the first member takes all four");
+        assert_eq!(held_a.get(), 4, "the first member should take all four");
 
-        second
-            .subscribe(
-                &group,
-                vec![topic.clone()],
-                Box::new(kestrel_core::group::CooperativeStickyAssignor),
-                kestrel_glommio::EARLIEST,
-            )
-            .await
-            .expect("subscribe");
+        let task_b = glommio::spawn_local(member(
+            "coop-2",
+            group.clone(),
+            topic.clone(),
+            Rc::clone(&held_b),
+            Rc::clone(&stop),
+        ))
+        .detach();
 
         // Settled, not merely non-zero: a handover passes through states where
         // one side holds nothing yet.
         let mut floor = 4usize;
         let mut stable_for = 0;
         for _ in 0..200 {
-            let _ = futures_lite::future::zip(first.poll(), second.poll()).await;
-            let a = first.assignments().count();
-            let b = second.assignments().count();
-            floor = floor.min(a);
+            let (a, b) = (held_a.get(), held_b.get());
+            if a > 0 {
+                floor = floor.min(a);
+            }
             if a + b == 4 && a > 0 && b > 0 {
                 stable_for += 1;
                 if stable_for >= 5 {
@@ -640,18 +596,18 @@ fn cooperative_rebalancing_never_drops_everything() {
             } else {
                 stable_for = 0;
             }
+            glommio::timer::sleep(Duration::from_millis(50)).await;
         }
 
-        let a = first.assignments().count();
-        let b = second.assignments().count();
+        let (a, b) = (held_a.get(), held_b.get());
+        stop.set(true);
+        let _ = futures_lite::future::zip(task_a, task_b).await;
+
         assert_eq!(a + b, 4, "every partition must be held by exactly one: {a} + {b}");
         assert!(a > 0 && b > 0, "the four should be shared: {a} + {b}");
         assert!(
             floor > 0,
             "the incumbent dropped to zero partitions — that is an eager rebalance"
         );
-
-        first.unsubscribe().await.expect("leave 1");
-        second.unsubscribe().await.expect("leave 2");
     });
 }
