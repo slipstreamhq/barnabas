@@ -657,7 +657,7 @@ fn committed_reports_only_what_was_committed() {
         }
         assert_eq!(read, 3);
 
-        let before = consumer.committed(&[p0.clone()]).await.expect("committed");
+        let before = consumer.committed(std::slice::from_ref(&p0)).await.expect("committed");
         assert!(before.is_empty(), "nothing committed yet: {before:?}");
 
         consumer.commit().await.expect("commit");

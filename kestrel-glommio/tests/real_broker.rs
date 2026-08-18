@@ -627,7 +627,7 @@ fn pausing_stops_a_partition_without_losing_its_place() {
         assert!(read > 0);
         let position = consumer.position_of(&topic, 0).expect("a position");
 
-        consumer.pause(&[p0.clone()]);
+        consumer.pause(std::slice::from_ref(&p0));
         assert!(consumer.is_paused(&topic, 0));
         for _ in 0..3 {
             let batch = consumer.poll().await.expect("poll while paused");
