@@ -737,6 +737,45 @@ impl<T: Transport> Cluster<T> {
         Ok(())
     }
 
+    /// Refresh brokers and the controller **without** naming a topic.
+    ///
+    /// An empty topic list is not the same as no topic list: `None` asks for
+    /// every topic in the cluster, which on a large cluster is a large answer
+    /// for information this does not want.
+    ///
+    /// # Errors
+    /// If no broker answers.
+    pub async fn refresh_cluster(&mut self) -> Result<()> {
+        let mut req = MetadataRequest::default();
+        req.topics = Some(Vec::new());
+        req.allow_auto_topic_creation = false;
+        let resp: MetadataResponse = self.call_any(ApiKey::Metadata, 12, &req).await?;
+        self.metadata.update(&resp);
+        Ok(())
+    }
+
+    /// The controller's address, refreshing if it is unknown.
+    ///
+    /// # Errors
+    /// If metadata cannot be refreshed, or no controller is elected — which
+    /// happens briefly during a controller election and is a wait, not a
+    /// failure, so callers retry it.
+    pub async fn controller_addr(&mut self) -> Result<String> {
+        if let Some(broker) = self.metadata.controller() {
+            return Ok(broker.addr());
+        }
+        self.refresh_cluster().await?;
+        self.metadata
+            .controller()
+            .map(kestrel_core::metadata::BrokerAddr::addr)
+            .ok_or(Error::Missing("a controller"))
+    }
+
+    /// Forget which broker is the controller, after it said it is not.
+    pub fn invalidate_controller(&mut self) {
+        self.metadata.invalidate_controller();
+    }
+
     /// The address of `topic`/`partition`'s leader, refreshing if unknown.
     ///
     /// # Errors

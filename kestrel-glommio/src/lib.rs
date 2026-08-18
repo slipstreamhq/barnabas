@@ -25,7 +25,7 @@ pub mod tls;
 
 pub use kestrel_client::producer::CompressionCodec;
 pub use kestrel_client::{
-    Error, ConsumerRecords, GroupMetadata, ProducerRecord, RebalanceListener, RecordRef, Result,
+    BrokerInfo, Error, ConsumerRecords, GroupMetadata, NewTopic, ProducerRecord, RebalanceListener, RecordRef, Result,
     EARLIEST, LATEST,
 };
 pub use kestrel_core::{Disposition, ErrorCode, IsolationLevel, Partitioner};
@@ -85,3 +85,6 @@ pub type Consumer = kestrel_client::Consumer<Glommio>;
 
 /// An idempotent, optionally transactional producer on this core.
 pub type Producer = kestrel_client::Producer<Glommio>;
+
+/// The admin client on glommio. See [`kestrel_client::admin`].
+pub type Admin = kestrel_client::Admin<Glommio>;

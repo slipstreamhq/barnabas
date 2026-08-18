@@ -46,6 +46,12 @@ pub type PartitionKey = (String, i32);
 pub struct Metadata {
     brokers: HashMap<i32, BrokerAddr>,
     leaders: HashMap<PartitionKey, i32>,
+    /// The node id of the controller, if the last response named one.
+    ///
+    /// Only the controller serves topic creation and deletion; every other
+    /// broker answers `NOT_CONTROLLER`. It moves on election, so it is stored
+    /// as an id and resolved through `brokers` at the moment of use.
+    controller: Option<i32>,
 }
 
 impl Metadata {
@@ -62,6 +68,10 @@ impl Metadata {
     /// recorded as leaderless — an error means "ask again", and writing it down
     /// would cache the failure.
     pub fn update(&mut self, resp: &MetadataResponse) {
+        // -1 is "no controller known", which is not the same as node -1.
+        if resp.controller_id.0 >= 0 {
+            self.controller = Some(resp.controller_id.0);
+        }
         for broker in &resp.brokers {
             self.brokers.insert(
                 broker.node_id.0,
@@ -103,6 +113,17 @@ impl Metadata {
     #[must_use]
     pub fn broker(&self, node_id: i32) -> Option<&BrokerAddr> {
         self.brokers.get(&node_id)
+    }
+
+    /// The controller, if one has been named and its address is known.
+    #[must_use]
+    pub fn controller(&self) -> Option<&BrokerAddr> {
+        self.brokers.get(&self.controller?)
+    }
+
+    /// Forget which broker is the controller, after it said it is not.
+    pub fn invalidate_controller(&mut self) {
+        self.controller = None;
     }
 
     /// Forget one partition's leader, leaving the rest of the map alone.

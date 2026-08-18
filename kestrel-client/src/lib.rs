@@ -38,6 +38,7 @@ use std::time::Duration;
 
 pub mod cluster;
 pub mod sasl;
+pub mod admin;
 pub mod builder;
 pub mod group;
 mod join;
@@ -45,6 +46,7 @@ mod timeout;
 pub mod consumer;
 pub mod producer;
 
+pub use admin::{Admin, BrokerInfo, NewTopic};
 pub use cluster::Cluster;
 pub use sasl::{Credentials, SaslMechanism};
 pub use builder::{ConsumerBuilder, ProducerBuilder, StartOffset};
