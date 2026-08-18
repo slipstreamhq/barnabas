@@ -5,12 +5,16 @@ including thread-per-core ones, which is what it was built for.
 
 **Working name, and early.** Nothing here is published and the API will change.
 
-> **Consumer groups work**: `subscribe`, rebalancing, committed offsets, auto-commit and
-> rebalance callbacks. Two gaps to know about before choosing this client:
-> **heartbeats only go out when you `poll`** (see below), and **only eager rebalancing** —
-> the `cooperative-sticky` assignor exists and is unit-tested, but the handover it drives does
-> not converge yet, so do not use it. Remaining work is scoped in
-> [`docs/completing-the-client.md`](docs/completing-the-client.md).
+> **The client is feature-complete** against the plan in
+> [`docs/completing-the-client.md`](docs/completing-the-client.md): consumer groups with eager
+> *and* cooperative rebalancing, exactly-once across a group, an admin client, a producing
+> accumulator, and partition-expansion detection.
+>
+> One behaviour to know before choosing it: **heartbeats only go out when you `poll`**, because
+> this client spawns nothing. See [Groups](#who-decides-which-partitions-you-read).
+>
+> Not implemented, deliberately: KIP-848 server-side assignment (the seam is there), static
+> membership (KIP-345), Kerberos/GSSAPI, and a configuration-string API.
 
 Design and sequencing:
 `../docs/superpowers/specs/2026-08-15-native-kafka-client-design.md`.
@@ -38,8 +42,8 @@ kestrel-tokio   (67)    connect, read, write, sleep.
 
 Those line counts are the load-bearing part. A binding supplies four functions and a handful of
 type aliases; **all protocol code is shared**, so the two runtimes cannot drift and a fix cannot
-land in one and not the other. The same broker suite — 6 consumer tests, 8 producer tests — runs
-against both.
+land in one and not the other. The same broker suite runs against both — 12 consumer, 16 producer,
+7 group and 7 admin tests, on top of 151 that need no broker at all.
 
 The core names no runtime, so there is nothing to abstract over and no `Send` bound forced by a
 lowest-common-denominator trait. The *binding* decides `Send`-ness, which is how one state machine
@@ -228,17 +232,35 @@ bound them*.
 .assign("events", 3, StartOffset::At(checkpoint.offset_for(3)))
 ```
 
-**Two things to know about the group implementation:**
+**Four assignors**, and picking one picks the rebalancing protocol with it,
+because they are the same choice:
 
-- **Heartbeats go out when you `poll`.** This client spawns nothing, so there is
-  no background thread sending them. A caller that spends longer than
-  `session.timeout.ms` between polls is removed from the group — Java avoids
-  this with a heartbeat thread and a separate `max.poll.interval.ms`. Call
-  [`Consumer::heartbeat`] from your own task if your processing can outlast the
-  session timeout.
-- **Rebalancing is eager**: on a rebalance every partition is given up and
-  reassigned. `cooperative-sticky`, which moves only what has to move, is not
-  implemented yet.
+| assignor | rebalancing | what it does |
+|---|---|---|
+| `RangeAssignor` | eager | Java's default: contiguous ranges per topic |
+| `RoundRobinAssignor` | eager | spread across all topics |
+| `StickyAssignor` | eager | balanced first, then minimal movement |
+| `CooperativeStickyAssignor` | **cooperative** (KIP-429) | revokes only what must move |
+
+The first two match Java 3.9.0 byte-for-byte across the oracle cases in
+`docs/Oracle.java`. Cooperative rebalancing means a member keeps reading the
+partitions nobody is taking, instead of the whole group stopping while
+everything is handed back and redealt.
+
+**Heartbeats go out when you `poll`.** This client spawns nothing, so there is
+no background thread sending them. A caller that spends longer than
+`session.timeout.ms` between polls is removed from the group — Java avoids this
+with a heartbeat thread and a separate `max.poll.interval.ms`. Call
+`Consumer::heartbeat` from your own task if your processing can outlast the
+session timeout.
+
+Rebalance callbacks run where you would expect, and revocation is reported
+before the partitions move:
+
+```rust
+consumer.set_rebalance_listener(Box::new(MyListener));   // on_assigned / on_revoked
+consumer.set_group_timeouts(Duration::from_secs(30), Duration::from_secs(60));
+```
 
 ### Consume
 
@@ -339,6 +361,129 @@ give each parallel instance its own — and only one process may hold one at a
 time. Two initialisations of the same id is always a bug, and its symptom
 appears later and elsewhere, as a failed commit.
 
+### Exactly-once across a consumer group
+
+Consume, transform, produce — with the input offsets committing **inside** the
+producer's transaction, so a crash between producing and committing replays the
+input rather than losing the output.
+
+```rust
+let records = consumer.poll().await?;
+producer.begin_transaction()?;
+producer.send_keyed("output", &transformed).await?;
+
+// After producing, before committing: these offsets account for that output.
+producer
+    .send_offsets_to_transaction(&consumer.positions(), &consumer.group_metadata().unwrap())
+    .await?;
+producer.commit_transaction().await?;
+```
+
+`group_metadata()` carries the member id and the fencing token the coordinator
+checks (KIP-447), so a member that has already been replaced cannot commit. Its
+fields are deliberately not readable: naming a *generation* above the protocol
+seam is precisely what KIP-848 changes, so the only thing a caller does with one
+is pass it along. It is `None` unless the member is stable, and it must be
+re-read per transaction.
+
+Java and librdkafka both take the offsets from the caller too — the producer
+holds no reference to the consumer, and a transaction's offsets are not always
+"everything read so far".
+
+### Producing one record at a time
+
+`send` and `send_keyed` send what you give them. `produce` accumulates:
+
+```rust
+producer.set_linger(Duration::from_millis(5));
+producer.set_batch_size(32 * 1024);          // default 16 KiB, as in Java
+
+for event in events {
+    producer.produce("events", record(event)).await?;   // batches on your behalf
+}
+producer.flush().await?;
+```
+
+A batch goes out when it fills or its linger expires. **The clock is only read
+when the producer is called**, because nothing runs in the background here — so
+a steady stream sends itself, and an idle producer holds its last partial batch
+until `flush` or `tick`. An event loop with nothing else to do sleeps until
+`linger_deadline()` and then calls `tick()`; the timer is the caller's, because
+the tasks are.
+
+### Pausing, offsets and lag
+
+```rust
+let p3 = TopicPartition::new("events", 3);
+consumer.pause(&[p3.clone()]);                // still assigned, still heartbeating
+consumer.resume(&[p3]);                       // carries on from where it stopped
+
+let ends  = consumer.end_offsets(&partitions).await?;
+let start = consumer.beginning_offsets(&partitions).await?;
+let at    = consumer.offsets_for_times(&[(TopicPartition::new("events", 0), when)]).await?;
+let lag   = consumer.lag().await?;
+let done  = consumer.committed(&partitions).await?;
+```
+
+All of them share one batched `ListOffsets`: **one request per leader**, not per
+partition, so this on a 64-partition assignment is one or two round trips.
+
+Two absences are deliberate, and match Java. A partition with no record at or
+after its timestamp is **absent** from `offsets_for_times` rather than present
+with a sentinel; a partition with no position is **absent** from `lag` rather
+than zero. "Unknown" and "zero" are different answers, and an alert built on the
+second one stays quiet through a consumer that never started.
+
+### Administering a cluster
+
+```rust
+let mut admin = Admin::connect(Glommio, &brokers, "my-tool").await?;
+
+admin.create_topics(&[NewTopic::new("events", 8, 3).with_config("retention.ms", "604800000")]).await?;
+admin.create_partitions("events", 16).await?;    // the new *total*, not a delta
+let brokers = admin.describe_cluster().await?;   // and which one is the controller
+let config  = admin.describe_topic_config("events").await?;
+admin.delete_records(&[(TopicPartition::new("events", 0), 1_000)]).await?;
+admin.delete_topics(&["events".to_owned()]).await?;
+```
+
+Enough to write a test suite and an operational tool without a second client;
+librdkafka's admin surface is much larger and this is not trying to match it.
+
+`create_topics` and `create_partitions` return when the change is **visible**,
+not when the controller accepted it. The two are seconds apart, and a producer
+that writes in between gets "no leader" for a topic that certainly exists.
+
+`TOPIC_ALREADY_EXISTS` is an error rather than a silent success — a caller who
+wants create-if-absent can ignore that code, and a caller who does not want it
+and never learns is the one producing into the wrong partition count.
+
+### When a topic grows partitions
+
+Kafka topics gain partitions at runtime and never lose them. A client holding a
+stale count keeps hashing keys against a number that no longer exists, and a
+consumer holding a fixed assignment never reads the new partitions at all —
+silently, because nothing errors and `lag` only covers what is assigned.
+
+```rust
+consumer.set_metadata_max_age(Duration::from_secs(60));   // 5 minutes by default
+
+for (topic, before, after) in consumer.take_expansions() {
+    tracing::warn!(%topic, before, after, "topic grew; extend the assignment");
+}
+```
+
+- A **subscribed** consumer rejoins its group, and the leader assigns the new
+  partitions. Nothing to do.
+- A **manually assigned** one is told, and never extended behind your back. Java
+  does not extend a manual assignment either, and it should not — but a caller
+  who is never *told* cannot decide.
+- A **producer** re-reads the count on the same schedule, so its keyed placement
+  stops disagreeing with every other producer.
+
+Only growth is acted on. A count that dipped would be a broker mid-election, and
+moving every key on it would be worse than the stale count.
+
 ### The same program on tokio
 
 ```rust
@@ -388,7 +533,7 @@ complete example at 67 lines, and nothing above the transport needs to change.
 
 | | |
 |---|---|
-| **Consumer, assign-only** | works — `ApiVersions`, `Metadata`, `ListOffsets`, `Fetch`, seek, READ_COMMITTED filtering |
+| **Consumer** | works, by group *or* by hand — `ApiVersions`, `Metadata`, `ListOffsets`, `Fetch`, seek, READ_COMMITTED filtering |
 | **Producer** | idempotent and transactional — sequencing, coordinator routing, zombie fencing, keyed partitioning. **One `Produce` per broker**, not per partition; enrollment likewise |
 | **Compression** | gzip, snappy, lz4, zstd — round-tripped against a real broker, both directions |
 | **Leader routing, metadata cache** | works — fetches go to the leader from the cluster map, `NOT_LEADER_OR_FOLLOWER` invalidates that partition and retries |
@@ -397,7 +542,12 @@ complete example at 67 lines, and nothing above the transport needs to change.
 | **Connection recovery** | a closed connection is evicted and redialled once; a request that outlives its deadline drops its connection, because the late response would desynchronise the stream |
 | **TLS** | opt-in `tls` feature on either binding. A second `Transport`, so `Consumer<GlommioTls>` is the same client over a different socket — the shared code needed no change at all |
 | **SASL** | PLAIN and SCRAM-SHA-256/512. Shared, since the handshake is protocol |
-| **Consumer groups** | **out of scope** — callers assign partitions themselves |
+| **Consumer groups** | `subscribe`, four assignors, **eager and cooperative** rebalancing (KIP-429), auto-commit, rebalance callbacks, `committed`. KIP-848 sits behind a seam, unimplemented |
+| **Exactly-once with groups** | `send_offsets_to_transaction` — `AddOffsetsToTxn` to the transaction coordinator, `TxnOffsetCommit` to the group coordinator, with KIP-447 fencing |
+| **Admin** | create/delete topics, expand partitions, describe cluster and topic configs, delete records. Controller-routed, and it re-discovers the controller on `NOT_CONTROLLER` |
+| **Accumulator** | `produce` batches per partition with `linger` and `batch_size`. No background task: `tick`/`linger_deadline` hand the timer to the caller |
+| **Topic expansion** | detected on a metadata age (`metadata.max.age.ms`'s five minutes): groups rejoin, manual assignments are reported to the caller, producers re-place keys |
+| **Pause/resume, offset lookups** | `pause`/`resume`, `end_offsets`, `beginning_offsets`, `offsets_for_times`, `lag` — one batched `ListOffsets` per leader |
 
 ## Performance
 
@@ -425,14 +575,20 @@ cargo run -p kestrel-bench --release        # needs a broker
 ## Tests
 
 ```sh
-cargo test                                        # 89 tests, no broker, no runtime
+cargo test                                        # 151 tests, no broker, no runtime
 cargo test -p kestrel-glommio -- --ignored --test-threads=1   # needs a broker
 cargo test -p kestrel-tokio   -- --ignored --test-threads=1   # the same suite, other runtime
 ```
 
-The broker tests need a single-node Kafka; the invocation is at the top of
-`kestrel-glommio/tests/real_broker.rs`. Note that `__transaction_state` defaults to replication
-factor 3, so a single-node broker needs it overridden or every transaction fails with error 15.
+The broker tests need Kafka; the invocation is at the top of
+`kestrel-glommio/tests/real_broker.rs`, and `./cluster.sh up` brings up a suitable one. Note that
+`__transaction_state` defaults to replication factor 3, so a single-node broker needs it overridden
+or every transaction fails with error 15.
+
+The broker suite is in four files: `real_broker.rs` (consuming, seeking, filtering, pausing,
+offsets), `real_broker_producer.rs` (idempotence, transactions, EOS with groups, the accumulator),
+`real_broker_group.rs` (membership, rebalancing, commit and resume) and `real_broker_admin.rs`
+(topics, configs, expansion).
 
 ## Security defaults
 
@@ -470,6 +626,27 @@ they do:
 - **Metadata requests ask for topic auto-creation**, as librdkafka and Java do, and
   `UNKNOWN_TOPIC_OR_PARTITION` refreshes rather than failing: a topic being created reports it for
   a moment.
+- **`ConsumerProtocol` blobs need a version prefix.** Kafka's `serializeSubscription` writes an
+  int16 version and *then* the struct; the generated type is only the struct. Without the prefix
+  the coordinator accepted the `JoinGroup`, logged `Preparing to rebalance`, and then held the
+  request until the rebalance timeout — no error, no response.
+- **Read the broker's log before inferring from the client side.** Five rounds of client-side
+  reasoning fixed five real bugs and never touched the cause of the symptom. One coordinator DEBUG
+  line ended it: `removed dynamic members who haven't joined`. Start a broker with
+  `KAFKA_LOG4J_LOGGERS="kafka.coordinator.group=DEBUG"` and read it beside `KESTREL_TRACE=1`.
+- **A group cannot be driven in lockstep.** Polling two members from one loop deadlocks against the
+  protocol: the joining member's `JoinGroup` is held until the whole group has rejoined, so the
+  incumbent cannot take its turn until the join it is blocking returns. A member is a process; in
+  tests, a member is a task.
+- **Accepted is not visible.** `CreateTopics` returning success means the controller wrote it down,
+  not that any other broker knows. So does `CreatePartitions`, and so does a `DescribeConfigs` sent
+  a moment later, which answers `UNKNOWN_TOPIC_OR_PARTITION` for a topic that certainly exists.
+- **Metadata that is merely stale is invisible.** Refreshing only when something is *missing* never
+  notices a topic that grew partitions — every leader still known, every answer still wrong. Age is
+  the only thing that catches it.
+- **Count partitions from the response, not from known leaders.** A `MetadataResponse` lists every
+  partition whether or not each has a leader right now, so counting leaders undercounts during an
+  election — and a count that dips looks exactly like a topic that shrank, which Kafka never does.
 - **Error codes are states, not failures.** A cold cluster answers 15, then 14, then 16 — the last
   *after* a successful `FindCoordinator`. `CONCURRENT_TRANSACTIONS` (51) appears whenever a
   transaction starts right after one ends. See `ErrorCode::disposition`.

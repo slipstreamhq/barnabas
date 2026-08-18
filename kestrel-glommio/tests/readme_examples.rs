@@ -127,3 +127,189 @@ fn readme_builder() {
                 .expect("producer");
         });
 }
+
+#[allow(dead_code)]
+fn readme_groups() {
+    glommio::LocalExecutorBuilder::default()
+        .make()
+        .expect("executor")
+        .run(async {
+            let mut consumer =
+                Consumer::new(Glommio, &brokers(), "my-app", IsolationLevel::ReadCommitted)
+                    .await
+                    .expect("consumer");
+            consumer
+                .subscribe(
+                    "my-group",
+                    vec!["events".into()],
+                    Box::new(kestrel_core::group::CooperativeStickyAssignor),
+                    EARLIEST,
+                )
+                .await
+                .expect("subscribe");
+            consumer.set_auto_commit(Some(std::time::Duration::from_secs(5)));
+            consumer.set_group_timeouts(
+                std::time::Duration::from_secs(30),
+                std::time::Duration::from_secs(60),
+            );
+
+            for batch in consumer.poll().await.expect("poll") {
+                for record in batch.iter() {
+                    let _ = record.value();
+                }
+            }
+        });
+}
+
+#[allow(dead_code)]
+fn readme_exactly_once_with_a_group() {
+    glommio::LocalExecutorBuilder::default()
+        .make()
+        .expect("executor")
+        .run(async {
+            let mut consumer =
+                Consumer::new(Glommio, &brokers(), "my-app", IsolationLevel::ReadCommitted)
+                    .await
+                    .expect("consumer");
+            let mut producer =
+                Producer::transactional(Glommio, &brokers(), "my-app", "my-app-sink-0")
+                    .await
+                    .expect("producer");
+            let transformed = vec![ProducerRecord::new(None, Some(Bytes::from("out")))];
+
+            let _records = consumer.poll().await.expect("poll");
+            producer.begin_transaction().expect("begin");
+            producer
+                .send_keyed("output", &transformed)
+                .await
+                .expect("send");
+
+            producer
+                .send_offsets_to_transaction(
+                    &consumer.positions(),
+                    &consumer.group_metadata().unwrap(),
+                )
+                .await
+                .expect("offsets");
+            producer.commit_transaction().await.expect("commit");
+        });
+}
+
+#[allow(dead_code)]
+fn readme_accumulator() {
+    glommio::LocalExecutorBuilder::default()
+        .make()
+        .expect("executor")
+        .run(async {
+            let mut producer = Producer::idempotent(Glommio, &brokers(), "my-app")
+                .await
+                .expect("producer");
+            producer.set_linger(std::time::Duration::from_millis(5));
+            producer.set_batch_size(32 * 1024);
+
+            for i in 0..10 {
+                producer
+                    .produce(
+                        "events",
+                        ProducerRecord::new(None, Some(Bytes::from(format!("{i}")))),
+                    )
+                    .await
+                    .expect("produce");
+            }
+            producer.flush().await.expect("flush");
+
+            if let Some(_deadline) = producer.linger_deadline() {
+                producer.tick().await.expect("tick");
+            }
+        });
+}
+
+#[allow(dead_code)]
+fn readme_pausing_and_offsets() {
+    use kestrel_core::group::TopicPartition;
+
+    glommio::LocalExecutorBuilder::default()
+        .make()
+        .expect("executor")
+        .run(async {
+            let mut consumer =
+                Consumer::new(Glommio, &brokers(), "my-app", IsolationLevel::ReadCommitted)
+                    .await
+                    .expect("consumer");
+            let partitions = vec![TopicPartition::new("events", 0)];
+            let when = 0i64;
+
+            let p3 = TopicPartition::new("events", 3);
+            consumer.pause(&[p3.clone()]);
+            consumer.resume(&[p3]);
+
+            let _ends = consumer.end_offsets(&partitions).await.expect("end");
+            let _start = consumer
+                .beginning_offsets(&partitions)
+                .await
+                .expect("beginning");
+            let _at = consumer
+                .offsets_for_times(&[(TopicPartition::new("events", 0), when)])
+                .await
+                .expect("times");
+            let _lag = consumer.lag().await.expect("lag");
+            let _done = consumer.committed(&partitions).await.expect("committed");
+        });
+}
+
+#[allow(dead_code)]
+fn readme_admin() {
+    use kestrel_core::group::TopicPartition;
+    use kestrel_glommio::{Admin, NewTopic};
+
+    glommio::LocalExecutorBuilder::default()
+        .make()
+        .expect("executor")
+        .run(async {
+            let mut admin = Admin::connect(Glommio, &brokers(), "my-tool")
+                .await
+                .expect("admin");
+
+            admin
+                .create_topics(&[
+                    NewTopic::new("events", 8, 3).with_config("retention.ms", "604800000")
+                ])
+                .await
+                .expect("create");
+            admin
+                .create_partitions("events", 16)
+                .await
+                .expect("expand");
+            let _brokers = admin.describe_cluster().await.expect("cluster");
+            let _config = admin
+                .describe_topic_config("events")
+                .await
+                .expect("config");
+            admin
+                .delete_records(&[(TopicPartition::new("events", 0), 1_000)])
+                .await
+                .expect("trim");
+            admin
+                .delete_topics(&["events".to_owned()])
+                .await
+                .expect("delete");
+        });
+}
+
+#[allow(dead_code)]
+fn readme_topic_expansion() {
+    glommio::LocalExecutorBuilder::default()
+        .make()
+        .expect("executor")
+        .run(async {
+            let mut consumer =
+                Consumer::new(Glommio, &brokers(), "my-app", IsolationLevel::ReadCommitted)
+                    .await
+                    .expect("consumer");
+            consumer.set_metadata_max_age(std::time::Duration::from_secs(60));
+
+            for (topic, before, after) in consumer.take_expansions() {
+                eprintln!("{topic} grew from {before} to {after}");
+            }
+        });
+}

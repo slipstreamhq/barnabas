@@ -1,5 +1,11 @@
 # Completing the client
 
+> **Done.** Every phase below is implemented and tested against a real broker.
+> The document is kept as the record of what was decided and why — the ordering
+> of the phases, and the things deliberately left out, are the parts still worth
+> reading. What is *left* out is listed under
+> [Not planned](#not-planned-and-worth-saying-so).
+
 ## The goal
 
 **Kestrel is a general-purpose Kafka client, and a user with Kafka experience
@@ -22,12 +28,19 @@ double the surface it would have to be applied to.
 | `poll` | `poll` | ✅ renamed from `fetch` |
 | `assign` | `assign` | ✅ renamed from `add`; the old `Consumer::assign` constructor is now `for_partition` |
 | `ConsumerRecords` | `ConsumerRecords` | ✅ renamed from `FetchedRecords` |
-| `subscribe` | *absent* | Phase 1 |
-| `commitSync` / `commitAsync` | *absent* | Phase 1 |
+| `subscribe` | `subscribe` | ✅ |
+| `commitSync` / `commitAsync` | `commit` / `set_auto_commit` | ✅ |
+| `pause` / `resume` | `pause` / `resume` | ✅ |
+| `endOffsets` / `beginningOffsets` | `end_offsets` / `beginning_offsets` | ✅ |
+| `offsetsForTimes` | `offsets_for_times` | ✅ |
+| `committed` | `committed` | ✅ |
+| `sendOffsetsToTransaction` | `send_offsets_to_transaction` | ✅ |
+| `AdminClient` | `Admin` | ✅ a deliberate subset |
 | `auto.offset.reset` | `StartOffset` | keep — typed, and the mapping is obvious |
 | `isolation.level` | `IsolationLevel` | already matches |
-| `max.poll.records` | *absent* | Phase 3 |
-| `linger.ms` | *absent* | Phase 3 — there is no accumulator at all |
+| `max.poll.records` | *absent* | a batch per poll is the throughput; see below |
+| `linger.ms` | `set_linger` | ✅ with `set_batch_size` (`batch.size`) |
+| `metadata.max.age.ms` | `set_metadata_max_age` | ✅ same default, five minutes |
 | `enable.idempotence` | always on | keep, and say why: off is how records get duplicated |
 
 Two decisions belong with it:
@@ -41,7 +54,7 @@ Two decisions belong with it:
   to be discovered: a batch per `poll` rather than a record at a time (it is
   most of the consume throughput), and no ambient runtime.
 
-## Topic expansion, which is not a group problem
+## ~~Topic expansion, which is not a group problem~~ — done
 
 A topic is usually created and produced by another team. You do not choose its
 partition count and you are not told when it changes — and **adding partitions
@@ -54,10 +67,22 @@ consumer looks healthy while missing a share of its input.
 Kafka's group protocol handles this incidentally — the coordinator reassigns on
 a metadata change — which is an advantage of groups that has nothing to do with
 coordinating instances. But the assign-only layer needs its own answer, because
-it will outlive this gap:
+it will outlive this gap.
 
-- a metadata watch, or a `partition_count` poll the caller drives
-- an explicit signal when the count changes, rather than a silent difference
+**What was built:** metadata is age-stamped, `set_metadata_max_age` defaulting to
+five minutes as `metadata.max.age.ms` does. A subscribed consumer rejoins its
+group and the leader assigns the new partitions; a manually assigned one is told
+through `take_expansions` and never extended behind the caller's back; a
+producer's keyed placement re-reads the count on the same schedule, so it stops
+disagreeing with every producer that has fresh metadata.
+
+Only growth is acted on. Kafka has no operation that removes partitions from a
+live topic, so a smaller count is a transient answer — a broker mid-election, a
+topic mid-creation — and moving every key on it would be worse than the stale
+count. `Metadata::partition_count` was changed to count the *response* rather
+than known leaders for the same reason: a response lists every partition whether
+or not each has a leader right now, so the count no longer dips during an
+election and cannot be misread as a shrink.
 - `assign_all` documented as *all of them as of now* until then
 
 ## What "parity" should and should not mean
@@ -203,14 +228,43 @@ all of them) and static membership, KIP-345.
 Kerberos/GSSAPI, interceptors, and a configuration-string API. A caller wanting
 librdkafka's full surface should use librdkafka.
 
-## What this costs
+Three more, each for a stated reason rather than for want of time:
 
-The group protocol is the largest single piece of a Kafka client — larger than
-the transactional producer already built here. It is months, not weeks, and the
-failure modes are silent: a fencing bug duplicates records, and a rebalance bug
-loses them. The correctness apparatus already in this workspace is the reason to
-believe it is tractable — the sans-io core, the scripted broker, the TLA+ model
-of the producer window. Groups should arrive with the same three.
+- **KIP-848 server-side assignment.** The seam is built and the classic protocol
+  sits behind it; version negotiation already reveals whether a broker offers
+  `ConsumerGroupHeartbeat`, so this can be selected automatically later without
+  a configuration knob.
+- **Static membership (KIP-345).** `group.instance.id` is on the wire and always
+  `None`.
+- **Broker configs in `Admin`.** A broker config must be asked of *that* broker,
+  and a wrapper hiding the routing would return one broker's answer for all of
+  them. Topic configs have no such ambiguity and are exposed.
+- **`max.poll.records`.** A batch per `poll` is most of the consume throughput —
+  see `PERF.md` — and capping it per call would trade that away for a knob whose
+  purpose in Java is bounding `max.poll.interval.ms`, which this client does not
+  have.
+
+## What this cost
+
+Written before the work as an estimate: *"the largest single piece of a Kafka
+client — larger than the transactional producer already built here. Months, not
+weeks, and the failure modes are silent: a fencing bug duplicates records, and a
+rebalance bug loses them."*
+
+The failure modes were as advertised. The cooperative handover took six fixes,
+five of them genuine protocol bugs — a subscription blob written at v1 so it
+could not carry a generation, two paths that cleared the generation on rejoin, a
+generation filter applied to the withholding decision as well as the target, and
+a rejoin that took one protocol step per `poll` where Java loops. Every one of
+them presented as the same symptom: both members holding every partition.
+
+The sixth was in the test, and it is the lesson worth keeping: **a group cannot
+be driven in lockstep**. The coordinator holds a joining member's `JoinGroup`
+until the whole group has rejoined, so an incumbent polled in the same loop
+cannot take its turn until the join it is blocking returns. What ended it was
+not more client-side reasoning — five rounds of that fixed five real bugs and
+never touched the cause — but one line of the coordinator's own DEBUG log:
+`removed dynamic members who haven't joined`. Read the broker's log early.
 
 ## Sequencing
 
@@ -236,13 +290,14 @@ librdkafka on every cell measured, and what remains are features, not speed.
 
 ## Slipstream, afterwards
 
-Two questions to answer once the client is complete, not before:
+The client is complete, so these are now the open questions:
 
 - Does Slipstream keep `assign` — its control plane genuinely does own
   placement, and a group would be a second authority — or adopt groups and
   retire that part of the control plane?
-- Either way it needs topic-expansion detection, which is why that item is not
-  filed under groups.
+- Topic-expansion detection is done either way, which is why it was never filed
+  under groups. If Slipstream keeps `assign`, `take_expansions` is the signal it
+  needs.
 
 The open correctness item there is the fenced-sink bug in its recovery path,
 which is not this client's.
