@@ -80,7 +80,7 @@ fn a_topic_can_be_created_described_expanded_and_deleted() {
         assert_eq!(admin.cluster().metadata().partition_count(&topic), 4);
 
         admin
-            .delete_topics(&[topic.clone()])
+            .delete_topics(std::slice::from_ref(&topic))
             .await
             .expect("delete");
 
