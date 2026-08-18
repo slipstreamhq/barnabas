@@ -8,7 +8,7 @@
 
 ## The goal
 
-**Kestrel is a general-purpose Kafka client, and a user with Kafka experience
+**Barnabas is a general-purpose Kafka client, and a user with Kafka experience
 should be immediately at home.** Familiar names, familiar semantics, familiar
 defaults. Group semantics are central, not optional.
 
@@ -23,7 +23,7 @@ use a different word for the same idea we cost them a lookup and gain nothing.
 This should be settled **before** the group work, not after, because groups
 double the surface it would have to be applied to.
 
-| what a Kafka user calls it | kestrel | state |
+| what a Kafka user calls it | barnabas | state |
 |---|---|---|
 | `poll` | `poll` | ✅ renamed from `fetch` |
 | `assign` | `assign` | ✅ renamed from `add`; the old `Consumer::assign` constructor is now `for_partition` |

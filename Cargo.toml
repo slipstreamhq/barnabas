@@ -4,7 +4,7 @@
 # `docs/superpowers/specs/2026-08-15-native-kafka-client-design.md`.
 [workspace]
 resolver = "2"
-members = ["kestrel-core", "kestrel-client", "kestrel-glommio", "kestrel-tokio", "kestrel-bench"]
+members = ["barnabas-core", "barnabas-client", "barnabas-glommio", "barnabas-tokio", "barnabas-bench"]
 
 [workspace.package]
 version = "0.0.1"

@@ -8,7 +8,7 @@
 #
 # Runs inside a container on the cluster's network (`./cluster.sh up` first), so
 # it reaches the brokers by their internal listeners and pays no more for the
-# network than `kestrel-bench` does over loopback.
+# network than `barnabas-bench` does over loopback.
 #
 #   ./java-bench.sh            against the Kafka cluster
 #   ./java-bench.sh redpanda   against the Redpanda cluster
@@ -16,14 +16,14 @@
 #
 # **Fairness**: the Java producer is given its best configuration, not its
 # defaults — `linger.ms=0`, a large `batch.size`, five in flight — for the same
-# reason `kestrel-bench` gives librdkafka its best. PERF.md records what
+# reason `barnabas-bench` gives librdkafka its best. PERF.md records what
 # happened the one time that was not done. It is also given far more records
 # than our own cells use, so the JIT is warm before the number is taken; a cold
 # JVM measures the JVM, not the client.
 set -euo pipefail
 
 IMAGE="${KAFKA_IMAGE:-docker.io/apache/kafka:3.9.0}"
-NET=kestrel-net
+NET=barnabas-net
 FLAVOUR="${1:-kafka}"
 PARTITIONS=8
 
@@ -90,7 +90,7 @@ consume_cell() {
 
 # N concurrent producers against one topic, rates summed.
 #
-# The counterpart to `kestrel-bench`'s many-core cell. One producer per process
+# The counterpart to `barnabas-bench`'s many-core cell. One producer per process
 # is what `kafka-producer-perf-test` gives, which is also what N application
 # instances would look like; each JVM has its own sender thread, and the rate
 # each reports covers only its send loop, so JVM startup is not counted.

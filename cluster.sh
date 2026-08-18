@@ -19,14 +19,14 @@
 # Kafka's behaviour rather than about the protocol. Same host ports either way,
 # so `KAFKA_BOOTSTRAP` does not change.
 #
-# Replication factor stays 1 for topics the bench creates (see kestrel-bench):
+# Replication factor stays 1 for topics the bench creates (see barnabas-bench):
 # the question is whether the client scales across cores, and RF=3 would add
 # replication cost to every cell and answer a different question.
 set -euo pipefail
 
 IMAGE="${KAFKA_IMAGE:-docker.io/apache/kafka:3.9.0}"
 REDPANDA_IMAGE="${REDPANDA_IMAGE:-docker.io/redpandadata/redpanda:v24.2.7}"
-NET=kestrel-net
+NET=barnabas-net
 # Fixed, so a rerun is reproducible and a stale volume is obviously stale.
 CLUSTER_ID="${KAFKA_CLUSTER_ID:-5L6g3nShT-eMCtK--X86sw}"
 NODES=3

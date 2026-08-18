@@ -1,8 +1,8 @@
 # Measurements
 
-`cargo run -p kestrel-bench --release`, 2026-08-16. Reproduce before believing; the harness prints
+`cargo run -p barnabas-bench --release`, 2026-08-16. Reproduce before believing; the harness prints
 its own parameters and asserts that every run handled every record before dividing.
-`KESTREL_CELLS=cores` (or `produce`, `latency`, `consume`, `compression`, `e2e`, `idle`, `pipeline`) runs one
+`BARNABAS_CELLS=cores` (or `produce`, `latency`, `consume`, `compression`, `e2e`, `idle`, `pipeline`) runs one
 section, because re-measuring one cell should not cost the others.
 
 **Machine:** AMD Ryzen Threadripper PRO 9975WX (32 cores / 64 threads), Linux 7.1.8.
@@ -17,12 +17,12 @@ client, so a ratio against it flatters us regardless.
 
 ## Many cores — the claim the design rests on
 
-N producer instances, each owning its own partitions of one 8-partition topic. `kestrel` uses N
+N producer instances, each owning its own partitions of one 8-partition topic. `barnabas` uses N
 glommio executors pinned to N cores; `rdkafka` uses N threads each with its own client; the Java
 column is N concurrent `kafka-producer-perf-test` processes, rates summed. Connection setup is
 outside the timing for all three.
 
-| instances | kestrel | Java | rdkafka |
+| instances | barnabas | Java | rdkafka |
 |---:|---:|---:|---:|
 | 1 | 3.50 – 4.07 M | 1.70 M | 0.56 M |
 | 2 | 4.17 – 8.45 M | 2.63 M | 0.66 M |
@@ -77,7 +77,7 @@ latency `max` column went from an occasional 253 ms to a steady ~1.1 ms.
 
 ## Produce throughput
 
-| batch | record | kestrel rec/s | rdkafka rec/s | ratio |
+| batch | record | barnabas rec/s | rdkafka rec/s | ratio |
 |---:|---:|---:|---:|---:|
 | 1 | 128 B | 20 000 – 25 300 | 9 830 – 9 870 | 2.0× – 2.6× |
 | 10 | 128 B | 129 000 – 159 000 | 38 900 – 39 300 | 3.3× – 4.1× |
@@ -134,7 +134,7 @@ sequence, so a pipelined producer that gapped or reordered its batches would hav
 
 ## Produce latency, one record at a time
 
-| | kestrel | rdkafka |
+| | barnabas | rdkafka |
 |---|---:|---:|
 | p50 | 0.040 – 0.047 ms | 0.046 – 0.063 ms |
 | p99 | 0.087 – 0.095 ms | 0.105 – 0.131 ms |
@@ -151,7 +151,7 @@ been wrong in both directions once.
 
 500 samples, one record at a time, producer and consumer sharing one executor.
 
-| | kestrel | kestrel, no prefetch | rdkafka |
+| | barnabas | barnabas, no prefetch | rdkafka |
 |---|---:|---:|---:|
 | p50 | 0.064 – 0.106 ms | 0.099 – 0.115 ms | 0.062 – 0.088 ms |
 | p99 | 0.129 – 0.332 ms | 0.204 – 0.252 ms | 0.139 – 0.224 ms |
@@ -178,16 +178,16 @@ together between runs, which is what prompted running them side by side.
 Measured at 1 M records with **one consumer holding all eight partitions**, so a poll is one
 `Fetch` per broker rather than one per partition.
 
-| | kestrel rec/s | rdkafka rec/s | ratio |
+| | barnabas rec/s | rdkafka rec/s | ratio |
 |---|---:|---:|---:|
 | 128 B | 14 791 000 – 15 835 000 | 132 000 – 152 000 | **~100×** (against its best) |
 
 **The old 200 000-record cell was not measuring throughput.** It was measuring the fixed cost at
 either end of a fetch loop: 200 k gives 1.58 M rec/s, 1 M gives 3.00 M, 2 M gives 3.20 M. The old
-figure understated steady state by half. Varying the record count (`KESTREL_CONSUME_RECORDS`) is
+figure understated steady state by half. Varying the record count (`BARNABAS_CONSUME_RECORDS`) is
 the check that a rate is steady state rather than overhead.
 
-Part of the gap to librdkafka is an API difference and should be read as such: `kestrel` returns a
+Part of the gap to librdkafka is an API difference and should be read as such: `barnabas` returns a
 whole batch per `fetch()`, `rdkafka`'s `StreamConsumer` returns one message per `await`.
 
 ## Compression
@@ -196,7 +196,7 @@ whole batch per `fetch()`, `rdkafka`'s `StreamConsumer` returns one message per 
 `payload` elsewhere in the harness is a run of one byte, which every codec shrinks to nothing and
 would make compression look free.
 
-| codec | kestrel rec/s | rdkafka rec/s | ratio |
+| codec | barnabas rec/s | rdkafka rec/s | ratio |
 |---|---:|---:|---:|
 | none | 1 372 000 – 1 943 000 | 331 000 – 339 000 | 4.1× – 5.7× |
 | gzip | 573 000 – 701 000 | 325 000 – 352 000 | 1.7× – 2.2× |
@@ -235,14 +235,14 @@ entirely the broker's wait timer.
 `rskafka` 0.6, from InfluxData's IOx: async, no C library, no background thread pool. Architecturally
 the closest thing to this client, and therefore the most informative comparison in this file.
 
-| cell | kestrel | rskafka | verdict |
+| cell | barnabas | rskafka | verdict |
 |---|---:|---:|---|
-| batch 1, 128 B | 26 600 – 31 600 | 22 300 – 22 600 | kestrel, ~1.3× |
-| batch 10, 128 B | 189 000 – 236 000 | 91 000 – 205 000 | kestrel (see note) |
+| batch 1, 128 B | 26 600 – 31 600 | 22 300 – 22 600 | barnabas, ~1.3× |
+| batch 10, 128 B | 189 000 – 236 000 | 91 000 – 205 000 | barnabas (see note) |
 | batch 100, 128 B | 1 094 000 – 1 170 000 | 2 435 | see below — not a real comparison |
-| batch 1 000, 128 B | 3 972 000 – 4 569 000 | 1 176 000 – 3 139 000 | kestrel, 1.3× – 3.9× |
-| batch 1 000, 1 KiB | 1 685 000 – 1 954 000 | 1 292 000 – 1 364 000 | kestrel, 1.2× – 1.5× |
-| consume, 128 B | **14 791 000 – 15 835 000** | 3 923 000 – 5 065 000 | kestrel, 3.4× – 4.0× |
+| batch 1 000, 128 B | 3 972 000 – 4 569 000 | 1 176 000 – 3 139 000 | barnabas, 1.3× – 3.9× |
+| batch 1 000, 1 KiB | 1 685 000 – 1 954 000 | 1 292 000 – 1 364 000 | barnabas, 1.2× – 1.5× |
+| consume, 128 B | **14 791 000 – 15 835 000** | 3 923 000 – 5 065 000 | barnabas, 3.4× – 4.0× |
 
 **We are not fastest on every dimension.** rskafka beats us at small batches and, more importantly,
 **beats us on consume by about 45%**. The ~20× consume advantage over librdkafka elsewhere in this
@@ -263,7 +263,7 @@ the trade this client was designed around, and at batch 1 000 it shows.
 
 ### The lean decoder: built, measured, and now the only path
 
-`kestrel_core::records` reads a record batch without building a record per record. Batch facts —
+`barnabas_core::records` reads a record batch without building a record per record. Batch facts —
 producer id, transactional, control — are kept once, and a record is an offset, a timestamp and
 ranges into the buffer the batch owns. Keys, values and headers are materialised when a caller asks
 for them, which matters because every slice of one buffer increments the same atomic refcount.
@@ -367,7 +367,7 @@ under. The cell is skipped for those columns rather than reported as a failure.
 
 ### Chasing the consume gap: both hypotheses wrong, and the real cause
 
-Isolating the two suspects in a broker-free microbenchmark (`KESTREL_CELLS=decode`, one record batch
+Isolating the two suspects in a broker-free microbenchmark (`BARNABAS_CELLS=decode`, one record batch
 in memory, both decoders on the same bytes) refuted both of them:
 
 | | ns/record |
@@ -429,7 +429,7 @@ producer gets its best configuration (`linger.ms=0`, 1 MiB batches, five in flig
 idempotent) and **far more records than our own cells use**, so its JIT is warm before the number is
 taken.
 
-| cell | kestrel | Java | librdkafka |
+| cell | barnabas | Java | librdkafka |
 |---|---:|---:|---:|
 | batched, 128 B | 3 745 000 – 4 505 000 | **1 622 000** | 316 000 – 343 000 |
 | batched, 1 KiB | 1 415 000 – 1 946 000 | **426 000** | 316 000 – 333 000 |
@@ -517,7 +517,7 @@ than defended.
 - **rskafka has no many-core row.** Its per-partition client shape makes the comparison less direct,
   and it has not been run.
 - **lz4's slowness** is unexplained.
-- **No sustained run in this file.** `KESTREL_SOAK_SECONDS` produces continuously and prints per-10s
+- **No sustained run in this file.** `BARNABAS_SOAK_SECONDS` produces continuously and prints per-10s
   rates and RSS, but no long run has been recorded here yet.
 - **The produce-throughput table above still uses `send_keyed`**, which awaits each call and so has
   one request in flight. **A caller that does not switch to `enqueue`/`flush` sees no pipelining

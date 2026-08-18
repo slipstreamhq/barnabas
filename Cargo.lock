@@ -90,6 +90,81 @@ dependencies = [
 ]
 
 [[package]]
+name = "barnabas-bench"
+version = "0.0.1"
+dependencies = [
+ "barnabas-client",
+ "barnabas-core",
+ "barnabas-glommio",
+ "barnabas-tokio",
+ "bytes",
+ "chrono",
+ "crc32c",
+ "glommio",
+ "kafka-protocol",
+ "rdkafka",
+ "rskafka",
+ "tokio",
+]
+
+[[package]]
+name = "barnabas-client"
+version = "0.0.1"
+dependencies = [
+ "barnabas-core",
+ "bytes",
+ "futures-lite",
+ "hmac",
+ "kafka-protocol",
+ "sha2",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "barnabas-core"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "flate2",
+ "kafka-protocol",
+ "lz4",
+ "snap",
+ "thiserror 2.0.20",
+ "zstd",
+]
+
+[[package]]
+name = "barnabas-glommio"
+version = "0.0.1"
+dependencies = [
+ "barnabas-client",
+ "barnabas-core",
+ "bytes",
+ "futures-lite",
+ "futures-rustls",
+ "glommio",
+ "kafka-protocol",
+ "rustls",
+ "thiserror 2.0.20",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "barnabas-tokio"
+version = "0.0.1"
+dependencies = [
+ "barnabas-client",
+ "barnabas-core",
+ "bytes",
+ "kafka-protocol",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -732,81 +807,6 @@ dependencies = [
  "snap",
  "uuid",
  "zstd",
-]
-
-[[package]]
-name = "kestrel-bench"
-version = "0.0.1"
-dependencies = [
- "bytes",
- "chrono",
- "crc32c",
- "glommio",
- "kafka-protocol",
- "kestrel-client",
- "kestrel-core",
- "kestrel-glommio",
- "kestrel-tokio",
- "rdkafka",
- "rskafka",
- "tokio",
-]
-
-[[package]]
-name = "kestrel-client"
-version = "0.0.1"
-dependencies = [
- "bytes",
- "futures-lite",
- "hmac",
- "kafka-protocol",
- "kestrel-core",
- "sha2",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "kestrel-core"
-version = "0.0.1"
-dependencies = [
- "bytes",
- "crc32c",
- "flate2",
- "kafka-protocol",
- "lz4",
- "snap",
- "thiserror 2.0.20",
- "zstd",
-]
-
-[[package]]
-name = "kestrel-glommio"
-version = "0.0.1"
-dependencies = [
- "bytes",
- "futures-lite",
- "futures-rustls",
- "glommio",
- "kafka-protocol",
- "kestrel-client",
- "kestrel-core",
- "rustls",
- "thiserror 2.0.20",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "kestrel-tokio"
-version = "0.0.1"
-dependencies = [
- "bytes",
- "kafka-protocol",
- "kestrel-client",
- "kestrel-core",
- "rustls",
- "tokio",
- "tokio-rustls",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]

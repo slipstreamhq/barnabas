@@ -1,4 +1,4 @@
-# kestrel
+# barnabas
 
 A native Rust Kafka client with a sans-io core, so it runs on any async runtime —
 including thread-per-core ones, which is what it was built for.
@@ -32,12 +32,12 @@ worth building.
 ```
 kafka-protocol          generated from Kafka's JSON schemas — the wire codec, not ours
       ↓
-kestrel-core            sans-io: framing, correlation, filtering, sequencing. No sockets,
+barnabas-core            sans-io: framing, correlation, filtering, sequencing. No sockets,
       ↓                 no clock, no Send.
-kestrel-client          the client: pooling, leader routing, metadata, fetch and transaction
+barnabas-client          the client: pooling, leader routing, metadata, fetch and transaction
       ↓                 flows. Generic over a four-function `Transport`. Still no Send.
-kestrel-glommio (64)    connect, read, write, sleep.
-kestrel-tokio   (67)    connect, read, write, sleep.
+barnabas-glommio (64)    connect, read, write, sleep.
+barnabas-tokio   (67)    connect, read, write, sleep.
 ```
 
 Those line counts are the load-bearing part. A binding supplies four functions and a handful of
@@ -53,7 +53,7 @@ The second reason for sans-io is testing, and for a Kafka client it is the bigge
 bugs are silent — a wrong retry duplicates records while every status code stays green — so they
 have to be caught by driving the client adversarially rather than by watching a broker behave.
 
-`kestrel-client/tests/adversarial.rs` does exactly that. The `Transport` seam takes a **simulated
+`barnabas-client/tests/adversarial.rs` does exactly that. The `Transport` seam takes a **simulated
 broker** that speaks the real wire protocol and lies on cue: a leader that moves mid-produce, a
 coordinator that migrates, a fenced epoch, an out-of-sequence error. No runtime, no sockets, and
 `sleep` returns immediately, so a test that forces forty retries runs in microseconds and
@@ -69,7 +69,7 @@ Both properties were mutation-proved: resetting sequences per transaction fails
 **By depending on a binding, not by setting a feature.** There is no `cfg` in
 this workspace selecting a runtime, and no default one to override.
 
-`kestrel-client` is generic over one trait:
+`barnabas-client` is generic over one trait:
 
 ```rust
 pub trait Transport: 'static {
@@ -81,23 +81,23 @@ pub trait Transport: 'static {
 }
 ```
 
-A binding is that trait plus three type aliases. `kestrel-glommio` is 64 lines;
-`kestrel-tokio` is 67. So the choice is which line you put in `Cargo.toml`:
+A binding is that trait plus three type aliases. `barnabas-glommio` is 64 lines;
+`barnabas-tokio` is 67. So the choice is which line you put in `Cargo.toml`:
 
 ```toml
 # thread-per-core, io_uring
-kestrel-glommio = "0.1"
+barnabas-glommio = "0.1"
 ```
 ```toml
 # work-stealing
-kestrel-tokio = "0.1"
+barnabas-tokio = "0.1"
 ```
 
 and which name you import:
 
 ```rust
-use kestrel_glommio::{Consumer, Glommio, EARLIEST};   // or
-use kestrel_tokio::{Consumer, Tokio, EARLIEST};
+use barnabas_glommio::{Consumer, Glommio, EARLIEST};   // or
+use barnabas_tokio::{Consumer, Tokio, EARLIEST};
 ```
 
 Each binding re-exports everything shared — `Error`, `Result`, `RecordRef`,
@@ -117,7 +117,7 @@ them apart.
 It also means the `Send`-ness is the *binding's* property. `glommio::net::TcpStream`
 belongs to the core that opened it, so everything on `Glommio` is `!Send` and
 stays on its executor; the tokio side is `Send` from the same client code
-because `kestrel-client` places no `Send` bound anywhere. A trait that demanded
+because `barnabas-client` places no `Send` bound anywhere. A trait that demanded
 `Send` would have forbidden the per-core side outright.
 
 Selecting per build is then the *caller's* job, and a `cfg` in one place does
@@ -125,9 +125,9 @@ it. Slipstream, for instance, does this in its Kafka crate:
 
 ```rust
 #[cfg(feature = "glommio")]
-use kestrel_glommio as kestrel;
+use barnabas_glommio as barnabas;
 #[cfg(not(feature = "glommio"))]
-use kestrel_tokio as kestrel;
+use barnabas_tokio as barnabas;
 ```
 
 ## Creating a client
@@ -135,7 +135,7 @@ use kestrel_tokio as kestrel;
 There are two ways in. The **staged builder** is the guided one:
 
 ```rust
-use kestrel_glommio::{Consumer, Glommio, StartOffset};
+use barnabas_glommio::{Consumer, Glommio, StartOffset};
 
 let mut consumer = Consumer::builder(Glommio)      // needs a bootstrap list
     .bootstrap(["localhost:9092"])                 // needs a client id
@@ -269,7 +269,7 @@ Offsets are yours to store, which is what makes this usable from a system that
 checkpoints them itself.
 
 ```rust
-use kestrel_glommio::{Consumer, Glommio, IsolationLevel, EARLIEST};
+use barnabas_glommio::{Consumer, Glommio, IsolationLevel, EARLIEST};
 
 let mut consumer = Consumer::new(
     Glommio,
@@ -306,7 +306,7 @@ consumer.seek_to("events", 3, my_checkpoint.offset_for(3));
 
 ```rust
 use bytes::Bytes;
-use kestrel_glommio::{Glommio, Producer, ProducerRecord};
+use barnabas_glommio::{Glommio, Producer, ProducerRecord};
 
 let mut producer = Producer::idempotent(
     Glommio,
@@ -414,9 +414,9 @@ the tasks are.
 ### Pausing, offsets and lag
 
 ```rust
-let p3 = TopicPartition::new("events", 3);
-consumer.pause(&[p3.clone()]);                // still assigned, still heartbeating
-consumer.resume(&[p3]);                       // carries on from where it stopped
+let hot = [TopicPartition::new("events", 3), TopicPartition::new("events", 4)];
+consumer.pause(&hot);                         // still assigned, still heartbeating
+consumer.resume(&hot);                        // carries on from where it stopped
 
 let ends  = consumer.end_offsets(&partitions).await?;
 let start = consumer.beginning_offsets(&partitions).await?;
@@ -487,7 +487,7 @@ moving every key on it would be worse than the stale count.
 ### The same program on tokio
 
 ```rust
-use kestrel_tokio::{Consumer, IsolationLevel, Tokio, EARLIEST};
+use barnabas_tokio::{Consumer, IsolationLevel, Tokio, EARLIEST};
 
 let mut consumer = Consumer::new(
     Tokio,
@@ -504,16 +504,16 @@ The rest is character-for-character identical.
 TLS is a feature on the binding, since the socket is the binding's business:
 
 ```toml
-kestrel-glommio = { version = "0.1", features = ["tls"] }
+barnabas-glommio = { version = "0.1", features = ["tls"] }
 ```
 
 ```rust
 // The type aliases are bound to the plaintext transport, so a TLS client is
-// spelled out in full — which also needs `kestrel-client` as a direct
+// spelled out in full — which also needs `barnabas-client` as a direct
 // dependency.
-let transport = kestrel_glommio::tls::GlommioTls::new();
+let transport = barnabas_glommio::tls::GlommioTls::new();
 let mut consumer =
-    kestrel_client::Consumer::<_>::new(transport, &brokers, "my-app", isolation).await?;
+    barnabas_client::Consumer::<_>::new(transport, &brokers, "my-app", isolation).await?;
 ```
 
 SASL is on the client and works on either runtime — PLAIN, SCRAM-SHA-256 and
@@ -526,7 +526,7 @@ cluster.set_credentials(Credentials::scram_sha256("user", "pass"));
 
 ### Writing another binding
 
-Implement the four functions. `kestrel-tokio/src/lib.rs` is the shortest
+Implement the four functions. `barnabas-tokio/src/lib.rs` is the shortest
 complete example at 67 lines, and nothing above the transport needs to change.
 
 ## Status
@@ -555,7 +555,7 @@ Measured across a matrix, not a headline — `PERF.md` has every cell, the machi
 what is still unmeasured. Against `rdkafka` on one local broker, using **its best observed number**
 for every ratio:
 
-| | kestrel | rdkafka |
+| | barnabas | rdkafka |
 |---|---:|---:|
 | produce, batch 1 000 × 128 B | 3.3–3.8 M rec/s | 313–338 k rec/s |
 | produce, batch 1 × 128 B | 10–33 k rec/s | ~9.8 k rec/s |
@@ -569,19 +569,19 @@ labelled as such in `PERF.md`, along with two fairness mistakes that were found 
 writing it.
 
 ```sh
-cargo run -p kestrel-bench --release        # needs a broker
+cargo run -p barnabas-bench --release        # needs a broker
 ```
 
 ## Tests
 
 ```sh
 cargo test                                        # 151 tests, no broker, no runtime
-cargo test -p kestrel-glommio -- --ignored --test-threads=1   # needs a broker
-cargo test -p kestrel-tokio   -- --ignored --test-threads=1   # the same suite, other runtime
+cargo test -p barnabas-glommio -- --ignored --test-threads=1   # needs a broker
+cargo test -p barnabas-tokio   -- --ignored --test-threads=1   # the same suite, other runtime
 ```
 
 The broker tests need Kafka; the invocation is at the top of
-`kestrel-glommio/tests/real_broker.rs`, and `./cluster.sh up` brings up a suitable one. Note that
+`barnabas-glommio/tests/real_broker.rs`, and `./cluster.sh up` brings up a suitable one. Note that
 `__transaction_state` defaults to replication factor 3, so a single-node broker needs it overridden
 or every transaction fails with error 15.
 
@@ -620,7 +620,7 @@ they do:
 - **Invalidate per partition, not wholesale.** One moved partition does not make the rest of the
   map wrong, and throwing it all away turns a single failover into a reconnect storm.
 - **There is no single "Kafka default" partitioner.** librdkafka hashes keys with CRC-32; the Java
-  client uses murmur2. Same key, same topic, different partition, no error. `kestrel` implements
+  client uses murmur2. Same key, same topic, different partition, no error. `barnabas` implements
   both and defaults to CRC-32, so a program migrating off `rdkafka` keeps its placement — checked
   against `rdkafka` itself, key for key, while it is still around to be the oracle.
 - **Metadata requests ask for topic auto-creation**, as librdkafka and Java do, and
@@ -633,7 +633,7 @@ they do:
 - **Read the broker's log before inferring from the client side.** Five rounds of client-side
   reasoning fixed five real bugs and never touched the cause of the symptom. One coordinator DEBUG
   line ended it: `removed dynamic members who haven't joined`. Start a broker with
-  `KAFKA_LOG4J_LOGGERS="kafka.coordinator.group=DEBUG"` and read it beside `KESTREL_TRACE=1`.
+  `KAFKA_LOG4J_LOGGERS="kafka.coordinator.group=DEBUG"` and read it beside `BARNABAS_TRACE=1`.
 - **A group cannot be driven in lockstep.** Polling two members from one loop deadlocks against the
   protocol: the joining member's `JoinGroup` is held until the whole group has rejoined, so the
   incumbent cannot take its turn until the join it is blocking returns. A member is a process; in

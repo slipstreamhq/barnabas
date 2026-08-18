@@ -1,0 +1,16 @@
+[package]
+name = "barnabas-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+kafka-protocol = { workspace = true }
+bytes          = { workspace = true }
+thiserror      = { workspace = true }
+crc32c = "0.6.8"
+flate2 = "1.1.9"
+snap = "1.1.2"
+lz4 = "1.28.1"
+zstd = "0.13.3"

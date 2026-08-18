@@ -1,0 +1,23 @@
+[package]
+name = "barnabas-tokio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# As `barnabas-glommio`: opt-in, because rustls and a root store are not free.
+tls = ["dep:tokio-rustls", "dep:rustls", "dep:webpki-roots"]
+
+[dependencies]
+barnabas-core   = { path = "../barnabas-core" }
+barnabas-client = { path = "../barnabas-client" }
+tokio          = { version = "1", features = ["net", "io-util", "time", "rt"] }
+tokio-rustls   = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots   = { version = "0.26", optional = true }
+
+[dev-dependencies]
+kafka-protocol = { workspace = true }
+bytes          = { workspace = true }
+tokio          = { version = "1", features = ["macros", "rt-multi-thread"] }

@@ -4,7 +4,7 @@
 that makes it safe: only the **contiguous leading run** of successes is retired,
 everything behind a failure is re-sent in order.
 
-`kestrel-client`'s adversarial tests check that on scenarios chosen by hand.
+`barnabas-client`'s adversarial tests check that on scenarios chosen by hand.
 This checks it over every interleaving TLC reaches within the bounds in the
 `.cfg` (8 batches, 5 in flight, 3 failures — five in flight is what Kafka allows
 with idempotence and what `DEFAULT_MAX_IN_FLIGHT` uses).
