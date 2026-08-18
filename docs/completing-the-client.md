@@ -219,8 +219,14 @@ of the producer window. Groups should arrive with the same three.
 2. ~~**Phase 1, the group protocol**~~ — done: classic join/sync/heartbeat,
    all four assignors, eager and cooperative rebalancing, auto-commit and
    rebalance callbacks, behind a seam for KIP-848.
-3. **Topic expansion** — groups solve it partly; the assign-only path still
-   needs it.
+3. ~~**Topic expansion**~~ — done. Metadata is age-stamped
+   (`set_metadata_max_age`, five minutes by default like
+   `metadata.max.age.ms`). A subscribed consumer rejoins its group, so the
+   leader assigns the new partitions; a manually assigned one is **told** via
+   `take_expansions` and never extended behind the caller's back; a producer's
+   keyed placement re-reads the count on the same schedule. Only growth counts
+   — Kafka never shrinks a live topic, so a smaller number is a transient
+   answer and acting on it would move every key twice.
 4. ~~**Phase 2, EOS with groups**~~ — done.
 5. ~~**Phase 3, the ordinary surface**~~ — done.
 

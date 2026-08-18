@@ -274,6 +274,9 @@ pub struct Consumer<T: Transport> {
     /// paused partition is still **assigned**: it keeps its offset, it counts
     /// against the group, and resuming it must not re-resolve where it was.
     paused: BTreeSet<(String, i32)>,
+    /// Topics seen to have grown partitions, `topic -> (before, after)`,
+    /// waiting to be reported by [`Consumer::take_expansions`].
+    expansions: BTreeMap<String, (i32, i32)>,
     /// Bumped whenever the assignment or a position changes for a reason other
     /// than consuming records. An outstanding fetch from an older generation
     /// asked a question that is no longer the one being asked.
@@ -304,6 +307,7 @@ impl<T: Transport> Consumer<T> {
             cluster,
             positions: BTreeMap::new(),
             paused: BTreeSet::new(),
+            expansions: BTreeMap::new(),
             isolation,
             max_wait: Duration::from_millis(500),
             max_bytes: 10 * 1024 * 1024,
@@ -336,6 +340,7 @@ impl<T: Transport> Consumer<T> {
             cluster: Cluster::connect(transport, bootstrap, client_id).await?,
             positions: BTreeMap::new(),
             paused: BTreeSet::new(),
+            expansions: BTreeMap::new(),
             isolation,
             max_wait: Duration::from_millis(500),
             max_bytes: 10 * 1024 * 1024,
@@ -573,6 +578,90 @@ impl<T: Transport> Consumer<T> {
             return Err(Error::Missing("a group to commit to"));
         };
         crate::group::GroupProtocol::commit(group, &mut self.cluster, &offsets).await
+    }
+
+    /// How long a topic's metadata may go unrefreshed.
+    ///
+    /// Five minutes by default, matching `metadata.max.age.ms`. It bounds how
+    /// long a partition expansion goes unnoticed — see
+    /// [`Self::take_expansions`].
+    pub fn set_metadata_max_age(&mut self, age: Duration) {
+        self.cluster.set_metadata_max_age(age);
+    }
+
+    /// Topics that have grown partitions since this was last called, as
+    /// `(topic, before, after)`. Drains what it returns.
+    ///
+    /// **A manual assignment is never extended for you.** Java does not do it
+    /// either, and it should not: the whole point of [`Self::assign`] is that
+    /// the caller decides what it reads. But a caller who is never *told* has
+    /// no way to decide, and the failure is silent — records land on partitions
+    /// nobody reads, no error is raised, and [`Self::lag`] looks perfect
+    /// because it only covers what is assigned.
+    ///
+    /// A **subscribed** consumer never reports here: an expansion makes it
+    /// rejoin its group instead, and the leader assigns the new partitions.
+    pub fn take_expansions(&mut self) -> Vec<(String, i32, i32)> {
+        std::mem::take(&mut self.expansions)
+            .into_iter()
+            .map(|(topic, (before, after))| (topic, before, after))
+            .collect()
+    }
+
+    /// Re-read stale metadata for the topics this consumer cares about, and
+    /// act on any that grew.
+    ///
+    /// Cheap between refreshes: [`Cluster::is_metadata_stale`] is a map lookup
+    /// and a subtraction, so this runs on every poll and does nothing on almost
+    /// all of them.
+    async fn check_for_expansion(&mut self) -> Result<()> {
+        let mut topics: Vec<String> = match self.group.as_ref() {
+            // A subscribed consumer watches what it *subscribed to*, not what
+            // it was assigned: a member holding no partitions of a topic is
+            // exactly the member that must notice the topic growing.
+            Some(group) => crate::group::GroupProtocol::<T>::topics(group),
+            None => self
+                .positions
+                .keys()
+                .map(|(topic, _)| topic.clone())
+                .collect(),
+        };
+        topics.sort();
+        topics.dedup();
+        topics.retain(|topic| self.cluster.is_metadata_stale(topic));
+        if topics.is_empty() {
+            return Ok(());
+        }
+
+        // **A prefetch is sitting unread on one of these connections**, and a
+        // `Metadata` request would decode its answer. Every other caller that
+        // touches a connection does this — `assign`, `commit`, `list_offset` —
+        // and it is done *here*, after the staleness check, so the ordinary
+        // poll keeps its prefetch and only the refresh pays.
+        //
+        // Without it the refresh returned `ConnectionBusy`, which this function
+        // swallows, so expansion was never detected and nothing said why.
+        self.discard_outstanding().await;
+
+        let mut grew = false;
+        for topic in topics {
+            // A refresh that fails is not fatal here — nothing has broken yet,
+            // and the next poll asks again. Failing the poll would turn a
+            // background check into an outage.
+            if let Ok(Some((before, after))) = self.cluster.refresh_if_stale(&topic).await {
+                if self.group.is_some() {
+                    grew = true;
+                } else {
+                    self.expansions.insert(topic, (before, after));
+                }
+            }
+        }
+        if grew {
+            if let Some(group) = self.group.as_mut() {
+                crate::group::GroupProtocol::<T>::request_rejoin(group);
+            }
+        }
+        Ok(())
     }
 
     /// Where this consumer would commit to, per partition: **the next offset
@@ -1420,6 +1509,10 @@ impl<T: Transport> Consumer<T> {
         // A subscribed consumer keeps its place in the group by polling, which
         // is why membership is driven here rather than by a background task:
         // this client spawns nothing.
+        // **Before membership is advanced.** An expansion asks for a rejoin,
+        // and advancing is what performs one — discovering it afterwards would
+        // wait a whole poll.
+        self.check_for_expansion().await?;
         if self.group.is_some() {
             // **Before membership is advanced, not after.** A rebalance is
             // discovered by advancing, and by then the generation that would

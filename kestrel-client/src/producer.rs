@@ -760,6 +760,17 @@ impl<T: Transport> Producer<T> {
         Ok(())
     }
 
+    /// How long a topic's metadata may go unrefreshed.
+    ///
+    /// Five minutes by default, matching `metadata.max.age.ms`. It bounds how
+    /// long this producer keeps placing keys with a stale partition count after
+    /// a topic is expanded — during which its records land on different
+    /// partitions than every producer with fresh metadata, and per-key ordering
+    /// is broken between them.
+    pub fn set_metadata_max_age(&mut self, age: Duration) {
+        self.cluster.set_metadata_max_age(age);
+    }
+
     /// How long a partial batch waits for company before being sent.
     ///
     /// Zero — the default, and Kafka's — means a record is sent as soon as it
@@ -1240,28 +1251,7 @@ impl<T: Transport> Producer<T> {
         if records.is_empty() {
             return Ok(Vec::new());
         }
-        // The partition count decides where every key lands, so a topic that is
-        // still materialising must be waited for rather than partitioned
-        // against a count of zero.
-        let mut count = 0;
-        for attempt in 0..MAX_RETRIES {
-            match self.cluster.partition_count(topic).await {
-                Ok(n) => {
-                    count = n;
-                    break;
-                }
-                Err(Error::NoLeader { .. }) if attempt + 1 < MAX_RETRIES => {
-                    Self::backoff(attempt).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        if count == 0 {
-            return Err(Error::NoLeader {
-                topic: topic.to_owned(),
-                partition: -1,
-            });
-        }
+        let count = self.partition_count_waiting(topic).await?;
 
         let mut by_partition: BTreeMap<i32, Vec<ProducerRecord>> = BTreeMap::new();
         for record in records {
@@ -1288,6 +1278,31 @@ impl<T: Transport> Producer<T> {
             .collect())
     }
 
+    /// The topic's partition count, waiting for a topic that is still
+    /// materialising rather than partitioning against a count of zero.
+    ///
+    /// The count decides where every key lands, so answering "zero partitions"
+    /// for a topic created a moment ago is not a smaller failure than the wait.
+    ///
+    /// # Errors
+    /// If the topic still has no partitions after the wait.
+    async fn partition_count_waiting(&mut self, topic: &str) -> Result<i32> {
+        for attempt in 0..MAX_RETRIES {
+            match self.cluster.partition_count(topic).await {
+                Ok(count) if count > 0 => return Ok(count),
+                Ok(_) | Err(Error::NoLeader { .. }) if attempt + 1 < MAX_RETRIES => {
+                    Self::backoff(attempt).await;
+                }
+                Ok(_) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::NoLeader {
+            topic: topic.to_owned(),
+            partition: -1,
+        })
+    }
+
     /// Which partition a key would go to, without sending anything.
     ///
     /// Exposed for the parity test that checks this places keys exactly where
@@ -1296,7 +1311,7 @@ impl<T: Transport> Producer<T> {
     /// # Errors
     /// If the topic's partition count cannot be learned.
     pub async fn partition_for(&mut self, topic: &str, key: Option<&[u8]>) -> Result<i32> {
-        let count = self.cluster.partition_count(topic).await?;
+        let count = self.partition_count_waiting(topic).await?;
         let mut scratch = self.round_robin;
         self.partitioner
             .partition_for(key, count, &mut scratch)

@@ -21,7 +21,7 @@
 //! shape a wrapper around a threaded C client forces.
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kafka_protocol::messages::{
     metadata_request::MetadataRequestTopic, ApiKey, ApiVersionsRequest, ApiVersionsResponse,
@@ -327,6 +327,19 @@ pub struct Cluster<T: Transport> {
     /// a second connection costs one socket per coordinator and nothing else.
     coordinator_conns: HashMap<String, Broker<T>>,
     metadata: Metadata,
+    /// When each topic's metadata was last read from a broker.
+    ///
+    /// Metadata is otherwise only refreshed when something is *missing* — an
+    /// unknown leader, an unknown count. That never notices metadata that is
+    /// merely **stale**, which is exactly what a topic that grew partitions
+    /// looks like: every leader still known, every answer still wrong.
+    refreshed_at: HashMap<String, Instant>,
+    /// How long a topic's metadata may go unrefreshed.
+    ///
+    /// Five minutes, which is `metadata.max.age.ms`'s default in the Java
+    /// client and librdkafka's `topic.metadata.refresh.interval.ms` in spirit.
+    /// It bounds how long a partition expansion goes unnoticed.
+    metadata_max_age: Duration,
     request_timeout: Duration,
     credentials: Option<Credentials>,
 }
@@ -347,6 +360,8 @@ impl<T: Transport> Cluster<T> {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             credentials: None,
             allow_auto_topic_creation: true,
+            refreshed_at: HashMap::new(),
+            metadata_max_age: Duration::from_secs(300),
         };
         // Touch one bootstrap address so a bad configuration fails here rather
         // than at the first fetch.
@@ -734,7 +749,50 @@ impl<T: Transport> Cluster<T> {
             }
         }
         self.metadata.update(&resp);
+        self.refreshed_at.insert(topic.to_owned(), Instant::now());
         Ok(())
+    }
+
+    /// How long a topic's metadata may go unrefreshed before a lookup re-reads
+    /// it. See the `refreshed_at` field.
+    pub fn set_metadata_max_age(&mut self, age: Duration) {
+        self.metadata_max_age = age;
+    }
+
+    /// Whether this topic's metadata is older than the maximum age. A topic
+    /// never read is stale.
+    #[must_use]
+    pub fn is_metadata_stale(&self, topic: &str) -> bool {
+        self.refreshed_at
+            .get(topic)
+            .is_none_or(|at| at.elapsed() >= self.metadata_max_age)
+    }
+
+    /// Re-read this topic if it is stale, and report `(before, after)` if its
+    /// partition count **grew**.
+    ///
+    /// Only growth: Kafka has no operation that removes partitions from a live
+    /// topic, so a smaller number is a transient answer — a broker that has not
+    /// caught up, a topic mid-creation — and acting on it would move every key
+    /// twice. A topic seen for the first time reports no growth either; there
+    /// is nothing to have grown from.
+    ///
+    /// # Errors
+    /// If the refresh fails.
+    pub async fn refresh_if_stale(&mut self, topic: &str) -> Result<Option<(i32, i32)>> {
+        if !self.is_metadata_stale(topic) {
+            return Ok(None);
+        }
+        let before = self.metadata.partition_count(topic);
+        self.refresh_metadata(topic).await?;
+        let after = self.metadata.partition_count(topic);
+        Ok((before > 0 && after > before).then_some((before, after)))
+    }
+
+    /// Forget a topic that has been deleted — its count and every leader.
+    pub fn forget_topic(&mut self, topic: &str) {
+        self.metadata.forget_topic(topic);
+        self.refreshed_at.remove(topic);
     }
 
     /// Refresh brokers and the controller **without** naming a topic.
@@ -803,7 +861,12 @@ impl<T: Transport> Cluster<T> {
     /// # Errors
     /// If metadata cannot be refreshed, or the topic has no partitions after it.
     pub async fn partition_count(&mut self, topic: &str) -> Result<i32> {
-        if self.metadata.partition_count(topic) == 0 {
+        // **Stale counts as unknown.** Everything that places a key by hash
+        // reaches this — the producer's partitioner, the group leader's
+        // assignment — so a count that has quietly gone out of date here is a
+        // producer writing to the wrong partitions and a group ignoring the new
+        // ones. It is the one lookup where age matters more than a round trip.
+        if self.metadata.partition_count(topic) == 0 || self.is_metadata_stale(topic) {
             self.refresh_metadata(topic).await?;
         }
         let count = self.metadata.partition_count(topic);

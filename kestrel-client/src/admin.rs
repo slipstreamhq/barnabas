@@ -219,6 +219,28 @@ impl<T: Transport> Admin<T> {
                 },
             )
             .await?;
+
+        // **Return when the topics are usable, not when the controller said
+        // yes.** The two are seconds apart: a producer that writes immediately
+        // after this asks a broker that has not heard about the topic and gets
+        // "no leader", and a consumer that subscribes gets a partition count of
+        // zero. Every caller would otherwise write this loop, and the ones who
+        // forgot would have a test that fails once a fortnight.
+        for topic in topics {
+            for attempt in 0..MAX_RETRIES {
+                let _ = self.cluster.refresh_metadata(&topic.name).await;
+                if self.cluster.metadata().partition_count(&topic.name) >= topic.partitions {
+                    break;
+                }
+                if attempt + 1 == MAX_RETRIES {
+                    return Err(Error::NoLeader {
+                        topic: topic.name.clone(),
+                        partition: -1,
+                    });
+                }
+                T::sleep(BACKOFF).await;
+            }
+        }
         Ok(())
     }
 
@@ -300,6 +322,21 @@ impl<T: Transport> Admin<T> {
                 },
             )
             .await?;
+
+        // As in [`Self::create_topics`]: visible, not merely accepted.
+        for attempt in 0..MAX_RETRIES {
+            let _ = self.cluster.refresh_metadata(topic).await;
+            if self.cluster.metadata().partition_count(topic) >= count {
+                return Ok(());
+            }
+            if attempt + 1 == MAX_RETRIES {
+                return Err(Error::NoLeader {
+                    topic: topic.to_owned(),
+                    partition: -1,
+                });
+            }
+            T::sleep(BACKOFF).await;
+        }
         Ok(())
     }
 

@@ -46,6 +46,16 @@ pub type PartitionKey = (String, i32);
 pub struct Metadata {
     brokers: HashMap<i32, BrokerAddr>,
     leaders: HashMap<PartitionKey, i32>,
+    /// How many partitions each topic has, as the **response** said — not as
+    /// counted from known leaders.
+    ///
+    /// The two differ exactly when they matter. A `MetadataResponse` lists
+    /// every partition of a topic whether or not each has a leader right now,
+    /// so counting the response is the true count even mid-election, while
+    /// counting leaders undercounts. Expansion detection compares this number
+    /// across refreshes, and a count that dips during an election would look
+    /// like a topic that shrank — which Kafka never does.
+    partition_counts: HashMap<String, i32>,
     /// The node id of the controller, if the last response named one.
     ///
     /// Only the controller serves topic creation and deletion; every other
@@ -89,6 +99,10 @@ impl Metadata {
             let Some(name) = topic.name.as_ref() else {
                 continue;
             };
+            self.partition_counts.insert(
+                name.0.to_string(),
+                i32::try_from(topic.partitions.len()).unwrap_or(i32::MAX),
+            );
             for partition in &topic.partitions {
                 if partition.error_code != 0 || partition.leader_id.0 < 0 {
                     continue;
@@ -131,21 +145,23 @@ impl Metadata {
         self.leaders.remove(&(topic.to_owned(), partition));
     }
 
-    /// How many partitions the client knows this topic has.
+    /// How many partitions this topic has, or 0 if it has never been seen.
     ///
-    /// Counted from known leaders, so it is only as complete as the last
-    /// refresh — which is why [`Self::update`] skipping errored partitions
-    /// matters here: a partition mid-election would otherwise shrink the count
-    /// and silently move every key.
+    /// Taken from the last response that named the topic, so it is stable
+    /// across elections: a partition without a leader still exists, and a count
+    /// that dipped while one was being elected would silently move every key.
     #[must_use]
     pub fn partition_count(&self, topic: &str) -> i32 {
-        i32::try_from(
-            self.leaders
-                .keys()
-                .filter(|(name, _)| name == topic)
-                .count(),
-        )
-        .unwrap_or(i32::MAX)
+        self.partition_counts.get(topic).copied().unwrap_or(0)
+    }
+
+    /// Forget a topic entirely — its count and every leader.
+    ///
+    /// For a topic that was deleted. Deletion is the only way a partition
+    /// count goes down, and it goes down by going away.
+    pub fn forget_topic(&mut self, topic: &str) {
+        self.partition_counts.remove(topic);
+        self.leaders.retain(|(name, _), _| name != topic);
     }
 
     /// Every broker the client has heard of, for connection cleanup.

@@ -145,6 +145,18 @@ pub trait GroupProtocol<T: Transport> {
         offsets: &BTreeMap<TopicPartition, i64>,
     ) -> impl std::future::Future<Output = Result<()>>;
 
+    /// What this member is subscribed to, so the caller can watch those topics
+    /// for changes the group must agree on.
+    fn topics(&self) -> Vec<String>;
+
+    /// Ask to rejoin the group at the next [`Self::advance`].
+    ///
+    /// **On the seam** for the same reason [`Self::commit`] is: what a rejoin
+    /// costs and what it is called differ completely between the classic
+    /// protocol and KIP-848. The caller only says that something the group
+    /// agreed on has changed.
+    fn request_rejoin(&mut self);
+
     /// What proves this member is current, for a transactional producer.
     ///
     /// `None` until the member is stable: an unjoined member has no token to
@@ -498,6 +510,14 @@ impl<T: Transport> GroupProtocol<T> for ClassicProtocol {
         offsets: &BTreeMap<TopicPartition, i64>,
     ) -> Result<()> {
         self.commit_offsets(cluster, offsets).await
+    }
+
+    fn topics(&self) -> Vec<String> {
+        self.member.topics().to_vec()
+    }
+
+    fn request_rejoin(&mut self) {
+        self.member.request_rejoin();
     }
 
     fn group_metadata(&self) -> Option<GroupMetadata> {

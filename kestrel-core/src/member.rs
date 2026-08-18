@@ -156,6 +156,12 @@ impl GroupMember {
         &self.group_id
     }
 
+    /// What this member is subscribed to.
+    #[must_use]
+    pub fn topics(&self) -> &[String] {
+        &self.topics
+    }
+
     #[must_use]
     pub fn state(&self) -> MemberState {
         self.state
@@ -228,6 +234,21 @@ impl GroupMember {
     pub fn set_topics(&mut self, topics: Vec<String>) {
         if topics != self.topics {
             self.topics = topics;
+            self.revoke_and_rejoin();
+        }
+    }
+
+    /// Rejoin at the next step, keeping the subscription as it is.
+    ///
+    /// For a change the group must agree on that is **not** a change of
+    /// topics: a subscribed topic growing partitions is the case that exists.
+    /// Only the leader computes an assignment, and it does so from metadata at
+    /// join time — so the group learns about new partitions by rejoining, and
+    /// nothing else makes it rejoin. Without this, a stable group keeps its old
+    /// assignment until some unrelated rebalance happens to come along, and the
+    /// new partitions go unread until then.
+    pub fn request_rejoin(&mut self) {
+        if self.state != MemberState::Unjoined {
             self.revoke_and_rejoin();
         }
     }

@@ -194,3 +194,190 @@ fn deleting_records_moves_the_log_start() {
         admin.delete_topics(&[topic]).await.expect("delete");
     });
 }
+
+// ── topic expansion ────────────────────────────────────────────────────────
+
+/// **A manually assigned consumer is told a topic grew, and not extended.**
+///
+/// The silent failure this prevents: records land on partitions nobody reads,
+/// nothing errors, and `lag` looks perfect because it only covers what is
+/// assigned.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn an_assigned_consumer_is_told_when_a_topic_grows() {
+    run(|| async {
+        let topic = unique("expand-assign");
+        let mut admin = admin().await;
+        admin
+            .create_topics(&[NewTopic::new(&topic, 1, 1)])
+            .await
+            .expect("create");
+
+        let mut consumer = kestrel_glommio::Consumer::for_partition(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "kestrel-expand",
+            &topic,
+            0,
+            kestrel_glommio::EARLIEST,
+            kestrel_core::IsolationLevel::ReadUncommitted,
+        )
+        .await
+        .expect("assign");
+        consumer.set_max_wait(Duration::from_millis(50));
+        // Every poll re-reads, so the test does not wait five minutes.
+        consumer.set_metadata_max_age(Duration::ZERO);
+
+        consumer.poll().await.expect("poll");
+        assert!(
+            consumer.take_expansions().is_empty(),
+            "nothing has grown yet"
+        );
+
+        admin.create_partitions(&topic, 3).await.expect("expand");
+
+        let mut told = Vec::new();
+        for _ in 0..40 {
+            consumer.poll().await.expect("poll");
+            told = consumer.take_expansions();
+            if !told.is_empty() {
+                break;
+            }
+            glommio::timer::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(told, vec![(topic.clone(), 1, 3)], "told once, with both counts");
+        assert_eq!(
+            consumer.assignments().count(),
+            1,
+            "a manual assignment is not extended behind the caller's back"
+        );
+        assert!(
+            consumer.take_expansions().is_empty(),
+            "reporting drains it"
+        );
+
+        admin.delete_topics(std::slice::from_ref(&topic)).await.expect("delete");
+    });
+}
+
+/// A subscribed consumer rejoins and is assigned the new partitions, without
+/// anything else happening in the group.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn a_group_picks_up_new_partitions() {
+    run(|| async {
+        let topic = unique("expand-group");
+        let group = unique("expand-groupg");
+        let mut admin = admin().await;
+        admin
+            .create_topics(&[NewTopic::new(&topic, 2, 1)])
+            .await
+            .expect("create");
+
+        let mut consumer = kestrel_glommio::Consumer::new(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "kestrel-expand-group",
+            kestrel_core::IsolationLevel::ReadUncommitted,
+        )
+        .await
+        .expect("consumer");
+        consumer.set_max_wait(Duration::from_millis(50));
+        consumer.set_metadata_max_age(Duration::ZERO);
+        consumer
+            .subscribe(
+                &group,
+                vec![topic.clone()],
+                Box::new(kestrel_core::group::RangeAssignor),
+                kestrel_glommio::EARLIEST,
+            )
+            .await
+            .expect("subscribe");
+
+        for _ in 0..100 {
+            consumer.poll().await.expect("poll");
+            if consumer.assignments().count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(consumer.assignments().count(), 2, "both to start with");
+
+        admin.create_partitions(&topic, 5).await.expect("expand");
+
+        for _ in 0..100 {
+            consumer.poll().await.expect("poll");
+            if consumer.assignments().count() == 5 {
+                break;
+            }
+            glommio::timer::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            consumer.assignments().count(),
+            5,
+            "the group rejoined and the leader assigned the new partitions"
+        );
+        assert!(
+            consumer.take_expansions().is_empty(),
+            "a subscribed consumer rebalances instead of reporting"
+        );
+
+        consumer.unsubscribe().await.expect("leave");
+        admin.delete_topics(std::slice::from_ref(&topic)).await.expect("delete");
+    });
+}
+
+/// A producer with an expanded topic starts using the new partitions rather
+/// than hashing keys against a count that no longer exists.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn a_producer_places_keys_against_the_new_count() {
+    run(|| async {
+        let topic = unique("expand-produce");
+        let mut admin = admin().await;
+        admin
+            .create_topics(&[NewTopic::new(&topic, 1, 1)])
+            .await
+            .expect("create");
+
+        let mut producer = kestrel_glommio::Producer::idempotent(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "kestrel-expand-produce",
+        )
+        .await
+        .expect("producer");
+        producer.set_metadata_max_age(Duration::ZERO);
+
+        for i in 0..8 {
+            producer
+                .produce(
+                    &topic,
+                    kestrel_glommio::ProducerRecord::new(
+                        Some(bytes::Bytes::from(format!("k{i}"))),
+                        Some(bytes::Bytes::from("v")),
+                    ),
+                )
+                .await
+                .expect("produce");
+        }
+        producer.flush().await.expect("flush");
+
+        admin.create_partitions(&topic, 4).await.expect("expand");
+        glommio::timer::sleep(Duration::from_millis(200)).await;
+
+        let mut used = std::collections::BTreeSet::new();
+        for i in 0..40 {
+            let partition = producer
+                .partition_for(&topic, Some(format!("k{i}").as_bytes()))
+                .await
+                .expect("partition for");
+            used.insert(partition);
+        }
+        assert!(
+            used.len() > 1,
+            "keys should spread across the new partitions, got {used:?}"
+        );
+
+        admin.delete_topics(std::slice::from_ref(&topic)).await.expect("delete");
+    });
+}
