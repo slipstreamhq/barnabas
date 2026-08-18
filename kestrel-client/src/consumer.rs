@@ -27,7 +27,7 @@
 //! what makes the connection count affordable — the thing `PERF.md` and the
 //! design doc both flagged as the cost of being per-core.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -270,6 +270,10 @@ pub struct Consumer<T: Transport> {
     listener: Option<Box<dyn RebalanceListener>>,
     /// `(session, rebalance)`, applied when a group is joined.
     group_timeouts: Option<(Duration, Duration)>,
+    /// Partitions held but not fetched. Separate from `positions` because a
+    /// paused partition is still **assigned**: it keeps its offset, it counts
+    /// against the group, and resuming it must not re-resolve where it was.
+    paused: BTreeSet<(String, i32)>,
     /// Bumped whenever the assignment or a position changes for a reason other
     /// than consuming records. An outstanding fetch from an older generation
     /// asked a question that is no longer the one being asked.
@@ -299,6 +303,7 @@ impl<T: Transport> Consumer<T> {
         Self {
             cluster,
             positions: BTreeMap::new(),
+            paused: BTreeSet::new(),
             isolation,
             max_wait: Duration::from_millis(500),
             max_bytes: 10 * 1024 * 1024,
@@ -330,6 +335,7 @@ impl<T: Transport> Consumer<T> {
         Ok(Self {
             cluster: Cluster::connect(transport, bootstrap, client_id).await?,
             positions: BTreeMap::new(),
+            paused: BTreeSet::new(),
             isolation,
             max_wait: Duration::from_millis(500),
             max_bytes: 10 * 1024 * 1024,
@@ -434,6 +440,7 @@ impl<T: Transport> Consumer<T> {
     ) -> Result<()> {
         self.discard_outstanding().await;
         self.positions.clear();
+        self.paused.clear();
         self.reset = reset;
         let mut protocol =
             crate::group::ClassicProtocol::new(group_id.to_owned(), topics, assignor);
@@ -687,6 +694,11 @@ impl<T: Transport> Consumer<T> {
                     }
                     for tp in lost {
                         self.positions.remove(&(tp.topic.clone(), tp.partition));
+                        // **A pause does not survive losing the partition.**
+                        // Another member is about to read it, and if this one
+                        // is given it back the pause would be invisible state
+                        // that silently stops consumption.
+                        self.paused.remove(&(tp.topic.clone(), tp.partition));
                     }
                     changed |= !lost.is_empty();
                     false
@@ -727,10 +739,65 @@ impl<T: Transport> Consumer<T> {
     /// more machinery than a fresh full fetch costs.
     pub fn remove(&mut self, topic: &str, partition: i32) {
         self.positions.remove(&(topic.to_owned(), partition));
+        self.paused.remove(&(topic.to_owned(), partition));
         self.generation += 1;
         for session in self.sessions.values_mut() {
             session.reset();
         }
+    }
+
+    /// Stop fetching these partitions without giving them up.
+    ///
+    /// The partitions stay assigned and keep their positions — this is
+    /// backpressure, not a revocation, and a paused consumer must keep polling
+    /// or the group will decide it is gone.
+    ///
+    /// Resets the fetch sessions for the same reason [`Self::remove`] does: the
+    /// broker's remembered set no longer matches ours.
+    pub fn pause(&mut self, partitions: &[kestrel_core::group::TopicPartition]) {
+        for tp in partitions {
+            self.paused.insert((tp.topic.clone(), tp.partition));
+        }
+        self.on_fetch_set_changed();
+    }
+
+    /// Fetch these partitions again, from wherever they stopped.
+    pub fn resume(&mut self, partitions: &[kestrel_core::group::TopicPartition]) {
+        for tp in partitions {
+            self.paused.remove(&(tp.topic.clone(), tp.partition));
+        }
+        self.on_fetch_set_changed();
+    }
+
+    /// Every partition currently paused, whether or not it is still assigned.
+    pub fn paused(&self) -> impl Iterator<Item = (&str, i32)> {
+        self.paused
+            .iter()
+            .map(|(topic, partition)| (topic.as_str(), *partition))
+    }
+
+    /// Whether one partition is paused.
+    #[must_use]
+    pub fn is_paused(&self, topic: &str, partition: i32) -> bool {
+        self.paused.contains(&(topic.to_owned(), partition))
+    }
+
+    /// A prefetch in flight asked about a set that no longer applies, and the
+    /// broker's session remembers that set too.
+    fn on_fetch_set_changed(&mut self) {
+        self.generation += 1;
+        for session in self.sessions.values_mut() {
+            session.reset();
+        }
+    }
+
+    /// Assigned and not paused: what a fetch may ask about.
+    fn fetchable(&self) -> Vec<(String, i32)> {
+        self.positions
+            .keys()
+            .filter(|key| !self.paused.contains(*key))
+            .cloned()
+            .collect()
     }
 
     /// Every partition this consumer holds.
@@ -913,6 +980,233 @@ impl<T: Transport> Consumer<T> {
         unreachable!("the loop returns on its last attempt")
     }
 
+    /// `ListOffsets` for many partitions at once: **one request per leader**,
+    /// not one per partition.
+    ///
+    /// Every lookup below is this: `end_offsets` on a 64-partition assignment
+    /// is one or two round trips rather than 64. Returns `(offset, timestamp)`
+    /// per partition, and **omits** a partition whose answer is "no such
+    /// offset" (`-1`), which is what `offsets_for_times` needs to distinguish
+    /// from offset zero.
+    async fn list_offsets_many(
+        &mut self,
+        want: &[(kestrel_core::group::TopicPartition, i64)],
+    ) -> Result<BTreeMap<kestrel_core::group::TopicPartition, (i64, i64)>> {
+        // See [`Self::assign`]: a prefetch is sitting unread on a connection
+        // this is about to reuse.
+        self.discard_outstanding().await;
+
+        let mut found = BTreeMap::new();
+        if want.is_empty() {
+            return Ok(found);
+        }
+
+        let mut remaining: Vec<(kestrel_core::group::TopicPartition, i64)> = want.to_vec();
+        for attempt in 0..=MAX_LEADER_RETRIES {
+            // Group by leader afresh each attempt: a retry is usually here
+            // *because* leadership moved.
+            let mut by_leader: BTreeMap<String, Vec<(kestrel_core::group::TopicPartition, i64)>> =
+                BTreeMap::new();
+            let mut no_leader: Option<Error> = None;
+            for (tp, timestamp) in &remaining {
+                match self.cluster.leader_addr(&tp.topic, tp.partition).await {
+                    Ok(addr) => by_leader
+                        .entry(addr)
+                        .or_default()
+                        .push((tp.clone(), *timestamp)),
+                    Err(e @ Error::NoLeader { .. }) => no_leader = Some(e),
+                    Err(e) => return Err(e),
+                }
+            }
+
+            let mut retry: Vec<(kestrel_core::group::TopicPartition, i64)> = Vec::new();
+            let mut refresh: Vec<String> = Vec::new();
+            for (addr, group) in by_leader {
+                let mut topics: BTreeMap<String, Vec<ListOffsetsPartition>> = BTreeMap::new();
+                for (tp, timestamp) in &group {
+                    let mut entry = ListOffsetsPartition::default();
+                    entry.partition_index = tp.partition;
+                    entry.timestamp = *timestamp;
+                    topics.entry(tp.topic.clone()).or_default().push(entry);
+                }
+
+                let mut req = ListOffsetsRequest::default();
+                req.replica_id = BrokerId(-1);
+                req.isolation_level = self.isolation.as_i8();
+                req.topics = topics
+                    .into_iter()
+                    .map(|(name, partitions)| {
+                        let mut topic = ListOffsetsTopic::default();
+                        topic.name = TopicName(StrBytes::from_string(name));
+                        topic.partitions = partitions;
+                        topic
+                    })
+                    .collect();
+
+                let resp: ListOffsetsResponse = self
+                    .cluster
+                    .call_at(&addr, ApiKey::ListOffsets, 7, &req)
+                    .await?;
+
+                for topic in &resp.topics {
+                    for partition in &topic.partitions {
+                        let tp = kestrel_core::group::TopicPartition::new(
+                            topic.name.0.to_string(),
+                            partition.partition_index,
+                        );
+                        let code = ErrorCode(partition.error_code);
+                        if code.is_ok() {
+                            // `-1` is "nothing at or after that timestamp", not
+                            // an error and not offset -1.
+                            if partition.offset >= 0 {
+                                found.insert(tp, (partition.offset, partition.timestamp));
+                            }
+                            continue;
+                        }
+                        if code.disposition() == Disposition::RefreshMetadata {
+                            self.cluster.invalidate(&tp.topic, tp.partition);
+                            refresh.push(tp.topic.clone());
+                            let timestamp = group
+                                .iter()
+                                .find(|(w, _)| *w == tp)
+                                .map_or(LATEST, |(_, t)| *t);
+                            retry.push((tp, timestamp));
+                            continue;
+                        }
+                        check("ListOffsets", partition.error_code)?;
+                    }
+                }
+            }
+
+            // A partition whose leader is mid-election is a wait, not a
+            // failure — the same rule `list_offset` follows.
+            if let Some(e) = no_leader {
+                if retry.is_empty() && attempt == MAX_LEADER_RETRIES {
+                    return Err(e);
+                }
+                for (tp, timestamp) in &remaining {
+                    if !found.contains_key(tp) && !retry.iter().any(|(r, _)| r == tp) {
+                        retry.push((tp.clone(), *timestamp));
+                    }
+                }
+            }
+
+            if retry.is_empty() {
+                return Ok(found);
+            }
+            if attempt == MAX_LEADER_RETRIES {
+                return Err(Error::Broker {
+                    op: "ListOffsets",
+                    code: ErrorCode::NOT_LEADER_OR_FOLLOWER.0,
+                    disposition: Disposition::RefreshMetadata,
+                });
+            }
+            refresh.sort();
+            refresh.dedup();
+            for topic in refresh {
+                self.cluster.refresh_metadata(&topic).await?;
+            }
+            T::sleep(LEADER_BACKOFF).await;
+            remaining = retry;
+        }
+        unreachable!("the loop returns on its last attempt")
+    }
+
+    /// The offset **after** the last record of each partition — the log end.
+    ///
+    /// Under READ_COMMITTED this is the last stable offset, so it does not run
+    /// ahead of what a committed reader can see, and lag computed from it does
+    /// not sit permanently at the size of an open transaction.
+    ///
+    /// # Errors
+    /// If no leader answers.
+    pub async fn end_offsets(
+        &mut self,
+        partitions: &[kestrel_core::group::TopicPartition],
+    ) -> Result<BTreeMap<kestrel_core::group::TopicPartition, i64>> {
+        let want: Vec<_> = partitions.iter().cloned().map(|tp| (tp, LATEST)).collect();
+        Ok(self
+            .list_offsets_many(&want)
+            .await?
+            .into_iter()
+            .map(|(tp, (offset, _))| (tp, offset))
+            .collect())
+    }
+
+    /// The offset of the oldest record still retained in each partition.
+    ///
+    /// Not zero: retention and `DeleteRecords` move it forward, and assuming
+    /// zero is how a consumer asks for an offset the broker has deleted.
+    ///
+    /// # Errors
+    /// As [`Self::end_offsets`].
+    pub async fn beginning_offsets(
+        &mut self,
+        partitions: &[kestrel_core::group::TopicPartition],
+    ) -> Result<BTreeMap<kestrel_core::group::TopicPartition, i64>> {
+        let want: Vec<_> = partitions.iter().cloned().map(|tp| (tp, EARLIEST)).collect();
+        Ok(self
+            .list_offsets_many(&want)
+            .await?
+            .into_iter()
+            .map(|(tp, (offset, _))| (tp, offset))
+            .collect())
+    }
+
+    /// The first offset at or after each timestamp, with the timestamp of the
+    /// record found.
+    ///
+    /// A partition with **no** record at or after its timestamp is absent from
+    /// the result rather than present with a sentinel, the same distinction
+    /// [`Self::committed`] draws. Timestamps are milliseconds since the epoch.
+    ///
+    /// # Errors
+    /// As [`Self::end_offsets`].
+    pub async fn offsets_for_times(
+        &mut self,
+        want: &[(kestrel_core::group::TopicPartition, i64)],
+    ) -> Result<BTreeMap<kestrel_core::group::TopicPartition, (i64, i64)>> {
+        self.list_offsets_many(want).await
+    }
+
+    /// How far each assigned partition is behind its log end.
+    ///
+    /// A partition this consumer has not read from yet has no position, so it
+    /// is absent — "unknown lag" and "zero lag" are different answers, and an
+    /// alert built on the second one stays quiet through a consumer that never
+    /// started.
+    ///
+    /// # Errors
+    /// As [`Self::end_offsets`].
+    pub async fn lag(&mut self) -> Result<BTreeMap<kestrel_core::group::TopicPartition, i64>> {
+        let positions = self.positions();
+        let assigned: Vec<_> = positions.keys().cloned().collect();
+        let ends = self.end_offsets(&assigned).await?;
+        Ok(positions
+            .into_iter()
+            .filter_map(|(tp, position)| {
+                ends.get(&tp).map(|end| (tp, (end - position).max(0)))
+            })
+            .collect())
+    }
+
+    /// Where this consumer's group last committed, for the partitions given.
+    ///
+    /// A partition with no committed offset is **absent**, not zero.
+    ///
+    /// # Errors
+    /// If this consumer is not in a group.
+    pub async fn committed(
+        &mut self,
+        partitions: &[kestrel_core::group::TopicPartition],
+    ) -> Result<BTreeMap<kestrel_core::group::TopicPartition, i64>> {
+        self.discard_outstanding().await;
+        let Some(group) = self.group.as_mut() else {
+            return Err(Error::Missing("a group to read commits from"));
+        };
+        crate::group::GroupProtocol::committed(group, &mut self.cluster, partitions).await
+    }
+
     /// Send one `Fetch` per broker and record what was asked, without waiting.
     ///
     /// If a send fails partway, whatever was already sent is still recorded —
@@ -920,7 +1214,7 @@ impl<T: Transport> Consumer<T> {
     /// leaving them unrecorded would strand them on the connection.
     async fn issue_fetch(&mut self) -> Result<()> {
         let mut by_broker: BTreeMap<String, Vec<(String, i32)>> = BTreeMap::new();
-        for (topic, partition) in self.positions.keys().cloned().collect::<Vec<_>>() {
+        for (topic, partition) in self.fetchable() {
             let addr = self.cluster.leader_addr(&topic, partition).await?;
             by_broker.entry(addr).or_default().push((topic, partition));
         }
@@ -964,7 +1258,7 @@ impl<T: Transport> Consumer<T> {
     /// reports whatever goes wrong then. Returning it from *this* call would
     /// fail a poll that had already succeeded.
     async fn start_prefetch(&mut self) {
-        if self.prefetch && !self.positions.is_empty() {
+        if self.prefetch && !self.fetchable().is_empty() {
             let _ = self.issue_fetch().await;
         }
     }
@@ -1139,7 +1433,10 @@ impl<T: Transport> Consumer<T> {
                 self.discard_outstanding().await;
             }
         }
-        if self.positions.is_empty() {
+        // Not `positions`: a consumer with every partition paused still has an
+        // assignment, and must still have polled — the heartbeat above is what
+        // keeps it in the group.
+        if self.fetchable().is_empty() {
             return Ok(Vec::new());
         }
         if self

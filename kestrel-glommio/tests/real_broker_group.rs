@@ -611,3 +611,71 @@ fn cooperative_rebalancing_never_drops_everything() {
         );
     });
 }
+
+/// `committed` reads back what `commit` wrote, and says **nothing** for a
+/// partition never committed to.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn committed_reports_only_what_was_committed() {
+    run(|| async {
+        let topic = unique("committed");
+        let group = unique("committedg");
+        let mut prod = TestProducer::connect(&broker(), &topic).await;
+        prod.create_topic_with_partitions(2).await;
+        prod.produce_plain(3).await;
+
+        let mut consumer = kestrel_glommio::Consumer::new(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "committed-1",
+            kestrel_core::IsolationLevel::ReadUncommitted,
+        )
+        .await
+        .expect("consumer");
+        consumer.set_max_wait(Duration::from_millis(100));
+        consumer
+            .subscribe(
+                &group,
+                vec![topic.clone()],
+                Box::new(RangeAssignor),
+                kestrel_glommio::EARLIEST,
+            )
+            .await
+            .expect("subscribe");
+
+        let p0 = kestrel_core::group::TopicPartition::new(topic.clone(), 0);
+        let p1 = kestrel_core::group::TopicPartition::new(topic.clone(), 1);
+
+        let mut read = 0;
+        for _ in 0..100 {
+            for group in consumer.poll().await.expect("poll") {
+                read += group.len();
+            }
+            if read >= 3 {
+                break;
+            }
+        }
+        assert_eq!(read, 3);
+
+        let before = consumer.committed(&[p0.clone()]).await.expect("committed");
+        assert!(before.is_empty(), "nothing committed yet: {before:?}");
+
+        consumer.commit().await.expect("commit");
+        let after = consumer
+            .committed(&[p0.clone(), p1.clone()])
+            .await
+            .expect("committed");
+        assert_eq!(
+            after.get(&p0),
+            Some(&3),
+            "the committed offset is the next one to read"
+        );
+        assert_eq!(
+            after.get(&p1),
+            Some(&0),
+            "an empty partition commits its position, which is zero"
+        );
+
+        consumer.unsubscribe().await.expect("leave");
+    });
+}

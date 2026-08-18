@@ -487,3 +487,177 @@ fn batch_filtering_drops_only_the_aborted_transaction() {
         );
     });
 }
+
+// ── the ordinary consumer surface ──────────────────────────────────────────
+
+/// `end_offsets`, `beginning_offsets` and `lag` on a real log.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn offset_lookups_describe_the_log() {
+    run(|| async {
+        let topic = unique_topic("offsets");
+        let mut producer = TestProducer::connect(&broker(), &topic).await;
+        producer.create_topic_with_partitions(2).await;
+        producer.produce_plain(5).await;
+
+        let mut consumer = Consumer::for_partition(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "kestrel-offsets",
+            &topic,
+            0,
+            EARLIEST,
+            IsolationLevel::ReadUncommitted,
+        )
+        .await
+        .expect("assign");
+
+        let p0 = kestrel_core::group::TopicPartition::new(topic.clone(), 0);
+        let p1 = kestrel_core::group::TopicPartition::new(topic.clone(), 1);
+
+        let ends = consumer.end_offsets(&[p0.clone(), p1.clone()]).await.expect("end");
+        assert_eq!(ends.get(&p0), Some(&5), "five records went to partition 0");
+        assert_eq!(ends.get(&p1), Some(&0), "partition 1 is empty");
+
+        let begins = consumer
+            .beginning_offsets(&[p0.clone(), p1.clone()])
+            .await
+            .expect("beginning");
+        assert_eq!(begins.get(&p0), Some(&0));
+
+        // Nothing read yet, so the whole log is lag.
+        let lag = consumer.lag().await.expect("lag");
+        assert_eq!(lag.get(&p0), Some(&5));
+
+        let read = consumer.poll().await.expect("poll");
+        let count: usize = read.iter().map(kestrel_glommio::ConsumerRecords::len).sum();
+        assert!(count > 0, "should have read something");
+
+        let lag = consumer.lag().await.expect("lag after reading");
+        assert_eq!(
+            lag.get(&p0),
+            Some(&(5 - i64::try_from(count).unwrap())),
+            "lag is the log end minus where we are"
+        );
+    });
+}
+
+/// A timestamp lookup finds the first record at or after it, and a timestamp
+/// past the end of the log finds **nothing** — absent, not offset -1.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn offsets_for_times_finds_the_first_record_at_or_after() {
+    run(|| async {
+        let topic = unique_topic("times");
+        let mut producer = TestProducer::connect(&broker(), &topic).await;
+        producer.create_topic().await;
+        producer.produce_plain(3).await;
+
+        let mut consumer = Consumer::for_partition(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "kestrel-times",
+            &topic,
+            0,
+            EARLIEST,
+            IsolationLevel::ReadUncommitted,
+        )
+        .await
+        .expect("assign");
+
+        let p0 = kestrel_core::group::TopicPartition::new(topic.clone(), 0);
+
+        let from_the_beginning = consumer
+            .offsets_for_times(&[(p0.clone(), 0)])
+            .await
+            .expect("offsets for times");
+        assert_eq!(
+            from_the_beginning.get(&p0).map(|(offset, _)| *offset),
+            Some(0),
+            "everything was written after the epoch"
+        );
+
+        let far_future = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap()
+            + 3_600_000;
+        let nothing = consumer
+            .offsets_for_times(&[(p0.clone(), far_future)])
+            .await
+            .expect("offsets for times");
+        assert!(
+            nothing.is_empty(),
+            "no record at or after an hour from now: {nothing:?}"
+        );
+    });
+}
+
+/// A paused partition yields nothing and keeps its position; resuming it
+/// carries on from where it stopped rather than re-reading or skipping.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn pausing_stops_a_partition_without_losing_its_place() {
+    run(|| async {
+        let topic = unique_topic("pause");
+        let mut producer = TestProducer::connect(&broker(), &topic).await;
+        producer.create_topic().await;
+        producer.produce_plain(4).await;
+
+        let mut consumer = Consumer::for_partition(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "kestrel-pause",
+            &topic,
+            0,
+            EARLIEST,
+            IsolationLevel::ReadUncommitted,
+        )
+        .await
+        .expect("assign");
+        consumer.set_max_wait(Duration::from_millis(100));
+
+        let p0 = kestrel_core::group::TopicPartition::new(topic.clone(), 0);
+
+        let first = consumer.poll().await.expect("poll");
+        let read: usize = first.iter().map(kestrel_glommio::ConsumerRecords::len).sum();
+        assert!(read > 0);
+        let position = consumer.position_of(&topic, 0).expect("a position");
+
+        consumer.pause(&[p0.clone()]);
+        assert!(consumer.is_paused(&topic, 0));
+        for _ in 0..3 {
+            let batch = consumer.poll().await.expect("poll while paused");
+            let n: usize = batch.iter().map(kestrel_glommio::ConsumerRecords::len).sum();
+            assert_eq!(n, 0, "a paused partition yields nothing");
+        }
+        assert_eq!(
+            consumer.position_of(&topic, 0),
+            Some(position),
+            "pausing must not move the position"
+        );
+        assert_eq!(
+            consumer.assignments().count(),
+            1,
+            "a paused partition is still assigned"
+        );
+
+        consumer.resume(&[p0]);
+        assert!(!consumer.is_paused(&topic, 0));
+        let mut after = 0;
+        for _ in 0..20 {
+            let batch = consumer.poll().await.expect("poll after resume");
+            after += batch
+                .iter()
+                .map(kestrel_glommio::ConsumerRecords::len)
+                .sum::<usize>();
+            if read + after >= 4 {
+                break;
+            }
+        }
+        assert_eq!(read + after, 4, "resuming carries on, it does not re-read");
+    });
+}
