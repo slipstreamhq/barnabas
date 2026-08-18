@@ -568,6 +568,41 @@ impl<T: Transport> Consumer<T> {
         crate::group::GroupProtocol::commit(group, &mut self.cluster, &offsets).await
     }
 
+    /// Where this consumer would commit to, per partition: **the next offset
+    /// to read**, not the last one read.
+    ///
+    /// For exactly-once with a group, this is the map to hand
+    /// [`Producer::send_offsets_to_transaction`](crate::Producer::send_offsets_to_transaction)
+    /// together with [`Self::group_metadata`]. Read it *after* the records it
+    /// covers have been produced, or the transaction commits offsets for output
+    /// it did not write.
+    #[must_use]
+    pub fn positions(&self) -> BTreeMap<kestrel_core::group::TopicPartition, i64> {
+        self.positions
+            .iter()
+            .map(|((topic, partition), offset)| {
+                (
+                    kestrel_core::group::TopicPartition::new(topic.clone(), *partition),
+                    *offset,
+                )
+            })
+            .collect()
+    }
+
+    /// This member's identity and fencing token, or `None` if it is not in a
+    /// group or not currently stable.
+    ///
+    /// Hand it to a transactional producer so the coordinator can reject
+    /// offsets from a member that has already been replaced. **Fetch it fresh
+    /// per transaction** — a rebalance in between invalidates it, and that is
+    /// the whole point of it.
+    #[must_use]
+    pub fn group_metadata(&self) -> Option<crate::group::GroupMetadata> {
+        self.group
+            .as_ref()
+            .and_then(crate::group::GroupProtocol::<T>::group_metadata)
+    }
+
     /// Commit if auto-commit is on and its interval has elapsed.
     async fn maybe_auto_commit(&mut self) -> Result<()> {
         let Some(interval) = self.auto_commit else {

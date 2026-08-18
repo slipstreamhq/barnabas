@@ -82,6 +82,35 @@ fn read_version(cursor: &mut Bytes) -> Result<i16> {
     Ok(cursor.get_i16())
 }
 
+/// A member's identity and its fencing token, opaque above the seam.
+///
+/// **Nothing outside this module reads the fields.** They are what
+/// `TxnOffsetCommit` must carry so the coordinator can reject a commit from a
+/// member that has already been replaced (KIP-447), and under KIP-848 the same
+/// two positions hold a member epoch instead of a generation. A caller that
+/// could name them would be a caller that has to change when the protocol does,
+/// so the only way to get one is to ask a live consumer for it and hand it
+/// straight to a producer.
+#[derive(Debug, Clone)]
+pub struct GroupMetadata {
+    pub(crate) group_id: String,
+    pub(crate) generation_id: i32,
+    pub(crate) member_id: String,
+    /// Static membership (KIP-345) is not implemented, so this is always
+    /// `None`. It is here because the field is on the wire and leaving it out
+    /// would mean changing this type later.
+    pub(crate) group_instance_id: Option<String>,
+}
+
+impl GroupMetadata {
+    /// The group these offsets belong to. The one field a caller may read,
+    /// because they chose it.
+    #[must_use]
+    pub fn group_id(&self) -> &str {
+        &self.group_id
+    }
+}
+
 /// How this client becomes and stays a member of a group, and how it learns
 /// what it is assigned.
 ///
@@ -115,6 +144,12 @@ pub trait GroupProtocol<T: Transport> {
         cluster: &mut Cluster<T>,
         offsets: &BTreeMap<TopicPartition, i64>,
     ) -> impl std::future::Future<Output = Result<()>>;
+
+    /// What proves this member is current, for a transactional producer.
+    ///
+    /// `None` until the member is stable: an unjoined member has no token to
+    /// offer, and committing without one is how a zombie writes.
+    fn group_metadata(&self) -> Option<GroupMetadata>;
 
     /// Where this group last committed, for the partitions given.
     ///
@@ -463,6 +498,21 @@ impl<T: Transport> GroupProtocol<T> for ClassicProtocol {
         offsets: &BTreeMap<TopicPartition, i64>,
     ) -> Result<()> {
         self.commit_offsets(cluster, offsets).await
+    }
+
+    fn group_metadata(&self) -> Option<GroupMetadata> {
+        // `can_commit` is exactly the right gate: a metadata that cannot commit
+        // is a metadata that will be rejected, and finding that out at
+        // `TxnOffsetCommit` time aborts a transaction that never had to start.
+        if !self.member.can_commit() {
+            return None;
+        }
+        Some(GroupMetadata {
+            group_id: self.member.group_id().to_owned(),
+            generation_id: self.member.generation(),
+            member_id: self.member.member_id().to_owned(),
+            group_instance_id: None,
+        })
     }
 
     async fn committed(

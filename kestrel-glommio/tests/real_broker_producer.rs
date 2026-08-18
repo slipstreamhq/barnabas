@@ -467,3 +467,228 @@ fn producing_outside_a_transaction_is_refused() {
         );
     });
 }
+
+// ── exactly-once with a consumer group ─────────────────────────────────────
+
+/// Read every record a group can currently see, into `(partition, value)`.
+///
+/// Takes what [`joined`] already collected: waiting for an assignment means
+/// polling, and a poll that fetches records has consumed them whether or not
+/// the caller was ready. Dropping those is how this test first "proved" a
+/// topic was empty.
+async fn drain(consumer: &mut Consumer, mut seen: Vec<(i32, String)>, want: usize) -> Vec<(i32, String)> {
+    for _ in 0..200 {
+        for group in consumer.poll().await.expect("poll") {
+            for record in group.iter() {
+                seen.push((
+                    group.partition,
+                    String::from_utf8_lossy(&record.value().expect("value")).into_owned(),
+                ));
+            }
+        }
+        if seen.len() >= want {
+            break;
+        }
+    }
+    seen
+}
+
+/// Subscribe a fresh consumer to `group` and wait until it holds partitions,
+/// keeping anything it read on the way.
+async fn joined(group: &str, topic: &str, client_id: &str) -> (Consumer, Vec<(i32, String)>) {
+    let mut consumer = Consumer::new(
+        kestrel_glommio::Glommio,
+        &bootstrap(),
+        client_id,
+        IsolationLevel::ReadCommitted,
+    )
+    .await
+    .expect("consumer");
+    consumer.set_max_wait(Duration::from_millis(100));
+    consumer
+        .subscribe(
+            group,
+            vec![topic.to_owned()],
+            Box::new(kestrel_core::group::RangeAssignor),
+            EARLIEST,
+        )
+        .await
+        .expect("subscribe");
+    let mut seen = Vec::new();
+    for _ in 0..100 {
+        for group in consumer.poll().await.expect("poll") {
+            for record in group.iter() {
+                seen.push((
+                    group.partition,
+                    String::from_utf8_lossy(&record.value().expect("value")).into_owned(),
+                ));
+            }
+        }
+        if consumer.assignments().count() > 0 {
+            return (consumer, seen);
+        }
+    }
+    panic!("never assigned a partition");
+}
+
+/// **Consume-transform-produce, exactly once.**
+///
+/// The output and the input offsets commit together or not at all. Asserting
+/// only that the output arrived would pass with the offsets committed
+/// separately, which is the bug this protocol exists to prevent — so the test
+/// that matters is the *second* consumer: a fresh member of the same group must
+/// see nothing left to read.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn exactly_once_commits_offsets_with_the_output() {
+    run(|| async {
+        let input = unique("eos-in");
+        let output = unique("eos-out");
+        let group = unique("eos-group");
+        make_topic_with_partitions(&input, 2).await;
+        make_topic(&output).await;
+
+        let mut source = Producer::idempotent(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test")
+            .await
+            .expect("source producer");
+        source.send(&input, 0, &records(&["a", "b"])).await.expect("p0");
+        source.send(&input, 1, &records(&["c", "d"])).await.expect("p1");
+
+        let (mut consumer, prefetched) = joined(&group, &input, "eos-1").await;
+        let mut producer = Producer::transactional(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "kestrel-test",
+            &unique("tid"),
+        )
+        .await
+        .expect("transactional producer");
+
+        let seen = drain(&mut consumer, prefetched, 4).await;
+        assert_eq!(seen.len(), 4, "the input should be readable: {seen:?}");
+
+        producer.begin_transaction().expect("begin");
+        let transformed: Vec<ProducerRecord> = seen
+            .iter()
+            .map(|(_, value)| {
+                ProducerRecord::new(None, Some(Bytes::from(format!("{value}!"))))
+            })
+            .collect();
+        producer.send(&output, 0, &transformed).await.expect("send output");
+
+        // **After producing, before committing.** The offsets account for the
+        // records just written; reading them earlier would commit input the
+        // transaction has not yet produced output for.
+        let metadata = consumer.group_metadata().expect("stable member");
+        producer
+            .send_offsets_to_transaction(&consumer.positions(), &metadata)
+            .await
+            .expect("send offsets");
+        producer.commit_transaction().await.expect("commit");
+
+        let mut written = read_all(&output, 4, IsolationLevel::ReadCommitted).await;
+        written.sort();
+        assert_eq!(written, vec!["a!", "b!", "c!", "d!"]);
+
+        consumer.unsubscribe().await.expect("leave");
+
+        // The offsets committed inside the transaction are the group's now.
+        let (mut next, prefetched) = joined(&group, &input, "eos-2").await;
+        let leftover = drain(&mut next, prefetched, 1).await;
+        assert!(
+            leftover.is_empty(),
+            "the transaction committed the offsets, so nothing should be left: {leftover:?}"
+        );
+        next.unsubscribe().await.expect("leave 2");
+    });
+}
+
+/// An aborted transaction takes its offsets down with it: the input is read
+/// again, which is the "at least once on failure" half of exactly-once.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn an_aborted_transaction_does_not_commit_offsets() {
+    run(|| async {
+        let input = unique("eos-abort-in");
+        let output = unique("eos-abort-out");
+        let group = unique("eos-abort-group");
+        make_topic(&input).await;
+        make_topic(&output).await;
+
+        let mut source = Producer::idempotent(kestrel_glommio::Glommio, &bootstrap(), "kestrel-test")
+            .await
+            .expect("source producer");
+        source.send(&input, 0, &records(&["x", "y"])).await.expect("seed");
+
+        let (mut consumer, prefetched) = joined(&group, &input, "abort-1").await;
+        let mut producer = Producer::transactional(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "kestrel-test",
+            &unique("tid"),
+        )
+        .await
+        .expect("transactional producer");
+
+        let seen = drain(&mut consumer, prefetched, 2).await;
+        assert_eq!(seen.len(), 2);
+
+        producer.begin_transaction().expect("begin");
+        producer
+            .send(&output, 0, &records(&["doomed"]))
+            .await
+            .expect("send output");
+        let metadata = consumer.group_metadata().expect("stable member");
+        producer
+            .send_offsets_to_transaction(&consumer.positions(), &metadata)
+            .await
+            .expect("send offsets");
+        producer.abort_transaction().await.expect("abort");
+
+        consumer.unsubscribe().await.expect("leave");
+
+        let (mut next, prefetched) = joined(&group, &input, "abort-2").await;
+        let again = drain(&mut next, prefetched, 2).await;
+        let values: Vec<String> = again.into_iter().map(|(_, v)| v).collect();
+        assert_eq!(
+            values,
+            vec!["x", "y"],
+            "the abort discarded the offsets, so the input must be read again"
+        );
+        next.unsubscribe().await.expect("leave 2");
+    });
+}
+
+/// Offsets cannot be sent outside a transaction. Cheap to get wrong, and the
+/// symptom without this check is offsets that commit unconditionally.
+#[test]
+#[ignore = "needs a Kafka broker on localhost:9092"]
+fn sending_offsets_outside_a_transaction_is_rejected() {
+    run(|| async {
+        let topic = unique("eos-guard");
+        let group = unique("eos-guard-group");
+        make_topic(&topic).await;
+
+        let (mut consumer, _) = joined(&group, &topic, "guard-1").await;
+        let mut producer = Producer::transactional(
+            kestrel_glommio::Glommio,
+            &bootstrap(),
+            "kestrel-test",
+            &unique("tid"),
+        )
+        .await
+        .expect("transactional producer");
+
+        let metadata = consumer.group_metadata().expect("stable member");
+        let mut offsets = std::collections::BTreeMap::new();
+        offsets.insert(
+            kestrel_core::group::TopicPartition::new(topic.clone(), 0),
+            0,
+        );
+
+        let result = producer.send_offsets_to_transaction(&offsets, &metadata).await;
+        assert!(result.is_err(), "no transaction is open");
+
+        consumer.unsubscribe().await.expect("leave");
+    });
+}

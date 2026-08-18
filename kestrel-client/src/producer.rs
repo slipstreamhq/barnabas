@@ -21,11 +21,14 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::messages::{
+    add_offsets_to_txn_request::AddOffsetsToTxnRequest,
     add_partitions_to_txn_request::AddPartitionsToTxnTopic,
+    txn_offset_commit_request::{TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
     AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, EndTxnRequest, EndTxnResponse,
     FindCoordinatorRequest, FindCoordinatorResponse, InitProducerIdRequest, InitProducerIdResponse,
-    ProduceRequest, ProduceResponse, ProducerId, TopicName, TransactionalId,
+    AddOffsetsToTxnResponse, GroupId, ProduceRequest, ProduceResponse, ProducerId, TopicName,
+    TransactionalId, TxnOffsetCommitRequest, TxnOffsetCommitResponse,
 };
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{
@@ -407,6 +410,194 @@ impl<T: Transport> Producer<T> {
 
         self.state.on_end_transaction();
         Ok(())
+    }
+
+    /// Commit a consumer group's offsets **as part of this transaction**.
+    ///
+    /// This is what makes consume-transform-produce exactly-once: the offsets
+    /// land only if the transaction commits, so a crash between producing and
+    /// committing replays the input rather than losing the output.
+    ///
+    /// Two requests, to **two different coordinators**, and they are not
+    /// interchangeable:
+    ///
+    /// - `AddOffsetsToTxn` goes to the *transaction* coordinator and enrolls
+    ///   the group's `__consumer_offsets` partition in the transaction, the
+    ///   same way [`Self::enroll_all`] enrolls a data partition. Without it the
+    ///   offsets are written outside the transaction and commit regardless.
+    /// - `TxnOffsetCommit` goes to the *group* coordinator, carrying the
+    ///   member's fencing token so a member that has already been replaced
+    ///   cannot commit (KIP-447). That is why `metadata` comes from a live
+    ///   consumer and cannot be constructed by a caller.
+    ///
+    /// Call it **after** producing the records those offsets account for, and
+    /// before [`Self::commit_transaction`].
+    ///
+    /// # Errors
+    /// If no transaction is open, the producer is not transactional, or either
+    /// coordinator rejects the request. A rejection here is not recoverable by
+    /// retrying the commit: abort the transaction and rejoin the group.
+    pub async fn send_offsets_to_transaction(
+        &mut self,
+        offsets: &BTreeMap<kestrel_core::group::TopicPartition, i64>,
+        metadata: &crate::group::GroupMetadata,
+    ) -> Result<()> {
+        if self.state.state() != kestrel_core::TxnState::InTransaction {
+            return Err(Error::Producer(
+                kestrel_core::producer::ProducerError::NoTransaction,
+            ));
+        }
+        if offsets.is_empty() {
+            return Ok(());
+        }
+        let identity = self.state.identity().ok_or(Error::Missing("producer id"))?;
+        let txn_id = self
+            .transactional_id
+            .clone()
+            .ok_or(Error::Missing("transactional id"))?;
+
+        let mut add = AddOffsetsToTxnRequest::default();
+        add.transactional_id = TransactionalId(StrBytes::from_string(txn_id.clone()));
+        add.producer_id = ProducerId(identity.id);
+        add.producer_epoch = identity.epoch;
+        add.group_id = GroupId(StrBytes::from_string(metadata.group_id.clone()));
+
+        let _: AddOffsetsToTxnResponse = self
+            .coordinator_call(
+                "AddOffsetsToTxn",
+                ApiKey::AddOffsetsToTxn,
+                3,
+                &add,
+                |r: &AddOffsetsToTxnResponse| r.error_code,
+            )
+            .await?;
+
+        let mut topics: BTreeMap<String, Vec<TxnOffsetCommitRequestPartition>> = BTreeMap::new();
+        for (tp, offset) in offsets {
+            let mut entry = TxnOffsetCommitRequestPartition::default();
+            entry.partition_index = tp.partition;
+            entry.committed_offset = *offset;
+            entry.committed_leader_epoch = -1;
+            topics.entry(tp.topic.clone()).or_default().push(entry);
+        }
+
+        let mut commit = TxnOffsetCommitRequest::default();
+        commit.transactional_id = TransactionalId(StrBytes::from_string(txn_id));
+        commit.group_id = GroupId(StrBytes::from_string(metadata.group_id.clone()));
+        commit.producer_id = ProducerId(identity.id);
+        commit.producer_epoch = identity.epoch;
+        commit.generation_id = metadata.generation_id;
+        commit.member_id = StrBytes::from_string(metadata.member_id.clone());
+        commit.group_instance_id = metadata
+            .group_instance_id
+            .clone()
+            .map(StrBytes::from_string);
+        commit.topics = topics
+            .into_iter()
+            .map(|(name, partitions)| {
+                let mut topic = TxnOffsetCommitRequestTopic::default();
+                topic.name = TopicName(StrBytes::from_string(name));
+                topic.partitions = partitions;
+                topic
+            })
+            .collect();
+
+        self.group_coordinator_call(&metadata.group_id, &commit)
+            .await?;
+        Ok(())
+    }
+
+    /// Send `TxnOffsetCommit` to the **group** coordinator, discovering it and
+    /// re-discovering it on `NOT_COORDINATOR`.
+    ///
+    /// Separate from [`Self::coordinator_call`] because a producer's cached
+    /// coordinator is the *transaction* coordinator; sending a group request
+    /// there earns `NOT_COORDINATOR` forever, and clearing that cache on the
+    /// way would cost the transaction coordinator lookup for no reason.
+    async fn group_coordinator_call(
+        &mut self,
+        group_id: &str,
+        req: &TxnOffsetCommitRequest,
+    ) -> Result<()> {
+        let mut find = FindCoordinatorRequest::default();
+        find.key = StrBytes::from_string(group_id.to_owned());
+        find.key_type = 0; // GROUP
+
+        let mut addr: Option<String> = None;
+        for attempt in 0..MAX_RETRIES {
+            let at = match addr.clone() {
+                Some(a) => a,
+                None => {
+                    let resp: FindCoordinatorResponse = self
+                        .cluster
+                        .call_any(ApiKey::FindCoordinator, 3, &find)
+                        .await?;
+                    let code = ErrorCode(resp.error_code);
+                    if !code.is_ok() {
+                        if matches!(
+                            code.disposition(),
+                            Disposition::Retry | Disposition::FindCoordinator
+                        ) {
+                            Self::backoff(attempt).await;
+                            continue;
+                        }
+                        return Err(Error::Broker {
+                            op: "FindCoordinator",
+                            code: code.0,
+                            disposition: code.disposition(),
+                        });
+                    }
+                    let a = format!("{}:{}", resp.host.as_str(), resp.port);
+                    addr = Some(a.clone());
+                    a
+                }
+            };
+
+            let resp: TxnOffsetCommitResponse = self
+                .cluster
+                .call_at(&at, ApiKey::TxnOffsetCommit, 3, req)
+                .await?;
+
+            // The error is per partition, so the first non-zero one decides.
+            let code = ErrorCode(
+                resp.topics
+                    .iter()
+                    .flat_map(|t| t.partitions.iter())
+                    .map(|p| p.error_code)
+                    .find(|c| *c != 0)
+                    .unwrap_or(0),
+            );
+            if code.is_ok() {
+                return Ok(());
+            }
+            match code.disposition() {
+                Disposition::Retry => Self::backoff(attempt).await,
+                Disposition::FindCoordinator => {
+                    addr = None;
+                    Self::backoff(attempt).await;
+                }
+                Disposition::Fatal => {
+                    self.state.fence();
+                    return Err(Error::Broker {
+                        op: "TxnOffsetCommit",
+                        code: code.0,
+                        disposition: Disposition::Fatal,
+                    });
+                }
+                Disposition::RefreshMetadata | Disposition::Ok => {
+                    return Err(Error::Broker {
+                        op: "TxnOffsetCommit",
+                        code: code.0,
+                        disposition: code.disposition(),
+                    })
+                }
+            }
+        }
+        Err(Error::Broker {
+            op: "TxnOffsetCommit",
+            code: ErrorCode::COORDINATOR_NOT_AVAILABLE.0,
+            disposition: Disposition::Retry,
+        })
     }
 
     /// Enroll partitions in the open transaction, in **one** request.

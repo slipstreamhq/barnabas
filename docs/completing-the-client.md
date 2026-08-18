@@ -151,13 +151,31 @@ Version negotiation already tells us which is available: the broker advertises
 `ConsumerGroupHeartbeat` or it does not, so selection can be automatic later
 without a configuration knob.
 
-### Phase 2 — exactly-once with groups
+### ~~Phase 2 — exactly-once with groups~~ — done
 
-- `AddOffsetsToTxn` + `TxnOffsetCommit`, so offsets commit inside the producer's
-  transaction
+`Producer::send_offsets_to_transaction` sends `AddOffsetsToTxn` to the
+transaction coordinator and `TxnOffsetCommit` to the group coordinator, so a
+group's offsets commit inside the producer's transaction:
 
-Deliberately absent today because Slipstream does not need it: source offsets
-live in its checkpoints. Every other EOS user does need it.
+```rust
+let records = consumer.poll().await?;
+producer.begin_transaction()?;
+producer.send(&output, 0, &transformed).await?;
+// After producing, before committing: these offsets account for that output.
+producer
+    .send_offsets_to_transaction(&consumer.positions(), &consumer.group_metadata().unwrap())
+    .await?;
+producer.commit_transaction().await?;
+```
+
+`group_metadata()` returns an opaque `GroupMetadata` — the member id and the
+fencing token the coordinator checks (KIP-447), so a member that has already
+been replaced cannot commit. It is opaque because naming a *generation* above
+the protocol seam is what KIP-848 changes; a caller only ever passes it along.
+It is `None` unless the member is stable, and must be re-read per transaction.
+
+Static membership (`group.instance.id`, KIP-345) is still absent; the field is
+on the wire and always `None`.
 
 ### Phase 3 — the rest of a normal application's surface
 
@@ -187,11 +205,12 @@ of the producer window. Groups should arrive with the same three.
 
 1. ~~**Naming and API alignment**~~ — done for the three that existed. The rest
    arrive with the features that need them.
-2. **Phase 1, the group protocol** — the piece that makes this usable by
-   ordinary applications.
+2. ~~**Phase 1, the group protocol**~~ — done: classic join/sync/heartbeat,
+   all four assignors, eager and cooperative rebalancing, auto-commit and
+   rebalance callbacks, behind a seam for KIP-848.
 3. **Topic expansion** — groups solve it partly; the assign-only path still
    needs it.
-4. **Phase 2, EOS with groups.**
+4. ~~**Phase 2, EOS with groups**~~ — done.
 5. **Phase 3, the ordinary surface.**
 
 Performance work is finished for now: the client leads the Java client and
