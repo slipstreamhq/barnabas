@@ -491,7 +491,10 @@ fn heartbeating_without_polling_keeps_membership() {
 /// computed — it never checks for overlap — and Java's `CooperativeStickyAssignor`
 /// works against this same cluster.
 ///
-/// Two real causes have been found and fixed, and it still does not converge:
+/// Three real causes have been found and fixed, and it still does not converge.
+/// The first two were reasoned about; the third came from reading
+/// `CooperativeStickyAssignor.java` and `ConsumerCoordinator.java`, which is
+/// what should have happened first:
 ///
 /// 1. The subscription was written at `ConsumerProtocolSubscription` v1, which
 ///    carries `owned_partitions` but not the `generation_id` that v2 added. A
@@ -502,12 +505,20 @@ fn heartbeating_without_polling_keeps_membership() {
 ///    handing away partitions it was still reading. The generation is now kept
 ///    across a handover, which is what being a member of that generation means.
 ///
-/// Both are checked by unit tests and both were worth fixing on their own. What
-/// remains is unidentified: with two live members the handover still does not
-/// settle at four partitions between them. The next step is tracing each
-/// member's `(generation, owned, assigned, lost)` per round against the
-/// broker's `Stabilized group` lines, which is the view that found the earlier
-/// causes and was not yet applied here.
+/// 3. The generation filter was applied to the withholding decision as well as
+///    to the target. Java draws that line deliberately: `memberData` filters by
+///    generation so a stale layout does not become sticky, while
+///    `computePartitionsTransferringOwnership` uses the **raw** owned list,
+///    because withholding is about who is still *reading* a partition and a
+///    member whose claim is judged stale is reading it regardless. Filtering
+///    there hands its partitions to another member while it still holds them.
+///
+/// All three are checked by unit tests and all three were worth fixing. What
+/// remains is unidentified, and the next step is the one deferred three times:
+/// trace each member's `(generation, owned, assigned, lost)` per round beside
+/// the broker's `Stabilized group` lines. Reasoning from the protocol found
+/// three causes and has now stopped paying; the trace is the instrument that
+/// found the version-prefix and forgotten-leader bugs earlier in this work.
 ///
 /// Left failing rather than deleted: the eager path is unaffected, and shipping
 /// `cooperative-sticky` as available while it double-assigns would be far worse

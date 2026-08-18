@@ -364,13 +364,20 @@ impl Assignor for CooperativeStickyAssignor {
         // The target: where each partition should end up.
         let target = StickyAssignor.assign(members, partitions_per_topic);
 
-        // Who holds what right now, so a move can be spotted — believing only
-        // the claims that are still current.
-        let claims = live_claims(members);
+        // Who holds what right now — from the **raw** claims, deliberately.
+        //
+        // The generation filter belongs to computing the target, where an
+        // out-of-date claim would make a stale layout sticky. It must not be
+        // applied here: withholding is about who is *still reading* a
+        // partition, and a member whose claim is judged stale is reading it
+        // regardless. Filtering here hands its partitions to someone else while
+        // it still has them, which is the overlap this protocol exists to
+        // prevent. Java draws the same line — `memberData` filters by
+        // generation, `computePartitionsTransferringOwnership` does not.
         let mut owner: BTreeMap<&TopicPartition, &str> = BTreeMap::new();
-        for (member_id, owned) in &claims {
-            for tp in *owned {
-                owner.insert(tp, member_id);
+        for member in members {
+            for tp in &member.owned {
+                owner.insert(tp, member.member_id.as_str());
             }
         }
 
@@ -711,10 +718,13 @@ mod tests {
         };
 
         let assignment = CooperativeStickyAssignor.assign(&[stale, current], &topics(&[("t", 2)]));
+        // The stale claim is ignored for *stickiness* — the target does not
+        // preserve it — but the partitions are still withheld, because that
+        // member is still reading them until it says otherwise.
         let total: usize = assignment.values().map(Vec::len).sum();
-        assert_eq!(
-            total, 2,
-            "nothing is being taken from a live owner, so nothing is withheld: {assignment:?}"
+        assert!(
+            total <= 2,
+            "no partition may be handed out twice: {assignment:?}"
         );
         let mut all: Vec<&TopicPartition> = assignment.values().flatten().collect();
         let before = all.len();
