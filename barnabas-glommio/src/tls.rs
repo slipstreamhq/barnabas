@@ -48,13 +48,12 @@ impl GlommioTls {
         // Name the provider explicitly. rustls will not pick one from features
         // alone, and the failure is a runtime panic in whichever binary forgot
         // to install a default — recorded the hard way in G4.
-        let config = ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("ring provides the default protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("ring provides the default protocol versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
 
         Self {
             connector: TlsConnector::from(Arc::new(config)),

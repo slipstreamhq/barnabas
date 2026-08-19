@@ -185,6 +185,26 @@ mistake a type can prevent.
 
 ## Examples
 
+The snippets below are bodies: they assume an executor is already running and
+elide the error handling. Under glommio, the shortest complete program that
+runs one of them is
+
+```rust
+#[glommio::main]
+async fn main() -> barnabas_glommio::Result<()> {
+    // any snippet below
+    Ok(())
+}
+```
+
+`#[glommio::main]` builds a `LocalExecutor` and runs the body on it; without it,
+`LocalExecutorBuilder::default().make()?.run(async { .. })` is the same thing
+written out. Under tokio it is `#[tokio::main]` and the snippets are otherwise
+unchanged — that is the point of the binding split.
+
+Every snippet in this file is compiled by `tests/readme_examples.rs`, because
+documentation that does not build is worse than none.
+
 ### Who decides which partitions you read
 
 **Either you or the group — both are supported, and they are different tools.**

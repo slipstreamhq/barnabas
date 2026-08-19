@@ -17,21 +17,21 @@ use bytes::{Bytes, BytesMut};
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use glommio::net::TcpStream;
 
+use barnabas_core::Connection;
 use kafka_protocol::messages::{
     add_partitions_to_txn_request::AddPartitionsToTxnTopic,
-    metadata_request::MetadataRequestTopic, MetadataRequest, MetadataResponse,
     create_topics_request::CreatableTopic,
+    metadata_request::MetadataRequestTopic,
     produce_request::{PartitionProduceData, TopicProduceData},
     AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, CreateTopicsRequest,
     CreateTopicsResponse, EndTxnRequest, EndTxnResponse, FindCoordinatorRequest,
-    FindCoordinatorResponse, InitProducerIdRequest, InitProducerIdResponse, ProduceRequest,
-    ProduceResponse, ProducerId, TopicName, TransactionalId,
+    FindCoordinatorResponse, InitProducerIdRequest, InitProducerIdResponse, MetadataRequest,
+    MetadataResponse, ProduceRequest, ProduceResponse, ProducerId, TopicName, TransactionalId,
 };
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{
     Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
 };
-use barnabas_core::Connection;
 
 pub struct TestProducer {
     stream: TcpStream,
@@ -108,8 +108,14 @@ impl TestProducer {
     /// accepts rather than at whatever this file was written against.
     async fn learn_versions(&mut self) {
         let req = kafka_protocol::messages::ApiVersionsRequest::default();
-        let resp: kafka_protocol::messages::ApiVersionsResponse =
-            exchange(&mut self.stream, &mut self.conn, ApiKey::ApiVersions, 3, &req).await;
+        let resp: kafka_protocol::messages::ApiVersionsResponse = exchange(
+            &mut self.stream,
+            &mut self.conn,
+            ApiKey::ApiVersions,
+            3,
+            &req,
+        )
+        .await;
         for api in &resp.api_keys {
             self.versions
                 .insert(api.api_key, (api.min_version, api.max_version));
@@ -204,9 +210,9 @@ impl TestProducer {
             let leader = resp.topics.iter().find_map(|t| {
                 (t.error_code == 0)
                     .then(|| {
-                        t.partitions
-                            .iter()
-                            .find(|p| p.partition_index == 0 && p.error_code == 0 && p.leader_id.0 >= 0)
+                        t.partitions.iter().find(|p| {
+                            p.partition_index == 0 && p.error_code == 0 && p.leader_id.0 >= 0
+                        })
                     })
                     .flatten()
                     .map(|p| p.leader_id)
@@ -247,15 +253,16 @@ impl TestProducer {
         find.key_type = 1; // TRANSACTION
 
         for attempt in 0..40 {
-            let resp: FindCoordinatorResponse =
-                self.call(ApiKey::FindCoordinator, 3, &find).await;
+            let resp: FindCoordinatorResponse = self.call(ApiKey::FindCoordinator, 3, &find).await;
             match resp.error_code {
                 0 => {
                     // **Connect to the answer.** An earlier version asked and
                     // then threw the address away, which is only harmless when
                     // there is one broker and it is therefore the coordinator.
                     let addr = format!("{}:{}", resp.host.as_str(), resp.port);
-                    let stream = TcpStream::connect(&*addr).await.expect("connect coordinator");
+                    let stream = TcpStream::connect(&*addr)
+                        .await
+                        .expect("connect coordinator");
                     self.coordinator = Some((
                         stream,
                         Connection::new(StrBytes::from_static_str("barnabas-test-producer")),
@@ -274,7 +281,9 @@ impl TestProducer {
         init.producer_epoch = -1;
 
         for attempt in 0..40 {
-            let resp: InitProducerIdResponse = self.call_coordinator(ApiKey::InitProducerId, 4, &init).await;
+            let resp: InitProducerIdResponse = self
+                .call_coordinator(ApiKey::InitProducerId, 4, &init)
+                .await;
             match resp.error_code {
                 0 => {
                     self.producer_id = resp.producer_id;
@@ -314,8 +323,9 @@ impl TestProducer {
         // immediately after ending the first hits it every time. Retriable, and
         // another entry for the taxonomy P2 inherits.
         for attempt in 0..40 {
-            let resp: AddPartitionsToTxnResponse =
-                self.call_coordinator(ApiKey::AddPartitionsToTxn, 3, &req).await;
+            let resp: AddPartitionsToTxnResponse = self
+                .call_coordinator(ApiKey::AddPartitionsToTxn, 3, &req)
+                .await;
             let code = resp
                 .results_by_topic_v3_and_below
                 .iter()
@@ -436,7 +446,8 @@ impl TestProducer {
         for t in &resp.responses {
             for p in &t.partition_responses {
                 assert_eq!(
-                    p.error_code, 0,
+                    p.error_code,
+                    0,
                     "Produce to {}-{} error {} ({:?})",
                     t.name.0.as_str(),
                     p.index,
