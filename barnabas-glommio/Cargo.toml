@@ -17,7 +17,7 @@ kafka-protocol = { workspace = true }
 bytes          = { workspace = true }
 thiserror      = { workspace = true }
 futures-lite   = "2"
-glommio        = { git = "https://github.com/dahankzter/glommio", rev = "2acb59d1" }
+glommio        = { package = "glommio-ng", version = "0.10" }
 futures-rustls = { version = "0.26", optional = true }
 rustls         = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 webpki-roots   = { version = "0.26", optional = true }
