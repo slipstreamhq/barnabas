@@ -275,7 +275,13 @@ mod tests {
     #[test]
     fn a_topic_with_no_partitions_yields_no_partition() {
         let mut counter = 0;
-        assert_eq!(Partitioner::Crc32.partition_for(Some(b"k"), 0, &mut counter), None);
-        assert_eq!(Partitioner::Crc32.partition_for(None, -1, &mut counter), None);
+        assert_eq!(
+            Partitioner::Crc32.partition_for(Some(b"k"), 0, &mut counter),
+            None
+        );
+        assert_eq!(
+            Partitioner::Crc32.partition_for(None, -1, &mut counter),
+            None
+        );
     }
 }

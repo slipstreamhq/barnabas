@@ -50,7 +50,6 @@ fn broker() -> String {
     bootstrap().first().expect("a bootstrap address").clone()
 }
 
-
 /// A topic per test, so tests neither see each other's records nor depend on
 /// run order.
 fn unique_topic(prefix: &str) -> String {
@@ -134,13 +133,13 @@ fn an_aborted_transaction_is_invisible() {
         let mut seen = Vec::new();
         for _ in 0..3 {
             seen.extend(
-            consumer
-                .poll()
-                .await
-                .expect("fetch")
-                .into_iter()
-                .flat_map(|group| group.iter().filter_map(|r| r.value()).collect::<Vec<_>>()),
-        );
+                consumer
+                    .poll()
+                    .await
+                    .expect("fetch")
+                    .into_iter()
+                    .flat_map(|group| group.iter().filter_map(|r| r.value()).collect::<Vec<_>>()),
+            );
         }
         assert!(
             seen.is_empty(),

@@ -19,6 +19,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use barnabas_core::group::{Assignor, Subscription, TopicPartition};
+use barnabas_core::member::{codes, GroupMember, Step};
 use bytes::Bytes;
 use kafka_protocol::messages::{
     consumer_protocol_assignment::{
@@ -27,18 +29,16 @@ use kafka_protocol::messages::{
     consumer_protocol_subscription::{
         ConsumerProtocolSubscription, TopicPartition as SubscriptionTopicPartition,
     },
-    join_group_request::{JoinGroupRequestProtocol, JoinGroupRequest},
+    join_group_request::{JoinGroupRequest, JoinGroupRequestProtocol},
     offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
     offset_fetch_request::OffsetFetchRequestTopic,
-    sync_group_request::{SyncGroupRequestAssignment, SyncGroupRequest},
+    sync_group_request::{SyncGroupRequest, SyncGroupRequestAssignment},
     ApiKey, FindCoordinatorRequest, FindCoordinatorResponse, GroupId, HeartbeatRequest,
     HeartbeatResponse, JoinGroupResponse, LeaveGroupRequest, LeaveGroupResponse,
     OffsetCommitRequest, OffsetCommitResponse, OffsetFetchRequest, OffsetFetchResponse,
     SyncGroupResponse, TopicName,
 };
 use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
-use barnabas_core::group::{Assignor, Subscription, TopicPartition};
-use barnabas_core::member::{codes, GroupMember, Step};
 
 use crate::cluster::Cluster;
 use crate::{Error, Result, Transport};
@@ -208,7 +208,11 @@ pub struct ClassicProtocol {
 
 impl ClassicProtocol {
     #[must_use]
-    pub fn new(group_id: impl Into<String>, topics: Vec<String>, assignor: Box<dyn Assignor>) -> Self {
+    pub fn new(
+        group_id: impl Into<String>,
+        topics: Vec<String>,
+        assignor: Box<dyn Assignor>,
+    ) -> Self {
         // **The assignor decides the protocol**, because they are the same
         // choice: `cooperative-sticky` is a name the group agrees on *and* a
         // different revocation flow. Letting them be set separately is letting
@@ -300,8 +304,9 @@ impl ClassicProtocol {
 
         // The coordinator holds this until the whole group has joined, so its
         // deadline is the rebalance timeout, not the general request timeout.
-        let deadline = Duration::from_millis(u64::try_from(self.rebalance_timeout_ms).unwrap_or(300_000))
-            + JOIN_SLACK;
+        let deadline =
+            Duration::from_millis(u64::try_from(self.rebalance_timeout_ms).unwrap_or(300_000))
+                + JOIN_SLACK;
         let resp: JoinGroupResponse = cluster
             .call_coordinator(&addr, ApiKey::JoinGroup, 7, &req, deadline)
             .await?;
@@ -364,7 +369,9 @@ impl ClassicProtocol {
         req.protocol_name = Some(StrBytes::from_string(self.assignor.name().to_owned()));
         req.assignments = assignments;
 
-        let resp: SyncGroupResponse = cluster.call_coordinator(&addr, ApiKey::SyncGroup, 4, &req, COORDINATOR_TIMEOUT).await?;
+        let resp: SyncGroupResponse = cluster
+            .call_coordinator(&addr, ApiKey::SyncGroup, 4, &req, COORDINATOR_TIMEOUT)
+            .await?;
         let assigned = if resp.error_code == codes::NONE && !resp.assignment.is_empty() {
             decode_assignment(&resp.assignment)?
         } else {
@@ -384,8 +391,16 @@ impl ClassicProtocol {
                 "[{}]   after: gen={} assignment={:?} lost={:?} step={:?}",
                 self.member.member_id(),
                 self.member.generation(),
-                self.member.assignment().iter().map(|t| t.partition).collect::<Vec<_>>(),
-                self.member.lost().iter().map(|t| t.partition).collect::<Vec<_>>(),
+                self.member
+                    .assignment()
+                    .iter()
+                    .map(|t| t.partition)
+                    .collect::<Vec<_>>(),
+                self.member
+                    .lost()
+                    .iter()
+                    .map(|t| t.partition)
+                    .collect::<Vec<_>>(),
                 step
             );
         }
@@ -400,7 +415,9 @@ impl ClassicProtocol {
         req.generation_id = self.member.generation();
         req.member_id = StrBytes::from_string(self.member.member_id().to_owned());
 
-        let resp: HeartbeatResponse = cluster.call_coordinator(&addr, ApiKey::Heartbeat, 4, &req, COORDINATOR_TIMEOUT).await?;
+        let resp: HeartbeatResponse = cluster
+            .call_coordinator(&addr, ApiKey::Heartbeat, 4, &req, COORDINATOR_TIMEOUT)
+            .await?;
         if std::env::var("BARNABAS_TRACE").is_ok() {
             eprintln!(
                 "[{}] HB<- err={} gen={}",
@@ -555,8 +572,9 @@ impl<T: Transport> GroupProtocol<T> for ClassicProtocol {
 
         // A failure here costs a rebalance delay, not correctness: the
         // coordinator drops us at the session timeout anyway.
-        let _: std::result::Result<LeaveGroupResponse, Error> =
-            cluster.call_coordinator(&addr, ApiKey::LeaveGroup, 3, &req, COORDINATOR_TIMEOUT).await;
+        let _: std::result::Result<LeaveGroupResponse, Error> = cluster
+            .call_coordinator(&addr, ApiKey::LeaveGroup, 3, &req, COORDINATOR_TIMEOUT)
+            .await;
         self.member.on_leave();
         Ok(())
     }
@@ -590,7 +608,10 @@ impl ClassicProtocol {
             partition.partition_index = tp.partition;
             partition.committed_offset = *offset;
             partition.committed_leader_epoch = -1;
-            by_topic.entry(tp.topic.clone()).or_default().push(partition);
+            by_topic
+                .entry(tp.topic.clone())
+                .or_default()
+                .push(partition);
         }
 
         let mut req = OffsetCommitRequest::default();
@@ -607,8 +628,9 @@ impl ClassicProtocol {
             })
             .collect();
 
-        let resp: OffsetCommitResponse =
-            cluster.call_coordinator(&addr, ApiKey::OffsetCommit, 8, &req, COORDINATOR_TIMEOUT).await?;
+        let resp: OffsetCommitResponse = cluster
+            .call_coordinator(&addr, ApiKey::OffsetCommit, 8, &req, COORDINATOR_TIMEOUT)
+            .await?;
         for topic in &resp.topics {
             for partition in &topic.partitions {
                 crate::check("OffsetCommit", partition.error_code)?;
@@ -629,7 +651,10 @@ impl ClassicProtocol {
 
         let mut by_topic: BTreeMap<String, Vec<i32>> = BTreeMap::new();
         for tp in partitions {
-            by_topic.entry(tp.topic.clone()).or_default().push(tp.partition);
+            by_topic
+                .entry(tp.topic.clone())
+                .or_default()
+                .push(tp.partition);
         }
 
         let mut req = OffsetFetchRequest::default();
@@ -646,8 +671,9 @@ impl ClassicProtocol {
                 .collect(),
         );
 
-        let resp: OffsetFetchResponse =
-            cluster.call_coordinator(&addr, ApiKey::OffsetFetch, 6, &req, COORDINATOR_TIMEOUT).await?;
+        let resp: OffsetFetchResponse = cluster
+            .call_coordinator(&addr, ApiKey::OffsetFetch, 6, &req, COORDINATOR_TIMEOUT)
+            .await?;
         crate::check("OffsetFetch", resp.error_code)?;
 
         let mut out = BTreeMap::new();
@@ -674,7 +700,10 @@ impl ClassicProtocol {
 fn encode_subscription(subscription: &Subscription) -> Result<Bytes> {
     let mut owned: BTreeMap<String, Vec<i32>> = BTreeMap::new();
     for tp in &subscription.owned {
-        owned.entry(tp.topic.clone()).or_default().push(tp.partition);
+        owned
+            .entry(tp.topic.clone())
+            .or_default()
+            .push(tp.partition);
     }
 
     let mut body = ConsumerProtocolSubscription::default();
@@ -734,7 +763,10 @@ fn decode_subscription(member_id: &str, metadata: &Bytes) -> Result<Subscription
 fn encode_assignment(partitions: &[TopicPartition]) -> Result<Bytes> {
     let mut by_topic: BTreeMap<String, Vec<i32>> = BTreeMap::new();
     for tp in partitions {
-        by_topic.entry(tp.topic.clone()).or_default().push(tp.partition);
+        by_topic
+            .entry(tp.topic.clone())
+            .or_default()
+            .push(tp.partition);
     }
 
     let mut body = ConsumerProtocolAssignment::default();

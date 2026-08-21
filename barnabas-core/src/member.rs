@@ -472,11 +472,21 @@ mod tests {
     #[test]
     fn a_first_join_is_refused_and_then_accepted() {
         let mut m = member();
-        assert_eq!(m.step(), Step::Join { member_id: String::new() });
+        assert_eq!(
+            m.step(),
+            Step::Join {
+                member_id: String::new()
+            }
+        );
 
         // KIP-394: the coordinator hands back an id rather than admitting us.
         let step = m.on_join(codes::MEMBER_ID_REQUIRED, NO_GENERATION, "m-1", "", vec![]);
-        assert_eq!(step, Step::Join { member_id: "m-1".to_owned() });
+        assert_eq!(
+            step,
+            Step::Join {
+                member_id: "m-1".to_owned()
+            }
+        );
         assert_eq!(m.member_id(), "m-1");
         assert_eq!(m.state(), MemberState::Unjoined);
 
@@ -561,7 +571,12 @@ mod tests {
         assert_eq!(m.assignment().len(), 2);
 
         let step = m.on_heartbeat(codes::REBALANCE_IN_PROGRESS);
-        assert_eq!(step, Step::Join { member_id: "m-1".to_owned() });
+        assert_eq!(
+            step,
+            Step::Join {
+                member_id: "m-1".to_owned()
+            }
+        );
         assert!(m.assignment().is_empty(), "partitions must be given up");
         assert_eq!(m.state(), MemberState::Unjoined);
         // **The generation is kept.** A rebalance does not un-make this member
@@ -597,7 +612,12 @@ mod tests {
         m.on_sync(codes::NONE, vec![tp(0)]);
 
         let step = m.on_heartbeat(codes::UNKNOWN_MEMBER_ID);
-        assert_eq!(step, Step::Join { member_id: String::new() });
+        assert_eq!(
+            step,
+            Step::Join {
+                member_id: String::new()
+            }
+        );
         assert_eq!(m.member_id(), "", "the id is no longer ours to use");
         assert!(m.assignment().is_empty());
     }
@@ -609,8 +629,14 @@ mod tests {
         m.on_join(codes::NONE, 2, "m-1", "m-2", vec![]);
         m.on_sync(codes::NONE, vec![tp(0)]);
 
-        assert_eq!(m.on_heartbeat(codes::NOT_COORDINATOR), Step::FindCoordinator);
-        assert!(m.assignment().is_empty(), "still revoked: we cannot heartbeat");
+        assert_eq!(
+            m.on_heartbeat(codes::NOT_COORDINATOR),
+            Step::FindCoordinator
+        );
+        assert!(
+            m.assignment().is_empty(),
+            "still revoked: we cannot heartbeat"
+        );
     }
 
     /// A rebalance that starts while we are syncing sends us round again.
@@ -621,8 +647,16 @@ mod tests {
         assert_eq!(m.state(), MemberState::Syncing);
 
         let step = m.on_sync(codes::REBALANCE_IN_PROGRESS, vec![]);
-        assert_eq!(step, Step::Join { member_id: "m-1".to_owned() });
-        assert!(!m.is_leader(), "leadership is not carried across a rebalance");
+        assert_eq!(
+            step,
+            Step::Join {
+                member_id: "m-1".to_owned()
+            }
+        );
+        assert!(
+            !m.is_leader(),
+            "leadership is not carried across a rebalance"
+        );
     }
 
     /// Changing the subscription is a rebalance: the group has to agree on it
@@ -673,8 +707,7 @@ mod tests {
     }
 
     fn cooperative() -> GroupMember {
-        GroupMember::new("g", vec!["t".to_owned()])
-            .with_protocol(RebalanceProtocol::Cooperative)
+        GroupMember::new("g", vec!["t".to_owned()]).with_protocol(RebalanceProtocol::Cooperative)
     }
 
     /// **A cooperative member keeps reading while the group rebalances.**
@@ -692,7 +725,10 @@ mod tests {
             &[tp(0), tp(1)],
             "cooperative members keep what nobody has taken yet"
         );
-        assert!(!m.can_commit(), "but they are not stable, so they do not commit");
+        assert!(
+            !m.can_commit(),
+            "but they are not stable, so they do not commit"
+        );
     }
 
     /// The eager protocol does the opposite, and that is the difference.
@@ -724,7 +760,9 @@ mod tests {
         assert_eq!(m.assignment(), &[tp(0)], "and the one that did not");
         assert_eq!(
             step,
-            Step::Join { member_id: "m-1".to_owned() },
+            Step::Join {
+                member_id: "m-1".to_owned()
+            },
             "rejoin at once: the released partitions have no owner until we do"
         );
     }
@@ -740,7 +778,11 @@ mod tests {
         m.on_join(codes::NONE, 5, "m-1", "m-2", vec![]);
         m.on_sync(codes::NONE, vec![tp(0)]);
 
-        assert_eq!(m.generation(), 5, "still a member of the generation just assigned");
+        assert_eq!(
+            m.generation(),
+            5,
+            "still a member of the generation just assigned"
+        );
         assert_eq!(
             m.subscription().generation,
             5,

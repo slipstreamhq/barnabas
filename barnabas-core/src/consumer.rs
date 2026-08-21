@@ -277,11 +277,7 @@ mod tests {
     /// **The bug P0 hit.** Aborted records must not reach the caller.
     #[test]
     fn aborted_records_are_dropped_under_read_committed() {
-        let recs = vec![
-            record(0, 7, true),
-            record(1, 7, true),
-            marker(2, 7, ABORT),
-        ];
+        let recs = vec![record(0, 7, true), record(1, 7, true), marker(2, 7, ABORT)];
         let aborted = [AbortedTransaction {
             producer_id: 7,
             first_offset: 0,
@@ -313,11 +309,11 @@ mod tests {
     #[test]
     fn a_committed_transaction_after_an_aborted_one_survives() {
         let recs = vec![
-            record(0, 7, true),      // aborted
-            record(1, 7, true),      // aborted
-            marker(2, 7, ABORT),     // closes the aborted range
-            record(3, 7, true),      // committed
-            record(4, 7, true),      // committed
+            record(0, 7, true),  // aborted
+            record(1, 7, true),  // aborted
+            marker(2, 7, ABORT), // closes the aborted range
+            record(3, 7, true),  // committed
+            record(4, 7, true),  // committed
             marker(5, 7, COMMIT),
         ];
         let aborted = [AbortedTransaction {
@@ -370,7 +366,10 @@ mod tests {
     /// machinery, never data.
     #[test]
     fn control_records_are_never_returned() {
-        for isolation in [IsolationLevel::ReadCommitted, IsolationLevel::ReadUncommitted] {
+        for isolation in [
+            IsolationLevel::ReadCommitted,
+            IsolationLevel::ReadUncommitted,
+        ] {
             let recs = vec![record(0, 7, true), marker(1, 7, COMMIT)];
             let out = filter(recs, &[], 2, isolation, 0);
             assert_eq!(offsets(&out), vec![0], "isolation {isolation:?}");

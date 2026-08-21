@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use barnabas_core::{Disposition, ErrorCode};
 use kafka_protocol::messages::{
     create_partitions_request::CreatePartitionsTopic,
     create_topics_request::CreatableTopic,
@@ -29,7 +30,6 @@ use kafka_protocol::messages::{
     DeleteTopicsResponse, DescribeConfigsRequest, DescribeConfigsResponse, TopicName,
 };
 use kafka_protocol::protocol::StrBytes;
-use barnabas_core::{Disposition, ErrorCode};
 
 use crate::cluster::Cluster;
 use crate::{check, Error, Result, Transport};

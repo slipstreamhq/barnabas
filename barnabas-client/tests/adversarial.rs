@@ -12,8 +12,8 @@
 
 mod sim;
 
-use kafka_protocol::messages::ApiKey;
 use barnabas_client::{Producer, ProducerRecord};
+use kafka_protocol::messages::ApiKey;
 use sim::{drive, journal, start, Fault, Sim};
 
 const BOOTSTRAP: &str = "broker-1:9092";
@@ -320,7 +320,11 @@ fn a_closed_connection_is_reconnected() {
         vec![(0, 0, 2)],
         "the reconnect wrote twice, or lost the batch"
     );
-    assert_eq!(j.count(ApiKey::Produce), 2, "expected exactly one reconnect");
+    assert_eq!(
+        j.count(ApiKey::Produce),
+        2,
+        "expected exactly one reconnect"
+    );
 }
 
 /// The retry after a reconnect carries the same sequence numbers, so a broker
@@ -526,7 +530,10 @@ fn a_window_of_batches_arrives_in_sequence() {
         let mut producer = transactional().await;
         producer.begin_transaction().expect("begin");
         for _ in 0..5 {
-            producer.enqueue("t", 0, &records(2)).await.expect("enqueue");
+            producer
+                .enqueue("t", 0, &records(2))
+                .await
+                .expect("enqueue");
         }
         assert_eq!(producer.queued(), 5);
 
@@ -562,7 +569,10 @@ fn the_window_is_bounded_by_max_in_flight() {
         producer.set_max_in_flight(3);
         producer.begin_transaction().expect("begin");
         for _ in 0..10 {
-            producer.enqueue("t", 0, &records(1)).await.expect("enqueue");
+            producer
+                .enqueue("t", 0, &records(1))
+                .await
+                .expect("enqueue");
         }
         producer.flush().await.expect("flush");
 
@@ -596,7 +606,10 @@ fn a_failure_mid_window_resends_everything_behind_it() {
         let mut producer = transactional().await;
         producer.begin_transaction().expect("begin");
         for _ in 0..4 {
-            producer.enqueue("t", 0, &records(2)).await.expect("enqueue");
+            producer
+                .enqueue("t", 0, &records(2))
+                .await
+                .expect("enqueue");
         }
         let written = producer.flush().await.expect("flush");
 
@@ -629,7 +642,10 @@ fn an_unexplained_sequence_error_still_fences() {
     drive(async {
         let mut producer = transactional().await;
         producer.begin_transaction().expect("begin");
-        producer.enqueue("t", 0, &records(1)).await.expect("enqueue");
+        producer
+            .enqueue("t", 0, &records(1))
+            .await
+            .expect("enqueue");
         let err = producer.flush().await.expect_err("must not be tolerated");
         assert!(
             matches!(
@@ -666,7 +682,10 @@ fn a_success_after_a_failure_is_not_retired() {
         let mut producer = transactional().await;
         producer.begin_transaction().expect("begin");
         for _ in 0..4 {
-            producer.enqueue("t", 0, &records(2)).await.expect("enqueue");
+            producer
+                .enqueue("t", 0, &records(2))
+                .await
+                .expect("enqueue");
         }
         let written = producer.flush().await.expect("flush");
 
@@ -719,7 +738,10 @@ fn a_call_on_a_busy_connection_is_refused() {
             .expect_err("a busy connection must refuse");
 
         assert!(
-            matches!(err, barnabas_client::Error::ConnectionBusy { in_flight: 1, .. }),
+            matches!(
+                err,
+                barnabas_client::Error::ConnectionBusy { in_flight: 1, .. }
+            ),
             "expected ConnectionBusy, got: {err}"
         );
     });

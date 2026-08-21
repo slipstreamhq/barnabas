@@ -23,9 +23,9 @@
 
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use barnabas_client::{ConsumerRecords, ProducerRecord};
 use barnabas_glommio::CompressionCodec;
+use bytes::Bytes;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 
@@ -457,7 +457,10 @@ fn barnabas_produce_many_cores(topic: &str, cores: usize, cell: &Cell) -> Durati
                             .collect();
                         for round in 0..(per_core / batch_size) {
                             let partition = owned[round % owned.len()];
-                            producer.send(&topic, partition, &batch).await.expect("send");
+                            producer
+                                .send(&topic, partition, &batch)
+                                .await
+                                .expect("send");
                         }
                     });
             })
@@ -470,7 +473,6 @@ fn barnabas_produce_many_cores(topic: &str, cores: usize, cell: &Cell) -> Durati
     }
     start.elapsed()
 }
-
 
 // ── compression ──────────────────────────────────────────────────────────────
 
@@ -615,12 +617,7 @@ fn barnabas_produce_pipelined(topic: &str, cell: &Cell, in_flight: usize) -> Dur
 ///
 /// The producer and consumer share one executor, so this is one core doing both
 /// halves — the shape a per-core stream processor has.
-fn barnabas_end_to_end(
-    topic: &str,
-    samples: usize,
-    value_bytes: usize,
-    prefetch: bool,
-) -> Latency {
+fn barnabas_end_to_end(topic: &str, samples: usize, value_bytes: usize, prefetch: bool) -> Latency {
     let topic = topic.to_owned();
     glommio::LocalExecutorBuilder::default()
         .make()
@@ -782,7 +779,11 @@ fn barnabas_idle_polls(topic: &str, partitions: i32, polls: usize, incremental: 
 fn rss_kib() -> u64 {
     std::fs::read_to_string("/proc/self/statm")
         .ok()
-        .and_then(|s| s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+        .and_then(|s| {
+            s.split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok())
+        })
         .map_or(0, |pages| pages * 4)
 }
 
@@ -1232,24 +1233,32 @@ fn decode_cell() {
         }
         sink
     });
-    time("  copy every key+value (Vec<u8>)", ITERATIONS, COUNT, || {
-        let mut sink = Vec::with_capacity(decoded.len());
-        for record in &decoded {
-            sink.push((
-                record.key.as_ref().map(|k| k.to_vec()),
-                record.value.as_ref().map(|v| v.to_vec()),
-            ));
-        }
-        sink
-    });
+    time(
+        "  copy every key+value (Vec<u8>)",
+        ITERATIONS,
+        COUNT,
+        || {
+            let mut sink = Vec::with_capacity(decoded.len());
+            for record in &decoded {
+                sink.push((
+                    record.key.as_ref().map(|k| k.to_vec()),
+                    record.value.as_ref().map(|v| v.to_vec()),
+                ));
+            }
+            sink
+        },
+    );
 
     // Where the decode time actually goes.
     time("lean: parse only, keep nothing", ITERATIONS, COUNT, || {
         lean::parse_only(&batch)
     });
-    time("lean: + 24-byte record (offsets)", ITERATIONS, COUNT, || {
-        lean::lean_offsets(&batch)
-    });
+    time(
+        "lean: + 24-byte record (offsets)",
+        ITERATIONS,
+        COUNT,
+        || lean::lean_offsets(&batch),
+    );
     time("lean: + Bytes slices", ITERATIONS, COUNT, || {
         lean::lean_bytes(&batch)
     });
@@ -1400,12 +1409,36 @@ fn main() {
         let cells = [
             // Small batches first, because that is where an internal accumulator
             // earns its keep and where this client has none.
-            Cell { batch: 1, value_bytes: 128, records: 5_000 },
-            Cell { batch: 10, value_bytes: 128, records: 20_000 },
-            Cell { batch: 100, value_bytes: 128, records: 100_000 },
-            Cell { batch: 1_000, value_bytes: 128, records: 200_000 },
-            Cell { batch: 1_000, value_bytes: 1_024, records: 200_000 },
-            Cell { batch: 1_000, value_bytes: 8_192, records: 50_000 },
+            Cell {
+                batch: 1,
+                value_bytes: 128,
+                records: 5_000,
+            },
+            Cell {
+                batch: 10,
+                value_bytes: 128,
+                records: 20_000,
+            },
+            Cell {
+                batch: 100,
+                value_bytes: 128,
+                records: 100_000,
+            },
+            Cell {
+                batch: 1_000,
+                value_bytes: 128,
+                records: 200_000,
+            },
+            Cell {
+                batch: 1_000,
+                value_bytes: 1_024,
+                records: 200_000,
+            },
+            Cell {
+                batch: 1_000,
+                value_bytes: 8_192,
+                records: 50_000,
+            },
         ];
         for cell in &cells {
             let barnabas_topic = topic("k");
@@ -1491,7 +1524,11 @@ fn main() {
         println!(
             "\nproduce, N cores      barnabas rec/s      per core   scaling   rdkafka rec/s   ratio"
         );
-        let cell = Cell { batch: 1_000, value_bytes: 128, records: 400_000 };
+        let cell = Cell {
+            batch: 1_000,
+            value_bytes: 128,
+            records: 400_000,
+        };
         let mut single_core = 0.0;
         for cores in [1usize, 2, 4, 8] {
             let topic = topic("mc");
@@ -1520,10 +1557,12 @@ fn main() {
     }
 
     if want("consume") {
-        println!(
-            "\nconsume throughput    barnabas rec/s   rdkafka rec/s   rskafka rec/s   vs rsk"
-        );
-        let cell = Cell { batch: 1_000, value_bytes: 128, records: consume_records() };
+        println!("\nconsume throughput    barnabas rec/s   rdkafka rec/s   rskafka rec/s   vs rsk");
+        let cell = Cell {
+            batch: 1_000,
+            value_bytes: 128,
+            records: consume_records(),
+        };
 
         let barnabas_topic = topic("kc");
         create_topic(&barnabas_topic);
@@ -1568,7 +1607,11 @@ fn main() {
 
     if want("compression") {
         println!("\ncompression (1 KiB records)   barnabas rec/s   rdkafka rec/s     ratio");
-        let cell = Cell { batch: 1_000, value_bytes: 1_024, records: 200_000 };
+        let cell = Cell {
+            batch: 1_000,
+            value_bytes: 1_024,
+            records: 200_000,
+        };
         for (codec, name) in [
             (CompressionCodec::None, "none"),
             (CompressionCodec::Gzip, "gzip"),
@@ -1637,7 +1680,11 @@ fn main() {
         // records one at a time and the client decides what travels together.
         // Comparing that against our *synchronous* one-record `send` would be
         // comparing a queue with a round trip.
-        let one = Cell { batch: 1, value_bytes: 128, records: 200_000 };
+        let one = Cell {
+            batch: 1,
+            value_bytes: 128,
+            records: 200_000,
+        };
         for window in [1usize, 100, 1_000] {
             let topic = topic("p1");
             create_topic(&topic);
@@ -1645,7 +1692,11 @@ fn main() {
             println!("1 record/enqueue, window {window:>5}   {rate:>12.0}");
         }
 
-        let cell = Cell { batch: 100, value_bytes: 128, records: 200_000 };
+        let cell = Cell {
+            batch: 100,
+            value_bytes: 128,
+            records: 200_000,
+        };
         let mut single = 0.0;
         for in_flight in [1usize, 2, 5, 10] {
             let topic = topic("pl");
@@ -1661,7 +1712,7 @@ fn main() {
             );
         }
 
-    // ── fetch sessions ──────────────────────────────────────────────────────
+        // ── fetch sessions ──────────────────────────────────────────────────────
     }
 
     if want("idle") {

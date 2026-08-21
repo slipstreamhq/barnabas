@@ -175,8 +175,8 @@ impl ScramExchange {
     /// If the message is malformed, or the server's nonce does not extend ours
     /// — which would mean the exchange is not the one we started.
     pub fn client_final(&mut self, server_first: &[u8]) -> Result<Vec<u8>, SaslError> {
-        let text = std::str::from_utf8(server_first)
-            .map_err(|e| SaslError::Malformed(e.to_string()))?;
+        let text =
+            std::str::from_utf8(server_first).map_err(|e| SaslError::Malformed(e.to_string()))?;
 
         let nonce = field(text, 'r').ok_or_else(|| SaslError::Malformed(text.to_owned()))?;
         let salt_b64 = field(text, 's').ok_or_else(|| SaslError::Malformed(text.to_owned()))?;
@@ -199,8 +199,10 @@ impl ScramExchange {
         let stored_key = hash(self.mechanism, &client_key);
 
         let final_without_proof = format!("c=biws,r={nonce}");
-        let auth_message =
-            format!("{},{},{}", self.client_first_bare, text, final_without_proof);
+        let auth_message = format!(
+            "{},{},{}",
+            self.client_first_bare, text, final_without_proof
+        );
 
         let client_signature = hmac(self.mechanism, &stored_key, auth_message.as_bytes());
         let proof: Vec<u8> = client_key
@@ -224,8 +226,8 @@ impl ScramExchange {
     /// If the message is malformed, carries an error, or the signature does not
     /// match.
     pub fn verify(&self, server_final: &[u8]) -> Result<(), SaslError> {
-        let text = std::str::from_utf8(server_final)
-            .map_err(|e| SaslError::Malformed(e.to_string()))?;
+        let text =
+            std::str::from_utf8(server_final).map_err(|e| SaslError::Malformed(e.to_string()))?;
         if let Some(err) = field(text, 'e') {
             return Err(SaslError::Malformed(err.to_owned()));
         }
@@ -353,7 +355,10 @@ mod tests {
     #[test]
     fn debug_never_prints_the_password() {
         let printed = format!("{:?}", Credentials::plain("user", "hunter2"));
-        assert!(!printed.contains("hunter2"), "the password leaked: {printed}");
+        assert!(
+            !printed.contains("hunter2"),
+            "the password leaked: {printed}"
+        );
         assert!(printed.contains("redacted"));
     }
 
@@ -406,10 +411,13 @@ mod tests {
             iterations,
         );
         let server_key = hmac(SaslMechanism::ScramSha256, &salted, b"Server Key");
-        let auth_message = format!(
-            "n=user,r=clientNONCE,{server_first},c=biws,r=clientNONCEserverNONCE"
+        let auth_message =
+            format!("n=user,r=clientNONCE,{server_first},c=biws,r=clientNONCEserverNONCE");
+        let signature = hmac(
+            SaslMechanism::ScramSha256,
+            &server_key,
+            auth_message.as_bytes(),
         );
-        let signature = hmac(SaslMechanism::ScramSha256, &server_key, auth_message.as_bytes());
 
         exchange
             .verify(format!("v={}", base64_encode(&signature)).as_bytes())

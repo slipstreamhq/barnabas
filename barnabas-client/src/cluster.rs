@@ -23,14 +23,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+use barnabas_core::{BrokerAddr, Connection, Metadata};
+use bytes::Bytes;
 use kafka_protocol::messages::{
     metadata_request::MetadataRequestTopic, ApiKey, ApiVersionsRequest, ApiVersionsResponse,
     MetadataRequest, MetadataResponse, SaslAuthenticateRequest, SaslAuthenticateResponse,
     SaslHandshakeRequest, SaslHandshakeResponse, TopicName,
 };
-use bytes::Bytes;
 use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
-use barnabas_core::{BrokerAddr, Connection, Metadata};
 
 use crate::sasl::{plain_message, Credentials, SaslMechanism, ScramExchange};
 use crate::timeout::with_timeout;
@@ -123,11 +123,7 @@ impl<T: Transport> Broker<T> {
         if resp.error_code != 0 {
             // The broker lists what it *would* accept, which is the single most
             // useful thing to say when authentication fails at this stage.
-            let offered: Vec<String> = resp
-                .mechanisms
-                .iter()
-                .map(|m| m.to_string())
-                .collect();
+            let offered: Vec<String> = resp.mechanisms.iter().map(|m| m.to_string()).collect();
             return Err(Error::Sasl(format!(
                 "broker rejected mechanism {}; it offers {}",
                 credentials.mechanism.as_str(),
@@ -164,13 +160,12 @@ impl<T: Transport> Broker<T> {
     async fn sasl_exchange(&mut self, bytes: Vec<u8>) -> Result<Bytes> {
         let mut req = SaslAuthenticateRequest::default();
         req.auth_bytes = Bytes::from(bytes);
-        let resp: SaslAuthenticateResponse =
-            self.call(ApiKey::SaslAuthenticate, 1, &req).await?;
+        let resp: SaslAuthenticateResponse = self.call(ApiKey::SaslAuthenticate, 1, &req).await?;
         if resp.error_code != 0 {
-            return Err(Error::Sasl(
-                resp.error_message
-                    .map_or_else(|| "authentication failed".to_owned(), |m| m.to_string()),
-            ));
+            return Err(Error::Sasl(resp.error_message.map_or_else(
+                || "authentication failed".to_owned(),
+                |m| m.to_string(),
+            )));
         }
         Ok(resp.auth_bytes)
     }
@@ -615,10 +610,7 @@ impl<T: Transport> Cluster<T> {
                 .await?;
                 self.coordinator_conns.insert(addr.to_owned(), broker);
             }
-            let broker = self
-                .coordinator_conns
-                .get_mut(addr)
-                .expect("just inserted");
+            let broker = self.coordinator_conns.get_mut(addr).expect("just inserted");
 
             match with_timeout::<T, _>(timeout, broker.call(api_key, version, req)).await {
                 Some(Ok(resp)) => return Ok(resp),
@@ -667,8 +659,13 @@ impl<T: Transport> Cluster<T> {
         }
         let mut last_err = None;
         for addr in self.bootstrap.clone() {
-            match Broker::<T>::connect(&self.transport, &addr, &self.client_id, self.credentials.as_ref())
-                .await
+            match Broker::<T>::connect(
+                &self.transport,
+                &addr,
+                &self.client_id,
+                self.credentials.as_ref(),
+            )
+            .await
             {
                 Ok(broker) => {
                     self.conns.insert(addr.clone(), broker);
@@ -703,8 +700,13 @@ impl<T: Transport> Cluster<T> {
 
         let mut last_err = None;
         for addr in self.bootstrap.clone() {
-            match Broker::<T>::connect(&self.transport, &addr, &self.client_id, self.credentials.as_ref())
-                .await
+            match Broker::<T>::connect(
+                &self.transport,
+                &addr,
+                &self.client_id,
+                self.credentials.as_ref(),
+            )
+            .await
             {
                 Ok(broker) => {
                     self.conns.insert(addr.clone(), broker);
@@ -719,9 +721,13 @@ impl<T: Transport> Cluster<T> {
     /// Connect to `addr` if not already connected, and return it.
     pub(crate) async fn broker_at(&mut self, addr: &str) -> Result<&mut Broker<T>> {
         if !self.conns.contains_key(addr) {
-            let broker =
-                Broker::<T>::connect(&self.transport, addr, &self.client_id, self.credentials.as_ref())
-                    .await?;
+            let broker = Broker::<T>::connect(
+                &self.transport,
+                addr,
+                &self.client_id,
+                self.credentials.as_ref(),
+            )
+            .await?;
             self.conns.insert(addr.to_owned(), broker);
         }
         Ok(self.conns.get_mut(addr).expect("just inserted"))

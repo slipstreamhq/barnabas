@@ -13,11 +13,11 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
 
 use crate::Tokio;
 
@@ -48,13 +48,12 @@ impl TokioTls {
     pub fn with_roots(roots: RootCertStore) -> Self {
         // Name the provider explicitly rather than relying on an installed
         // default — the same trap G4 recorded for the DFS client.
-        let config = ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("ring provides the default protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .expect("ring provides the default protocol versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
 
         Self {
             connector: TlsConnector::from(Arc::new(config)),

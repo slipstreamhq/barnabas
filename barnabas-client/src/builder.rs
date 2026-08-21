@@ -31,8 +31,8 @@
 
 use std::time::Duration;
 
-use kafka_protocol::records::Compression;
 use barnabas_core::{IsolationLevel, Partitioner};
+use kafka_protocol::records::Compression;
 
 use crate::{Consumer, Credentials, Producer, Result, Transport, EARLIEST, LATEST};
 

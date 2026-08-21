@@ -275,8 +275,8 @@ pub fn decode_lean(buffer: &Bytes) -> Result<Option<Vec<LeanBatch>>> {
             }
 
             pos += 1; // per-record attributes, unused in the format
-            let timestamp_delta =
-                varint(&body, &mut pos).ok_or_else(|| Error::Codec("timestamp delta".to_owned()))?;
+            let timestamp_delta = varint(&body, &mut pos)
+                .ok_or_else(|| Error::Codec("timestamp delta".to_owned()))?;
             let offset_delta =
                 varint(&body, &mut pos).ok_or_else(|| Error::Codec("offset delta".to_owned()))?;
 
@@ -559,7 +559,10 @@ mod tests {
         let lean = decode_lean(&encoded).expect("decode").expect("handled");
         let batch = &lean[0];
         assert_eq!(batch.key(&batch.records[0]), None);
-        assert_eq!(batch.value(&batch.records[0]), Some(Bytes::from_static(b"v")));
+        assert_eq!(
+            batch.value(&batch.records[0]),
+            Some(Bytes::from_static(b"v"))
+        );
     }
 
     /// Every codec round-trips, and against the reference decoder's output.
@@ -627,7 +630,10 @@ mod tests {
         let encoded = encode(&[record(0, None, Some(b"v"))], Compression::None);
         let lean = decode_lean(&encoded).expect("decode").expect("handled");
         let batch = &lean[0];
-        assert!(batch.headers(&batch.records[0]).expect("headers").is_empty());
+        assert!(batch
+            .headers(&batch.records[0])
+            .expect("headers")
+            .is_empty());
     }
 
     /// A response cut off at `max_bytes` ends mid-batch. That fragment is not
@@ -640,7 +646,11 @@ mod tests {
         let lean = decode_lean(&truncated.freeze())
             .expect("decode")
             .expect("handled");
-        assert_eq!(lean.len(), 1, "the whole batch is kept, the fragment is not");
+        assert_eq!(
+            lean.len(),
+            1,
+            "the whole batch is kept, the fragment is not"
+        );
         assert_eq!(lean[0].records.len(), 1);
     }
 

@@ -19,23 +19,23 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
+use barnabas_core::producer::{ProducerIdentity, ProducerState, SequenceRange};
+use barnabas_core::{Disposition, ErrorCode, Partitioner};
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::messages::{
     add_offsets_to_txn_request::AddOffsetsToTxnRequest,
     add_partitions_to_txn_request::AddPartitionsToTxnTopic,
-    txn_offset_commit_request::{TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
-    AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, EndTxnRequest, EndTxnResponse,
-    FindCoordinatorRequest, FindCoordinatorResponse, InitProducerIdRequest, InitProducerIdResponse,
-    AddOffsetsToTxnResponse, GroupId, ProduceRequest, ProduceResponse, ProducerId, TopicName,
-    TransactionalId, TxnOffsetCommitRequest, TxnOffsetCommitResponse,
+    txn_offset_commit_request::{TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic},
+    AddOffsetsToTxnResponse, AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey,
+    EndTxnRequest, EndTxnResponse, FindCoordinatorRequest, FindCoordinatorResponse, GroupId,
+    InitProducerIdRequest, InitProducerIdResponse, ProduceRequest, ProduceResponse, ProducerId,
+    TopicName, TransactionalId, TxnOffsetCommitRequest, TxnOffsetCommitResponse,
 };
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{
     Compression, Record, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
 };
-use barnabas_core::producer::{ProducerIdentity, ProducerState, SequenceRange};
-use barnabas_core::{Disposition, ErrorCode, Partitioner};
 
 use crate::cluster::Cluster;
 use crate::{Error, Result, Transport};
@@ -266,8 +266,10 @@ impl<T: Transport> Producer<T> {
         req.key_type = 1; // TRANSACTION
 
         for attempt in 0..MAX_RETRIES {
-            let resp: FindCoordinatorResponse =
-                self.cluster.call_any(ApiKey::FindCoordinator, 3, &req).await?;
+            let resp: FindCoordinatorResponse = self
+                .cluster
+                .call_any(ApiKey::FindCoordinator, 3, &req)
+                .await?;
 
             let code = ErrorCode(resp.error_code);
             if code.is_ok() {
@@ -1007,8 +1009,7 @@ impl<T: Transport> Producer<T> {
             }
             if by_broker.is_empty() {
                 if !unroutable || attempt + 1 == MAX_RETRIES {
-                    let (topic, partition) =
-                        self.pending.keys().next().expect("non-empty").clone();
+                    let (topic, partition) = self.pending.keys().next().expect("non-empty").clone();
                     return Err(Error::NoLeader { topic, partition });
                 }
                 Self::backoff(attempt).await;
@@ -1104,8 +1105,11 @@ impl<T: Transport> Producer<T> {
                 return Ok(written);
             }
             if needs_refresh {
-                let mut topics: Vec<String> =
-                    self.pending.keys().map(|(topic, _)| topic.clone()).collect();
+                let mut topics: Vec<String> = self
+                    .pending
+                    .keys()
+                    .map(|(topic, _)| topic.clone())
+                    .collect();
                 topics.sort_unstable();
                 topics.dedup();
                 for topic in topics {
@@ -1262,7 +1266,10 @@ impl<T: Transport> Producer<T> {
                     topic: topic.to_owned(),
                     partition: -1,
                 })?;
-            by_partition.entry(partition).or_default().push(record.clone());
+            by_partition
+                .entry(partition)
+                .or_default()
+                .push(record.clone());
         }
 
         let partitions: Vec<i32> = by_partition.keys().copied().collect();

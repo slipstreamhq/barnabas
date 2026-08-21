@@ -328,11 +328,7 @@ mod tests {
         let mut md = Metadata::new();
         md.update(&response(
             vec![broker(1, "kafka-1", 9092)],
-            vec![topic(
-                "t",
-                0,
-                vec![partition(0, 1, 0), partition(1, 1, 0)],
-            )],
+            vec![topic("t", 0, vec![partition(0, 1, 0), partition(1, 1, 0)])],
         ));
         md.invalidate_partition("t", 0);
         assert!(md.leader_for("t", 0).is_none());

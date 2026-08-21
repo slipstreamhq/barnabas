@@ -108,8 +108,10 @@ impl Assignor for RangeAssignor {
         members: &[Subscription],
         partitions_per_topic: &BTreeMap<String, i32>,
     ) -> Assignment {
-        let mut assignment: Assignment =
-            members.iter().map(|m| (m.member_id.clone(), Vec::new())).collect();
+        let mut assignment: Assignment = members
+            .iter()
+            .map(|m| (m.member_id.clone(), Vec::new()))
+            .collect();
 
         for (topic, &count) in partitions_per_topic {
             let mut subscribers: Vec<&str> = members
@@ -163,8 +165,10 @@ impl Assignor for RoundRobinAssignor {
         members: &[Subscription],
         partitions_per_topic: &BTreeMap<String, i32>,
     ) -> Assignment {
-        let mut assignment: Assignment =
-            members.iter().map(|m| (m.member_id.clone(), Vec::new())).collect();
+        let mut assignment: Assignment = members
+            .iter()
+            .map(|m| (m.member_id.clone(), Vec::new()))
+            .collect();
 
         let mut sorted: Vec<&Subscription> = members.iter().collect();
         sorted.sort_unstable_by(|a, b| a.member_id.cmp(&b.member_id));
@@ -250,8 +254,10 @@ impl Assignor for StickyAssignor {
         members: &[Subscription],
         partitions_per_topic: &BTreeMap<String, i32>,
     ) -> Assignment {
-        let mut assignment: Assignment =
-            members.iter().map(|m| (m.member_id.clone(), Vec::new())).collect();
+        let mut assignment: Assignment = members
+            .iter()
+            .map(|m| (m.member_id.clone(), Vec::new()))
+            .collect();
 
         let mut sorted: Vec<&Subscription> = members.iter().collect();
         sorted.sort_unstable_by(|a, b| a.member_id.cmp(&b.member_id));
@@ -427,10 +433,7 @@ mod tests {
     }
 
     fn topics(entries: &[(&str, i32)]) -> BTreeMap<String, i32> {
-        entries
-            .iter()
-            .map(|(t, c)| ((*t).to_owned(), *c))
-            .collect()
+        entries.iter().map(|(t, c)| ((*t).to_owned(), *c)).collect()
     }
 
     fn partitions_of(assignment: &Assignment, member: &str) -> Vec<i32> {
@@ -441,7 +444,6 @@ mod tests {
             .map(|tp| tp.partition)
             .collect()
     }
-
 
     /// **Parity with the Java client, checked against the Java client.**
     ///
@@ -568,7 +570,10 @@ mod tests {
             &topics(&[("a", 2), ("b", 2)]),
         );
         assert!(assignment["c0"].iter().all(|tp| tp.topic == "a"));
-        assert_eq!(assignment["c1"].iter().filter(|tp| tp.topic == "b").count(), 2);
+        assert_eq!(
+            assignment["c1"].iter().filter(|tp| tp.topic == "b").count(),
+            2
+        );
     }
 
     /// Nobody subscribed, so the partition goes unassigned rather than to an
@@ -677,8 +682,15 @@ mod tests {
             total, 1,
             "the moving partition must be withheld: {assignment:?}"
         );
-        assert_eq!(assignment["c0"].len(), 1, "c0 keeps the one it is not losing");
-        assert!(assignment["c1"].is_empty(), "c1 waits a round for its share");
+        assert_eq!(
+            assignment["c0"].len(),
+            1,
+            "c0 keeps the one it is not losing"
+        );
+        assert!(
+            assignment["c1"].is_empty(),
+            "c1 waits a round for its share"
+        );
     }
 
     /// Nothing is moving, so nothing is withheld and the round is complete.
@@ -694,7 +706,11 @@ mod tests {
     fn cooperative_grants_unowned_partitions_at_once() {
         let members = [holding("c0", &["t"], &[("t", 0)])];
         let assignment = CooperativeStickyAssignor.assign(&members, &topics(&[("t", 2)]));
-        assert_eq!(assignment["c0"].len(), 2, "the new partition needs no handover");
+        assert_eq!(
+            assignment["c0"].len(),
+            2,
+            "the new partition needs no handover"
+        );
     }
 
     /// **A claim from an older generation is ignored.**
@@ -750,8 +766,7 @@ mod tests {
             ("roundrobin", RoundRobinAssignor.assign(&members, &spec)),
             ("sticky", StickyAssignor.assign(&members, &spec)),
         ] {
-            let mut all: Vec<TopicPartition> =
-                assignment.values().flatten().cloned().collect();
+            let mut all: Vec<TopicPartition> = assignment.values().flatten().cloned().collect();
             let count = all.len();
             all.sort();
             all.dedup();

@@ -30,14 +30,13 @@ use tokio::net::TcpStream;
 pub mod tls;
 
 pub use barnabas_client::{
-    Error, ConsumerRecords, ProducerRecord, RebalanceListener, RecordRef, Result, EARLIEST,
-    LATEST,
+    ConsumerRecords, Error, ProducerRecord, RebalanceListener, RecordRef, Result, EARLIEST, LATEST,
 };
-pub use barnabas_core::{Disposition, ErrorCode, IsolationLevel, Partitioner};
 /// SASL works on either runtime — it is the client's business, not the
 /// socket's — so the bindings re-export it too. Without this a caller had to
 /// depend on `barnabas-client` directly just to name a password.
 pub use barnabas_client::{Credentials, SaslMechanism, StartOffset};
+pub use barnabas_core::{Disposition, ErrorCode, IsolationLevel, Partitioner};
 
 /// The runtime selector. Never instantiated — it exists to name a choice.
 #[derive(Debug, Clone, Copy)]

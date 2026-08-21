@@ -11,12 +11,11 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use barnabas_tokio::{Consumer, IsolationLevel, Producer, ProducerRecord, EARLIEST};
+use bytes::Bytes;
 
 mod producer;
 use producer::TestProducer;
-
 
 /// `KAFKA_BOOTSTRAP` so these can run against the three-broker cluster in
 /// `cluster.sh` as well as a single broker.
@@ -113,9 +112,10 @@ fn an_idempotent_producer_round_trips() {
         let topic = unique("idem");
         make_topic(&topic).await;
 
-        let mut producer = Producer::idempotent(barnabas_tokio::Tokio, &bootstrap(), "barnabas-test")
-            .await
-            .expect("idempotent producer");
+        let mut producer =
+            Producer::idempotent(barnabas_tokio::Tokio, &bootstrap(), "barnabas-test")
+                .await
+                .expect("idempotent producer");
         producer
             .send(&topic, 0, &records(&["a", "b", "c"]))
             .await
@@ -136,9 +136,14 @@ fn a_committed_transaction_is_visible() {
         let topic = unique("txn-commit");
         make_topic(&topic).await;
 
-        let mut producer = Producer::transactional(barnabas_tokio::Tokio, &bootstrap(), "barnabas-test", &unique("tid"))
-            .await
-            .expect("transactional producer");
+        let mut producer = Producer::transactional(
+            barnabas_tokio::Tokio,
+            &bootstrap(),
+            "barnabas-test",
+            &unique("tid"),
+        )
+        .await
+        .expect("transactional producer");
 
         producer.begin_transaction().expect("begin");
         producer
@@ -162,9 +167,14 @@ fn an_aborted_transaction_is_invisible() {
         let topic = unique("txn-abort");
         make_topic(&topic).await;
 
-        let mut producer = Producer::transactional(barnabas_tokio::Tokio, &bootstrap(), "barnabas-test", &unique("tid"))
-            .await
-            .expect("transactional producer");
+        let mut producer = Producer::transactional(
+            barnabas_tokio::Tokio,
+            &bootstrap(),
+            "barnabas-test",
+            &unique("tid"),
+        )
+        .await
+        .expect("transactional producer");
 
         producer.begin_transaction().expect("begin");
         producer
@@ -192,9 +202,14 @@ fn a_second_transaction_is_not_deduplicated() {
         let topic = unique("txn-sequence");
         make_topic(&topic).await;
 
-        let mut producer = Producer::transactional(barnabas_tokio::Tokio, &bootstrap(), "barnabas-test", &unique("tid"))
-            .await
-            .expect("transactional producer");
+        let mut producer = Producer::transactional(
+            barnabas_tokio::Tokio,
+            &bootstrap(),
+            "barnabas-test",
+            &unique("tid"),
+        )
+        .await
+        .expect("transactional producer");
 
         producer.begin_transaction().expect("begin 1");
         let first = producer
@@ -232,9 +247,14 @@ fn a_commit_after_an_abort_writes_only_the_commit() {
         let topic = unique("txn-abort-commit");
         make_topic(&topic).await;
 
-        let mut producer = Producer::transactional(barnabas_tokio::Tokio, &bootstrap(), "barnabas-test", &unique("tid"))
-            .await
-            .expect("transactional producer");
+        let mut producer = Producer::transactional(
+            barnabas_tokio::Tokio,
+            &bootstrap(),
+            "barnabas-test",
+            &unique("tid"),
+        )
+        .await
+        .expect("transactional producer");
 
         producer.begin_transaction().expect("begin 1");
         producer
@@ -271,18 +291,28 @@ fn a_new_producer_fences_the_old_one() {
         make_topic(&topic).await;
         let txn_id = unique("tid");
 
-        let mut old = Producer::transactional(barnabas_tokio::Tokio, &bootstrap(), "barnabas-test", &txn_id)
-            .await
-            .expect("old producer");
+        let mut old = Producer::transactional(
+            barnabas_tokio::Tokio,
+            &bootstrap(),
+            "barnabas-test",
+            &txn_id,
+        )
+        .await
+        .expect("old producer");
         old.begin_transaction().expect("begin");
         old.send(&topic, 0, &records(&["zombie"]))
             .await
             .expect("send");
 
         // A restarted instance takes the same transactional id.
-        let new = Producer::transactional(barnabas_tokio::Tokio, &bootstrap(), "barnabas-test", &txn_id)
-            .await
-            .expect("new producer");
+        let new = Producer::transactional(
+            barnabas_tokio::Tokio,
+            &bootstrap(),
+            "barnabas-test",
+            &txn_id,
+        )
+        .await
+        .expect("new producer");
         assert!(
             new.identity().expect("identity").epoch > old.identity().expect("identity").epoch,
             "the new producer did not bump the epoch, so it fences nothing"
@@ -290,7 +320,10 @@ fn a_new_producer_fences_the_old_one() {
 
         // The zombie's commit must fail, and it must fail *fatally* — a retry
         // would be a second writer.
-        let err = old.commit_transaction().await.expect_err("zombie committed");
+        let err = old
+            .commit_transaction()
+            .await
+            .expect_err("zombie committed");
         assert!(
             matches!(
                 err,
@@ -319,9 +352,10 @@ fn keyed_records_land_on_the_partition_their_key_names() {
         let topic = unique("keyed");
         make_topic_with_partitions(&topic, 4).await;
 
-        let mut producer = Producer::idempotent(barnabas_tokio::Tokio, &bootstrap(), "barnabas-test")
-            .await
-            .expect("producer");
+        let mut producer =
+            Producer::idempotent(barnabas_tokio::Tokio, &bootstrap(), "barnabas-test")
+                .await
+                .expect("producer");
 
         // Where each key should go, according to the partitioner alone.
         let keys = ["alpha", "beta", "gamma", "delta", "epsilon"];
@@ -415,9 +449,14 @@ fn producing_outside_a_transaction_is_refused() {
         let topic = unique("txn-misuse");
         make_topic(&topic).await;
 
-        let mut producer = Producer::transactional(barnabas_tokio::Tokio, &bootstrap(), "barnabas-test", &unique("tid"))
-            .await
-            .expect("transactional producer");
+        let mut producer = Producer::transactional(
+            barnabas_tokio::Tokio,
+            &bootstrap(),
+            "barnabas-test",
+            &unique("tid"),
+        )
+        .await
+        .expect("transactional producer");
 
         let err = producer
             .send(&topic, 0, &records(&["nope"]))

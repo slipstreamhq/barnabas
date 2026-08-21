@@ -74,9 +74,8 @@ mod tests {
 
     #[test]
     fn empty_input_completes_immediately() {
-        let out: Vec<()> = futures_lite::future::block_on(join_all(Vec::<
-            std::future::Ready<()>,
-        >::new()));
+        let out: Vec<()> =
+            futures_lite::future::block_on(join_all(Vec::<std::future::Ready<()>>::new()));
         assert!(out.is_empty());
     }
 

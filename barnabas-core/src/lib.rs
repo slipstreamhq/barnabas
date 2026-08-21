@@ -42,9 +42,12 @@ pub mod producer;
 pub mod records;
 
 pub use conn::{Connection, PendingResponse};
-pub use member::{GroupMember, MemberState, RebalanceProtocol, Step};
-pub use group::{Assignment, Assignor, CooperativeStickyAssignor, RangeAssignor, RoundRobinAssignor, StickyAssignor, Subscription, TopicPartition};
 pub use consumer::{FetchPosition, IsolationLevel};
+pub use group::{
+    Assignment, Assignor, CooperativeStickyAssignor, RangeAssignor, RoundRobinAssignor,
+    StickyAssignor, Subscription, TopicPartition,
+};
+pub use member::{GroupMember, MemberState, RebalanceProtocol, Step};
 pub use metadata::{BrokerAddr, Metadata};
 pub use partitioner::Partitioner;
 pub use producer::{ProducerIdentity, ProducerState, SequenceRange, TxnState};

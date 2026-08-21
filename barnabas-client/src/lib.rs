@@ -36,23 +36,23 @@ use std::future::Future;
 use std::io;
 use std::time::Duration;
 
-pub mod cluster;
-pub mod sasl;
 pub mod admin;
 pub mod builder;
+pub mod cluster;
+pub mod consumer;
 pub mod group;
 mod join;
-mod timeout;
-pub mod consumer;
 pub mod producer;
+pub mod sasl;
+mod timeout;
 
 pub use admin::{Admin, BrokerInfo, NewTopic};
-pub use cluster::Cluster;
-pub use sasl::{Credentials, SaslMechanism};
 pub use builder::{ConsumerBuilder, ProducerBuilder, StartOffset};
-pub use consumer::{Consumer, ConsumerRecords, RecordRef, RebalanceListener, EARLIEST, LATEST};
+pub use cluster::Cluster;
+pub use consumer::{Consumer, ConsumerRecords, RebalanceListener, RecordRef, EARLIEST, LATEST};
 pub use group::{ClassicProtocol, GroupMetadata, GroupProtocol, Membership};
 pub use producer::{Producer, ProducerRecord};
+pub use sasl::{Credentials, SaslMechanism};
 
 use barnabas_core::{Disposition, ErrorCode};
 

@@ -133,7 +133,10 @@ pub fn journal() -> Journal {
 
 /// Pop a scripted fault for `api`, if one is due.
 fn take_fault(world: &mut World, api: ApiKey) -> Option<i16> {
-    let idx = world.faults.iter().position(|f| f.api == api && f.times > 0)?;
+    let idx = world
+        .faults
+        .iter()
+        .position(|f| f.api == api && f.times > 0)?;
     if world.faults[idx].after > 0 {
         world.faults[idx].after -= 1;
         return None;
@@ -236,7 +239,11 @@ fn handle(world: &mut World, wire: &[u8]) -> Answer {
         world.closes[idx].times -= 1;
         return Answer::Closed;
     }
-    if let Some(idx) = world.hangs.iter().position(|h| h.api == api_key && h.times > 0) {
+    if let Some(idx) = world
+        .hangs
+        .iter()
+        .position(|h| h.api == api_key && h.times > 0)
+    {
         world.hangs[idx].times -= 1;
         return Answer::Hang;
     }
@@ -284,7 +291,8 @@ fn handle(world: &mut World, wire: &[u8]) -> Answer {
                 add_partitions_to_txn_response::AddPartitionsToTxnPartitionResult::default();
             partition.partition_index = 0;
             partition.partition_error_code = fault.unwrap_or(0);
-            let mut topic = add_partitions_to_txn_response::AddPartitionsToTxnTopicResult::default();
+            let mut topic =
+                add_partitions_to_txn_response::AddPartitionsToTxnTopicResult::default();
             topic.name = TopicName(StrBytes::from_static_str("t"));
             topic.results_by_partition = vec![partition];
             let mut r = AddPartitionsToTxnResponse::default();
@@ -298,7 +306,12 @@ fn handle(world: &mut World, wire: &[u8]) -> Answer {
         }),
         ApiKey::Produce => {
             let req = ProduceRequest::decode(&mut buf, version).expect("produce request");
-            encode(api_key, version, &header, &produce_response(world, &req, fault))
+            encode(
+                api_key,
+                version,
+                &header,
+                &produce_response(world, &req, fault),
+            )
         }
         ApiKey::ListOffsets => {
             let mut partition = list_offsets_response::ListOffsetsPartitionResponse::default();
@@ -420,7 +433,12 @@ fn produce_response(
     r
 }
 
-fn encode<R: Encodable>(api_key: ApiKey, version: i16, header: &RequestHeader, resp: &R) -> Vec<u8> {
+fn encode<R: Encodable>(
+    api_key: ApiKey,
+    version: i16,
+    header: &RequestHeader,
+    resp: &R,
+) -> Vec<u8> {
     let mut out = BytesMut::new();
     let mut response_header = ResponseHeader::default();
     response_header.correlation_id = header.correlation_id;
@@ -430,7 +448,11 @@ fn encode<R: Encodable>(api_key: ApiKey, version: i16, header: &RequestHeader, r
     resp.encode(&mut out, version).expect("encode response");
 
     let mut framed = Vec::with_capacity(out.len() + 4);
-    framed.extend_from_slice(&i32::try_from(out.len()).expect("response fits").to_be_bytes());
+    framed.extend_from_slice(
+        &i32::try_from(out.len())
+            .expect("response fits")
+            .to_be_bytes(),
+    );
     framed.extend_from_slice(&out);
     framed
 }

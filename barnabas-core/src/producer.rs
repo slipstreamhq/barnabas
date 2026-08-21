@@ -224,7 +224,10 @@ impl ProducerState {
                 });
             }
         }
-        let next = self.sequences.entry((topic.to_owned(), partition)).or_insert(0);
+        let next = self
+            .sequences
+            .entry((topic.to_owned(), partition))
+            .or_insert(0);
         let base = *next;
         *next += count;
         Ok(SequenceRange { base, count })
@@ -276,9 +279,7 @@ impl ProducerState {
     fn check_usable(&self) -> Result<(), ProducerError> {
         match self.txn {
             TxnState::Fatal => Err(ProducerError::Fatal),
-            TxnState::Uninitialised if self.identity.is_none() => {
-                Err(ProducerError::Uninitialised)
-            }
+            TxnState::Uninitialised if self.identity.is_none() => Err(ProducerError::Uninitialised),
             _ => Ok(()),
         }
     }

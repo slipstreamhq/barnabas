@@ -30,6 +30,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use barnabas_core::consumer::{self, AbortedTransaction, Fetched};
+use barnabas_core::records::LeanBatch;
+use barnabas_core::{Disposition, ErrorCode, IsolationLevel};
 use bytes::Bytes;
 use kafka_protocol::messages::{
     fetch_request::{FetchPartition, FetchTopic},
@@ -39,9 +42,6 @@ use kafka_protocol::messages::{
 };
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{Record, RecordBatchDecoder};
-use barnabas_core::consumer::{self, AbortedTransaction, Fetched};
-use barnabas_core::records::LeanBatch;
-use barnabas_core::{Disposition, ErrorCode, IsolationLevel};
 
 use crate::cluster::Cluster;
 use crate::{check, Error, Result, Transport};
@@ -395,8 +395,7 @@ impl<T: Transport> Consumer<T> {
         // Up front so a missing topic fails here rather than as a fetch loop
         // that never returns anything.
         self.cluster.refresh_metadata(topic).await?;
-        self.positions
-            .insert((topic.to_owned(), partition), offset);
+        self.positions.insert((topic.to_owned(), partition), offset);
 
         if offset == EARLIEST || offset == LATEST {
             let resolved = self.list_offset(topic, partition, offset).await?;
@@ -714,7 +713,10 @@ impl<T: Transport> Consumer<T> {
         // for the caller: the partitions are about to belong to someone else,
         // and the offsets go with them.
         match self.commit().await {
-            Ok(()) | Err(Error::Broker { op: "OffsetCommit", .. }) => {}
+            Ok(())
+            | Err(Error::Broker {
+                op: "OffsetCommit", ..
+            }) => {}
             Err(e) => return Err(e),
         }
         self.last_auto_commit = Some(std::time::Instant::now());
@@ -744,8 +746,7 @@ impl<T: Transport> Consumer<T> {
             let Some(mut group) = self.group.take() else {
                 return Ok(changed);
             };
-            let outcome =
-                crate::group::GroupProtocol::advance(&mut group, &mut self.cluster).await;
+            let outcome = crate::group::GroupProtocol::advance(&mut group, &mut self.cluster).await;
 
             let settled = match &outcome {
                 Ok(crate::group::Membership::Assigned(partitions)) => {
@@ -921,8 +922,7 @@ impl<T: Transport> Consumer<T> {
     /// Seek one partition. The caller owns its offsets, so this is how a
     /// restored checkpoint is applied.
     pub fn seek_to(&mut self, topic: &str, partition: i32, offset: i64) {
-        self.positions
-            .insert((topic.to_owned(), partition), offset);
+        self.positions.insert((topic.to_owned(), partition), offset);
         self.generation += 1;
     }
 
@@ -936,7 +936,12 @@ impl<T: Transport> Consumer<T> {
             1,
             "seek() needs exactly one assignment; use seek_to()"
         );
-        let key = self.positions.keys().next().expect("checked length").clone();
+        let key = self
+            .positions
+            .keys()
+            .next()
+            .expect("checked length")
+            .clone();
         self.positions.insert(key, offset);
         self.generation += 1;
     }
@@ -1233,7 +1238,11 @@ impl<T: Transport> Consumer<T> {
         &mut self,
         partitions: &[barnabas_core::group::TopicPartition],
     ) -> Result<BTreeMap<barnabas_core::group::TopicPartition, i64>> {
-        let want: Vec<_> = partitions.iter().cloned().map(|tp| (tp, EARLIEST)).collect();
+        let want: Vec<_> = partitions
+            .iter()
+            .cloned()
+            .map(|tp| (tp, EARLIEST))
+            .collect();
         Ok(self
             .list_offsets_many(&want)
             .await?
@@ -1273,9 +1282,7 @@ impl<T: Transport> Consumer<T> {
         let ends = self.end_offsets(&assigned).await?;
         Ok(positions
             .into_iter()
-            .filter_map(|(tp, position)| {
-                ends.get(&tp).map(|end| (tp, (end - position).max(0)))
-            })
+            .filter_map(|(tp, position)| ends.get(&tp).map(|end| (tp, (end - position).max(0))))
             .collect())
     }
 
@@ -1481,7 +1488,6 @@ fn decode_records(mut bytes: Bytes) -> Result<Vec<Record>> {
     Ok(all)
 }
 
-
 impl<T: Transport> Consumer<T> {
     /// Fetch every assigned partition, **one request per broker**.
     ///
@@ -1641,7 +1647,9 @@ impl<T: Transport> Consumer<T> {
 }
 
 /// The aborted-transaction list a fetch response carries for one partition.
-fn aborted_of(part: &kafka_protocol::messages::fetch_response::PartitionData) -> Vec<AbortedTransaction> {
+fn aborted_of(
+    part: &kafka_protocol::messages::fetch_response::PartitionData,
+) -> Vec<AbortedTransaction> {
     part.aborted_transactions
         .as_ref()
         .map(|list| {
