@@ -13,7 +13,7 @@ barnabas-glommio = { path = "../barnabas-glommio" }
 kafka-protocol = { workspace = true }
 bytes          = { workspace = true }
 tokio          = { version = "1", features = ["full"] }
-glommio        = { package = "glommio-ng", version = "0.10" }
+glommio        = { package = "glommio-ng", version = "0.11.1" }
 # The comparison everyone will ask for, available only while librdkafka is
 # still something we build against.
 rdkafka        = { version = "0.39", default-features = false, features = ["libz", "zstd", "tokio"] }

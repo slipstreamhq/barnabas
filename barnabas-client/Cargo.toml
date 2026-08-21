@@ -17,7 +17,7 @@ categories = ["network-programming", "asynchronous"]
 futures-lite = "2"
 
 [dependencies]
-barnabas-core = { path = "../barnabas-core", version = "0.1.0" }
+barnabas-core = { path = "../barnabas-core", version = "0.2.0" }
 kafka-protocol = { workspace = true }
 bytes          = { workspace = true }
 thiserror      = { workspace = true }

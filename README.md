@@ -4,8 +4,8 @@ A native Rust Kafka client with a sans-io core, so it runs on **any** async
 runtime — including thread-per-core ones, which is what it was built for.
 
 ```toml
-barnabas-glommio = "0.1"   # thread-per-core, io_uring
-barnabas-tokio   = "0.1"   # work-stealing
+barnabas-glommio = "0.2"   # thread-per-core, io_uring
+barnabas-tokio   = "0.2"   # work-stealing
 ```
 
 ```rust
@@ -28,13 +28,13 @@ tokio instead. Nothing else changes — see [Choosing a runtime](docs/runtimes.m
 
 ## Stability
 
-**0.1.x, and early.** The client is feature-complete and covered by a broker
+**0.2.x, and early.** The client is feature-complete and covered by a broker
 suite on both runtimes, but it is new and the surface has had few users.
 
 **Breaking changes can happen in 0.x, and will be avoided where they can be.**
 Where one is unavoidable it gets a minor bump, a CHANGELOG entry, and a
-migration note. The 1.0 line is where that stops being a judgement call. If you
-need immovable API, pin an exact version.
+migration note — see [CHANGELOG.md](CHANGELOG.md). The 1.0 line is where that
+stops being a judgement call. If you need immovable API, pin an exact version.
 
 ## Why
 

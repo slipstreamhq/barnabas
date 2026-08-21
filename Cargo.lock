@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "barnabas-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "barnabas-client",
  "barnabas-core",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "barnabas-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "barnabas-core",
  "bytes",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "barnabas-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "crc32c",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "barnabas-glommio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "barnabas-client",
  "barnabas-core",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "barnabas-tokio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "barnabas-client",
  "barnabas-core",
@@ -454,7 +454,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -672,9 +672,9 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "glommio-ng"
-version = "0.10.3"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8cdb9b03ac444a86da6afc0d0e25bdab943b222ac0f0275514d5cf588c44d6ac"
+checksum = "95bccf930e7b78d67c6466cb1e585c6045da72b5e39c79d56bef2e5a8b3e4511"
 dependencies = [
  "ahash",
  "backtrace",
@@ -682,7 +682,6 @@ dependencies = [
  "bitflags",
  "bitmaps",
  "buddy-alloc",
- "cc",
  "concurrent-queue",
  "crossbeam",
  "enclose",
@@ -710,9 +709,9 @@ dependencies = [
 
 [[package]]
 name = "glommio-ng-macros"
-version = "0.10.3"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a814e5279ae46ca3f60180ea399dac6a853e2a871793c8d9d5f6451714821733"
+checksum = "fba7f0ed3085a23dcb1c888e8962f7f39a7a15bf893753842c573355e99b15b0"
 dependencies = [
  "proc-macro2",
  "quote",
