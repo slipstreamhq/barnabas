@@ -7,10 +7,14 @@ resolver = "2"
 members = ["barnabas-core", "barnabas-client", "barnabas-glommio", "barnabas-tokio", "barnabas-bench"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-publish = false
+repository = "https://github.com/slipstreamhq/barnabas"
+# glommio needs 1.92; the client itself is happy well below that, but a single
+# MSRV across the workspace is what a consumer can actually reason about.
+rust-version = "1.92"
+publish = true
 
 [workspace.dependencies]
 kafka-protocol = "0.17"

@@ -3,7 +3,13 @@ name = "barnabas-glommio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 publish.workspace = true
+description = "The glommio binding for the barnabas Kafka client — thread-per-core, io_uring, no Send required."
+readme = "../README.md"
+keywords = ["kafka", "glommio", "io-uring", "thread-per-core"]
+categories = ["network-programming", "asynchronous"]
 
 [features]
 # TLS is opt-in: it pulls rustls and a certificate store, which a client on a
@@ -11,8 +17,8 @@ publish.workspace = true
 tls = ["dep:futures-rustls", "dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
-barnabas-core   = { path = "../barnabas-core" }
-barnabas-client = { path = "../barnabas-client" }
+barnabas-core = { path = "../barnabas-core", version = "0.1.0" }
+barnabas-client = { path = "../barnabas-client", version = "0.1.0" }
 kafka-protocol = { workspace = true }
 bytes          = { workspace = true }
 thiserror      = { workspace = true }

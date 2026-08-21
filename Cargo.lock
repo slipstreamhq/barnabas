@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "barnabas-bench"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "barnabas-client",
  "barnabas-core",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "barnabas-client"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "barnabas-core",
  "bytes",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "barnabas-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "bytes",
  "crc32c",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "barnabas-glommio"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "barnabas-client",
  "barnabas-core",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "barnabas-tokio"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "barnabas-client",
  "barnabas-core",

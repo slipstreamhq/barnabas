@@ -3,7 +3,13 @@ name = "barnabas-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 publish.workspace = true
+description = "The sans-io core of the barnabas Kafka client: framing, correlation, record batches and compression. No sockets, no runtime."
+readme = "../README.md"
+keywords = ["kafka", "protocol", "sans-io", "codec"]
+categories = ["network-programming", "encoding"]
 
 [dependencies]
 kafka-protocol = { workspace = true }
