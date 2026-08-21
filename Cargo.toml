@@ -1,7 +1,6 @@
-# The native Kafka client. Its own workspace, deliberately: nothing here names
-# a Slipstream type, and the whole argument for building it is that it is
-# useful outside this repo. See
-# `docs/superpowers/specs/2026-08-15-native-kafka-client-design.md`.
+# A native Kafka client with a sans-io core. Its own workspace, deliberately:
+# nothing here names a type from the system it was built for, and the whole
+# argument for building it is that it is useful outside it.
 [workspace]
 resolver = "2"
 members = ["barnabas-core", "barnabas-client", "barnabas-glommio", "barnabas-tokio", "barnabas-bench"]
